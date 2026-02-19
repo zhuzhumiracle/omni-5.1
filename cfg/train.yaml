@@ -1,6 +1,6 @@
 # hydra.job.chdir: false
 
-headless: false
+headless: True
 
 sim: ${task.sim}
 env: ${task.env}
@@ -16,18 +16,20 @@ viewer:
   eye: [8, 0., 6.]
   lookat: [0., 0., 1.]
 
+
 wandb:
   group: ${oc.select:..task.name}
   run_name: ${oc.select:..task.name,test}-${oc.select:..algo.name,none}
   job_type: train
-  entity: marl-drones
-  project: omnidrones
+  entity: "3218371195-" 
+  project:  "c"
   mode: online # set to 'disabled' when debugging locally
   run_id:
   monitor_gym: True
   tags:
 
+
 defaults:
-  - task: Hover
+  - task: Forest
   - algo: mappo
   - _self_

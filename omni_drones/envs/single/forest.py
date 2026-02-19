@@ -198,7 +198,8 @@ class Forest(IsaacEnv):
         ray_caster_cfg = RayCasterCfg(
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
             offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
-            ray_alignment="base",
+            # ray_alignment="base",
+            attach_yaw_only=True,
             pattern_cfg=patterns.BpearlPatternCfg(
                 vertical_ray_angles=torch.linspace(*self.lidar_vfov, 4)
             ),

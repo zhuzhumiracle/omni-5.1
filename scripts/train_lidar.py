@@ -1,5 +1,6 @@
 import logging
 import os
+import sys  # 新增: 用于解决进度条缓存问题
 
 import hydra
 import torch
@@ -50,7 +51,15 @@ class PPOPolicy(TensorDictModuleBase):
         self.entropy_coef = 0.001
         self.clip_param = 0.1
         self.critic_loss_fn = nn.HuberLoss(delta=10)
-        self.n_agents, self.action_dim = action_spec.shape[-2:]
+        
+        # --- 修复 1: 兼容单智能体(1D)和多智能体(2D)的动作空间 ---
+        if len(action_spec.shape) >= 2:
+            self.n_agents, self.action_dim = action_spec.shape[-2:]
+        else:
+            self.n_agents = 1
+            self.action_dim = action_spec.shape[-1]
+        # -----------------------------------------------------
+        
         self.gae = GAE(0.99, 0.95)
 
         fake_input = observation_spec.zero()
@@ -187,6 +196,12 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    
+    # --- 修复 2: 强制开启渲染相关配置，防止 Warning 变 Error ---
+    cfg.sim.enable_replicator = False
+    cfg.sim.enable_viewport = True
+    # ---------------------------------------------------
+    
     simulation_app = init_simulation_app(cfg)
     run = init_wandb(cfg)
     setproctitle(run.name)
@@ -199,8 +214,6 @@ def main(cfg):
 
     transforms = [InitTracker()]
 
-    # a CompositeSpec is by default processed by a entity-based encoder
-    # ravel it to use a MLP encoder instead
     if cfg.task.get("ravel_obs", False):
         transform = ravel_composite(base_env.observation_spec, ("agents", "observation"))
         transforms.append(transform)
@@ -214,11 +227,6 @@ def main(cfg):
     ):
         transforms.append(ravel_composite(base_env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
 
-    # if cfg.task.get("history", False):
-    #     # transforms.append(History([("info", "drone_state"), ("info", "prev_action")]))
-    #     transforms.append(History([("agents", "observation")]))
-
-    # optionally discretize the action space or use a controller
     action_transform: str = cfg.task.get("action_transform", None)
     if action_transform is not None:
         if action_transform.startswith("multidiscrete"):
@@ -312,15 +320,20 @@ def main(cfg):
             format="mp4"
         )
 
-        # log distributions
-        # df = pd.DataFrame(traj_stats)
-        # table = wandb.Table(dataframe=df)
-        # info["eval/return"] = wandb.plot.histogram(table, "return")
-        # info["eval/episode_len"] = wandb.plot.histogram(table, "episode_len")
-
         return info
 
-    pbar = tqdm(collector)
+    # --- 修复 3: 正确计算进度条总长度，解决进度条不显示的问题 ---
+    if max_iters > 0:
+        total_len = max_iters
+    elif total_frames > 0:
+        total_len = total_frames // frames_per_batch
+    else:
+        total_len = None 
+
+    # file=sys.stdout 强制输出到标准流，防止被缓存
+    pbar = tqdm(collector, total=total_len, dynamic_ncols=True, file=sys.stdout)
+    # -------------------------------------------------------
+
     env.train()
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
@@ -350,9 +363,16 @@ def main(cfg):
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         run.log(info)
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
-
-        pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
+        
+        # --- 修复 4: 注释掉会导致刷屏的 print，只保留进度条 ---
+        # print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
+        
+        # 优化进度条显示信息
+        pbar.set_postfix({
+            "fps": f"{collector._fps:.1f}", 
+            "return": f"{info.get('train/stats.return', 0):.2f}"
+        })
+        # --------------------------------------------------
 
         if max_iters > 0 and i >= max_iters - 1:
             break

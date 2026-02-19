@@ -4,12 +4,12 @@ hydra:
     # see https://hydra.cc/docs/advanced/search_path/
     - file://../cfg
 
-headless: true
+headless: false
 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 150_000_000
+total_frames: 60_000_000
 max_iters: -1
 eval_interval: -1
 save_interval: -1
@@ -24,8 +24,8 @@ wandb:
   group: ${oc.select:..task.name}
   run_name: ${oc.select:..task.name,test}-${oc.select:..algo.name,none}
   job_type: train
-  entity:
-  project: omnidrones
+  entity: "3218371195-" 
+  project:  "c"
   mode: online # set to 'disabled' when debugging locally
   run_id:
   monitor_gym: True

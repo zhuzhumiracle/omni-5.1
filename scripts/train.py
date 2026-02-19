@@ -37,6 +37,10 @@ def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+
+
+    cfg.sim.enable_replicator = True
+    cfg.sim.enable_viewport = True
     simulation_app = init_simulation_app(cfg)
     run = init_wandb(cfg)
     setproctitle(run.name)
@@ -121,7 +125,8 @@ def main(cfg):
 
         with set_exploration_type(exploration_type):
             trajs = env.rollout(
-                max_steps=base_env.max_episode_length,
+                max_steps=2000,
+                # max_steps=base_env.max_episode_length,
                 policy=policy,
                 callback=render_callback,
                 auto_reset=True,
@@ -151,7 +156,7 @@ def main(cfg):
         # log video
         info["recording"] = wandb.Video(
             render_callback.get_video_array(axes="t c h w"),
-            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+            fps=0.5/ (cfg.sim.dt * cfg.sim.substeps),
             format="mp4"
         )
 
@@ -164,6 +169,15 @@ def main(cfg):
         return info
 
     pbar = tqdm(collector, total=total_frames//frames_per_batch)
+    # 增加进度条代码，根据 max_iters 和 total_frames 计算总长度
+    if max_iters > 0:
+        total_len = max_iters
+    elif total_frames > 0:
+        total_len = total_frames // frames_per_batch
+    else:
+        total_len = None # 如果都没设，就是无限长度进度条
+
+    pbar = tqdm(collector, total=total_len, dynamic_ncols=True)
     env.train()
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
@@ -177,6 +191,7 @@ def main(cfg):
             info.update(stats)
 
         info.update(policy.train_op(data.to_tensordict()))
+
 
         if eval_interval > 0 and i % eval_interval == 0:
             logging.info(f"Eval at {collector._frames} steps.")
@@ -193,10 +208,14 @@ def main(cfg):
                 logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         run.log(info)
-        print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
+        # print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
         pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
-
+        pbar.set_postfix({
+            "fps": f"{collector._fps:.1f}", 
+            "frames": collector._frames,
+            "return": f"{info.get('train/stats.return', 0):.2f}"
+        })
         if max_iters > 0 and i >= max_iters - 1:
             break
 
