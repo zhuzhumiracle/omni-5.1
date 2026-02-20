@@ -4,12 +4,12 @@ hydra:
     # see https://hydra.cc/docs/advanced/search_path/
     - file://../cfg
 
-headless: false
+headless: true
 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 60_000_000
+total_frames: 200_000_000
 max_iters: -1
 eval_interval: -1
 save_interval: -1

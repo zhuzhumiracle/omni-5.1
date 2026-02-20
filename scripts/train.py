@@ -95,6 +95,9 @@ def main(cfg):
     max_iters = cfg.get("max_iters", -1)
     eval_interval = cfg.get("eval_interval", -1)
     save_interval = cfg.get("save_interval", -1)
+    max_return = -float("inf")
+    last_best_ckpt_path = None
+    last_ckpt_path = None
 
     stats_keys = [
         k for k in base_env.observation_spec.keys(True, True)
@@ -133,6 +136,8 @@ def main(cfg):
                 break_when_any_done=False,
                 return_contiguous=False,
             )
+
+
         base_env.enable_render(not cfg.headless)
         env.reset()
 
@@ -177,6 +182,8 @@ def main(cfg):
     else:
         total_len = None # 如果都没设，就是无限长度进度条
 
+    # 1. 在进入 for 循环前，初始化一个变量
+    last_return = 0.0
     pbar = tqdm(collector, total=total_len, dynamic_ncols=True)
     env.train()
     for i, data in enumerate(pbar):
@@ -189,6 +196,29 @@ def main(cfg):
                 for k, v in episode_stats.pop().items(True, True)
             }
             info.update(stats)
+            # 2. 如果这一步更新了 return，就把真实分数存下来
+            if "train/stats.return" in info:
+                last_return = info["train/stats.return"]
+# 检查是不是最优模型
+            if "train/stats.return" in info:
+                current_return = info["train/stats.return"]
+                if current_return > max_return:
+                    max_return = current_return
+                    try:
+                        # ckpt_path = os.path.join(run.dir, "checkpoint_best.pt")
+                        ckpt_path = os.path.join(run.dir, f"checkpoint_best_return_{max_return:.2f}.pt")
+                        torch.save(policy.state_dict(), ckpt_path)
+                        # logging.info(f"Saved best checkpoint with return {max_return:.2f} to {str(ckpt_path)}")
+                        
+                        if last_best_ckpt_path is not None and last_best_ckpt_path != ckpt_path:
+                            try:
+                                if os.path.exists(last_best_ckpt_path):
+                                    os.remove(last_best_ckpt_path)
+                            except OSError:
+                                pass
+                        last_best_ckpt_path = ckpt_path
+                    except AttributeError:
+                        logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         info.update(policy.train_op(data.to_tensordict()))
 
@@ -210,14 +240,22 @@ def main(cfg):
         run.log(info)
         # print(OmegaConf.to_yaml({k: v for k, v in info.items() if isinstance(v, float)}))
 
-        pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
+        # pbar.set_postfix({"rollout_fps": collector._fps, "frames": collector._frames})
         pbar.set_postfix({
             "fps": f"{collector._fps:.1f}", 
             "frames": collector._frames,
-            "return": f"{info.get('train/stats.return', 0):.2f}"
+            "return": f"{last_return:.2f}"
         })
         if max_iters > 0 and i >= max_iters - 1:
             break
+
+    # 加载最佳模型进行最终评估
+    if last_best_ckpt_path is not None and os.path.exists(last_best_ckpt_path):
+        logging.info(f"Loading best checkpoint from {last_best_ckpt_path} for final evaluation.")
+        try:
+            policy.load_state_dict(torch.load(last_best_ckpt_path))
+        except Exception as e:
+            logging.warning(f"Failed to load best checkpoint: {e}")
 
     logging.info(f"Final Eval at {collector._frames} steps.")
     info = {"env_frames": collector._frames}
@@ -242,6 +280,7 @@ def main(cfg):
     except AttributeError:
         logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
+    # logging.info(f"Maximum return achieved: {max_return:.2f}")
     wandb.finish()
 
     simulation_app.close()

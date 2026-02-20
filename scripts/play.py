@@ -83,7 +83,24 @@ def main(cfg):
         )
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
-
+    # --- 新增：加载训练好的模型权重 ---
+    checkpoint_path = cfg.get("checkpoint_path", None)
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        print(f"[*] 正在从以下路径加载预训练模型: {checkpoint_path}")
+        # 加载权重文件
+        state_dict = torch.load(checkpoint_path, map_location=base_env.device)
+        
+        # 将权重注入到策略网络中
+        # 注意：如果是从 wandb 下载的，可能需要 policy.load_state_dict(state_dict) 
+        # 或者 policy.load_state_dict(state_dict['model_state_dict'])，取决于你保存时的格式
+        policy.load_state_dict(state_dict)
+        
+        # 极其重要：将策略设为评估模式，关闭随机探索
+        policy.eval() 
+        print("[+] 模型权重加载成功！")
+    else:
+        print(f"[!] 警告：未找到有效的 checkpoint_path 或路径不存在: {checkpoint_path}")
+    # --------------------------------
     frames_per_batch = env.num_envs * 32
 
     stats_keys = [

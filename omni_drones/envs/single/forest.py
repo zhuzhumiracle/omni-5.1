@@ -288,7 +288,7 @@ class Forest(IsaacEnv):
         state = torch.cat([rpos_clipped, self.drone_state[..., 3:]], dim=-1)  # (num_envs, 1, state_dim)
         lidar_flat = self.lidar_scan.flatten(start_dim=2)  # (num_envs, 1, 144)
         obs = torch.cat([state, lidar_flat], dim=-1)  # (num_envs, 1, obs_dim)
-
+# kun注释
         if self._should_render(0):
             self.debug_draw.clear()
             x = self.lidar.data.pos_w[0]
@@ -297,8 +297,8 @@ class Forest(IsaacEnv):
                 target=x.cpu() + torch.as_tensor(self.cfg.viewer.lookat)
             )
             v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
-            self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
-            self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
+            # self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
+            # self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
 
         return TensorDict(
             {
@@ -311,21 +311,110 @@ class Forest(IsaacEnv):
             self.batch_size,
         )
 
+    # def _compute_reward_and_done(self):
+    #     # pose reward
+    #     distance = self.rpos.norm(dim=-1, keepdim=True)
+    #     vel_direction = self.rpos / distance.clamp_min(1e-6)
+
+    #     reward_safety = torch.log(self.lidar_range-self.lidar_scan).mean(dim=(2, 3))
+    #     reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1).clip(max=2.0)
+
+    #     reward_up = torch.square((self.drone.up[..., 2] + 1) / 2)
+
+    #     # effort
+    #     # reward_effort = self.reward_effort_weight * torch.exp(-self.effort)
+
+    #     reward = reward_vel + reward_up + 1. + reward_safety * 0.05
+
+    #     misbehave = (
+    #         (self.drone.pos[..., 2] < 0.2)
+    #         | (self.drone.pos[..., 2] > 4.)
+    #         | (self.drone.vel_w[..., :3].norm(dim=-1) > 2.5)
+    #         | (einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3))
+    #     )
+    #     hasnan = torch.isnan(self.drone_state).any(-1)
+
+    #     terminated = misbehave | hasnan
+    #     truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
+
+    #     self.stats["safety"].add_(reward_safety)
+    #     self.stats["return"] += reward
+    #     self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
+
+    #     return TensorDict(
+    #         {
+    #             "agents": {
+    #                 "reward": reward.unsqueeze(-1)
+    #             },
+    #             "done": terminated | truncated,
+    #             "terminated": terminated,
+    #             "truncated": truncated,
+    #         },
+    #         self.batch_size,
+    #     )
+
     def _compute_reward_and_done(self):
-        # pose reward
-        distance = self.rpos.norm(dim=-1, keepdim=True)
-        vel_direction = self.rpos / distance.clamp_min(1e-6)
+        # ================= 1. 基础状态计算 =================
+        v = self.drone.vel_w[..., :3]  # 无人机实际线速度
+        v_norm = v.norm(dim=-1)
+        vel_direction = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
 
-        reward_safety = torch.log(self.lidar_range-self.lidar_scan).mean(dim=(2, 3))
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1).clip(max=2.0)
+        actual_dists = self.lidar_range - self.lidar_scan
+        d = actual_dists.amin(dim=(2, 3)) 
 
-        reward_up = torch.square((self.drone.up[..., 2] + 1) / 2)
+        # ================= 2. 论文超参数与权重定义 =================
+        v_max = 2.0         
+        z_min, z_max = 0.5, 3.0 
+        lambda_esdf = 1.0   
+        k_esdf = 2.0        
+        collision_dist = 0.3 
 
-        # effort
-        # reward_effort = self.reward_effort_weight * torch.exp(-self.effort)
+        w_forward = 1.0
+        w_smooth = -0.05    
+        w_max_speed = 0.5   
+        w_z = -1.0          
+        w_esdf = 1.0
+        w_yaw = 0.5
 
-        reward = reward_vel + reward_up + 1. + reward_safety * 0.2
+        # ================= 3. 计算各项 Reward =================
+        distance = self.rpos.norm(dim=-1)
+        rpos_dir = self.rpos / distance.unsqueeze(-1).clamp_min(1e-6)
+        r_forward = (v * rpos_dir).sum(-1)
 
+        # 🔧 修复 1：提取 vel_w 的后 3 维获取角速度，防止报 AttributeError
+        omega = self.drone.vel_w[..., 3:]
+        r_smoothness = omega.norm(dim=-1)
+
+        # 🔧 修复 2：加上 .clamp(max=5.0) 限制指数上限，防止数值溢出产生 NaN
+        speed_excess = torch.relu(v_norm - v_max).clamp(max=5.0)
+        r_max_speed = -torch.exp(speed_excess) + 1.0
+
+        z = self.drone.pos[..., 2]
+        r_z = torch.relu(z - z_max) + torch.relu(z_min - z)
+
+        r_esdf = lambda_esdf * (1.0 - torch.exp(-k_esdf * (d ** 2)))
+
+        r_collision = torch.where(d < collision_dist, 
+                                  torch.tensor(-10.0, device=self.device), 
+                                  torch.tensor(0.0, device=self.device))
+
+        # 🔧 修复 3：直接使用无人机内置的 heading 向量，跳过四元数计算
+        x_body = self.drone.heading[..., :3]
+        r_yaw = (x_body * vel_direction).sum(-1)
+
+        # ================= 4. 总分合并 =================
+        reward = (
+            w_forward * r_forward +
+            w_smooth * r_smoothness +  
+            w_max_speed * r_max_speed + 
+            w_z * r_z +                
+            w_esdf * r_esdf +
+            r_collision +
+            w_yaw * r_yaw + 
+            1.0  # 基础生存奖励
+        )
+
+        # ================= 5. 终止条件与统计 =================
         misbehave = (
             (self.drone.pos[..., 2] < 0.2)
             | (self.drone.pos[..., 2] > 4.)
@@ -337,7 +426,7 @@ class Forest(IsaacEnv):
         terminated = misbehave | hasnan
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)
 
-        self.stats["safety"].add_(reward_safety)
+        self.stats["safety"].add_(r_esdf)
         self.stats["return"] += reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
 
