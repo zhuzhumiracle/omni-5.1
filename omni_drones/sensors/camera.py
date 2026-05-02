@@ -132,19 +132,62 @@ class Camera:
         for _ in range(2):
             self.sim.render()
 
+    def update(self, dt=None):
+        self.sim.render()
+
     def get_images(self) -> TensorDict:
         images_list = []
         for annotators in self.annotators:
             images_dict = {}
             for k, v in annotators.items():
-                img_tensor = wp.to_torch(v.get_data(device=self.device))
-                if img_tensor.dim() == 2:
-                    img_tensor = img_tensor.unsqueeze(0)
-                else:
-                    img_tensor = img_tensor.permute(2, 0, 1)
+                img_tensor = self._get_annotator_tensor(v, k)
+                img_tensor = self._format_annotator_tensor(img_tensor, k)
                 images_dict[k] = img_tensor
             images_list.append(TensorDict(images_dict, []))
         return torch.stack(images_list)
+
+    def _get_annotator_tensor(self, annotator, annotator_type: str) -> torch.Tensor:
+        for attempt in range(3):
+            img_tensor = wp.to_torch(annotator.get_data(device=self.device))
+            if img_tensor.numel() > 0:
+                return img_tensor
+            if attempt < 2:
+                self.sim.render()
+        raise RuntimeError(
+            f"Annotator '{annotator_type}' returned empty data after render retries. "
+            f"resolution={self.resolution}."
+        )
+
+    def _format_annotator_tensor(self, img_tensor: torch.Tensor, annotator_type: str) -> torch.Tensor:
+        """Normalize Replicator annotator output to channel-first [C, H, W]."""
+        height, width = self.shape
+        num_pixels = height * width
+
+        if img_tensor.dim() == 1:
+            if img_tensor.numel() == num_pixels:
+                return img_tensor.reshape(1, height, width)
+            if img_tensor.numel() > 0 and num_pixels > 0 and img_tensor.numel() % num_pixels == 0:
+                channels = img_tensor.numel() // num_pixels
+                return img_tensor.reshape(height, width, channels).permute(2, 0, 1)
+            raise RuntimeError(
+                f"Unexpected 1D annotator output for '{annotator_type}': "
+                f"numel={img_tensor.numel()}, expected {num_pixels} or a multiple of it "
+                f"for resolution={self.resolution}."
+            )
+
+        if img_tensor.dim() == 2:
+            return img_tensor.unsqueeze(0)
+
+        if img_tensor.dim() == 3:
+            if img_tensor.shape[0] in (1, 3, 4) and img_tensor.shape[-2:] == (height, width):
+                return img_tensor
+            if img_tensor.shape[:2] == (height, width):
+                return img_tensor.permute(2, 0, 1)
+
+        raise RuntimeError(
+            f"Unexpected annotator output shape for '{annotator_type}': "
+            f"shape={tuple(img_tensor.shape)}, resolution={self.resolution}."
+        )
 
     def _define_usd_camera_attributes(self, prim_path):
         """Creates and sets USD camera attributes.
@@ -193,15 +236,10 @@ class Camera:
             prim.GetAttribute(param).Set(param_value)
 
     def update_camera_orientation(self, prim_path: str, pitch: float, yaw: float, roll: float):
-        # Convert degrees to radians
-        pitch_rad = math.radians(pitch)
-        yaw_rad = math.radians(yaw)
-        roll_rad = math.radians(roll)
-
-        # Create Gf.Quatf objects for each rotation
-        rx = Gf.Rotation(Gf.Vec3d(1, 0, 0), pitch_rad)
-        ry = Gf.Rotation(Gf.Vec3d(0, 1, 0), roll_rad)
-        rz = Gf.Rotation(Gf.Vec3d(0, 0, 1), yaw_rad)
+        # Gf.Rotation expects angles in degrees.
+        rx = Gf.Rotation(Gf.Vec3d(1, 0, 0), pitch)
+        ry = Gf.Rotation(Gf.Vec3d(0, 1, 0), yaw)
+        rz = Gf.Rotation(Gf.Vec3d(0, 0, 1), roll)
 
         # Combine the quaternions
         matrix = rx * ry * rz
@@ -216,10 +254,12 @@ class Camera:
 def orientation_from_view(camera, target):
     camera_position = Gf.Vec3d(camera)
     target_position = Gf.Vec3d(target)
+    # USD cameras look along local -Z. SetLookAt builds a view matrix, while
+    # xformOp:orient needs the camera transform, so we invert before extracting
+    # the authored rotation. The scene uses Z-up coordinates.
     up_axis = Gf.Vec3d(0, 0, 1)
     matrix_gf = Gf.Matrix4d(1).SetLookAt(camera_position, target_position, up_axis)
-    matrix_gf = matrix_gf.GetInverse()
-    quat = matrix_gf.ExtractRotationQuat()
+    quat = matrix_gf.GetInverse().ExtractRotationQuat()
     orientation = (quat.real, *quat.imaginary)
     return orientation
 

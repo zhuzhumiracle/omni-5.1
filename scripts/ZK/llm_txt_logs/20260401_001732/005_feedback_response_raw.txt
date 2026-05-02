@@ -1,0 +1,68 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    dist = curr_dist.clamp_min(1e-6)
+    prev_dist_safe = prev_dist.clamp_min(1e-6)
+    speed = v_norm.clamp_min(0.0)
+    lidar = min_lidar_dist.clamp_min(1e-6)
+
+    progress = prev_dist_safe - dist
+    progress_reward = 80.0 * torch.tanh(3.0 * progress)
+
+    proximity_reward = 25.0 * torch.exp(-0.6 * dist)
+
+    success_bonus = (dist < 0.8).to(dist.dtype) * 1500.0
+    near_goal_bonus = torch.exp(-0.25 * dist) * 50.0
+
+    height_error = torch.abs(z_pos - 2.0)
+    height_penalty = -8.0 * torch.square(torch.relu(height_error - 0.25))
+
+    v_dir = v / speed.unsqueeze(-1).clamp_min(1e-6)
+    heading_align = torch.sum(x_body * v_dir, dim=-1)
+    move_reward = 4.0 * torch.tanh(speed) * heading_align
+
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = -0.08 * action_diff - 0.06 * omega_norm
+
+    overspeed_penalty = -0.6 * torch.square(torch.relu(speed - 5.0))
+
+    approach_vec = target_pos - curr_pos
+    approach_dir = torch.sum(approach_vec * v_dir, dim=-1)
+    approach_reward = 2.0 * torch.tanh(approach_dir / dist.clamp_min(1e-6))
+
+    obstacle_soft = -8.0 * torch.exp(-3.0 * lidar) - 2.0 / (lidar * lidar + 1e-4)
+    obstacle_hard = -(lidar < 0.6).to(lidar.dtype) * (60.0 + 120.0 / (lidar + 0.02))
+    obstacle_collision = -(lidar < 0.25).to(lidar.dtype) * (800.0 + 2000.0 / (lidar + 0.005))
+    obstacle_extreme = -2000.0 * torch.exp(-20.0 * lidar)
+
+    reward = (
+        progress_reward
+        + proximity_reward
+        + success_bonus
+        + near_goal_bonus
+        + height_penalty
+        + move_reward
+        + smooth_penalty
+        + overspeed_penalty
+        + approach_reward
+        + obstacle_soft
+        + obstacle_hard
+        + obstacle_collision
+        + obstacle_extreme
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```

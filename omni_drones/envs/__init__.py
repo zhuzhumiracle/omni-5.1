@@ -33,6 +33,7 @@ from .isaac_env import IsaacEnv
 
 try:
     from .single import Forest, Pinball
+    from .single import forest_lc, forest_singal, forest_weues
 except ModuleNotFoundError:
     print(
         "To run the environments which use `ContactSensor` and `RayCaster`,"

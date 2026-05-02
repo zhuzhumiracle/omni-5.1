@@ -4,7 +4,7 @@ hydra:
   # see https://hydra.cc/docs/advanced/search_path/
    - file://../cfg
 
-headless: true
+headless: false
 
 
 sim: ${task.sim}
@@ -13,7 +13,7 @@ env: ${task.env}
 total_frames: -1
 seed: 0
 # 在这里直接添加这一行，注意缩进与 headless 对齐
-checkpoint_path: /home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/wandb/run-20260219_043341-dk5a33h0/files/checkpoint_final.pt
+checkpoint_path: /home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/wandb/run-20260219_215847-zp1j3gmn/files/checkpoint_best_return_2939.65.pt
 viewer:
   resolution: [960, 720]
   eye: [8, 0., 6.]

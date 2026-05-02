@@ -41,6 +41,7 @@ def main(cfg):
 
     cfg.sim.enable_replicator = True
     cfg.sim.enable_viewport = True
+
     simulation_app = init_simulation_app(cfg)
     run = init_wandb(cfg)
     setproctitle(run.name)

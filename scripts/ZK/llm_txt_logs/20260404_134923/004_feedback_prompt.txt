@@ -1,0 +1,335 @@
+[SYSTEM]
+You are an elite reinforcement learning engineer and a PyTorch expert.
+
+Your goal is to write a highly optimized, purely PyTorch Tensor-based reward function for a UAV trajectory planning and obstacle avoidance task in a highly parallelized GPU simulator (Isaac Sim).
+
+All inputs are batched PyTorch Tensors.
+You MUST satisfy all of the following:
+
+1. Use only PyTorch tensor operations.
+2. Do NOT use Python math, numpy, or any Python loops.
+3. Do NOT output any import statements.
+4. Do NOT define any extra functions, classes, or helper methods.
+5. The only function you output must be:
+
+def compute_reward(**kwargs):
+    ...
+    return reward
+
+6. The returned reward must be a 1D PyTorch tensor of shape [num_envs].
+7. Every reward component added to the final reward must also have shape [num_envs].
+8. If an input variable is vector-valued (e.g. shape [num_envs, 3]), you MUST reduce it first using operations like torch.norm(..., dim=-1) or .sum(dim=-1) before combining it with scalar reward terms.
+9. Never reduce across the batch dimension.
+
+Anti-shortcut constraints:
+
+- Do NOT reward hovering or near-zero-speed behavior as a safe solution.
+- Do NOT reward very slow crawling or very high-speed rushing; prefer a moderate, task-appropriate forward speed.
+- When obstacle risk increases, penalize high v_norm, high |v_z|, and large omega together.
+- Do NOT solve obstacle avoidance mainly by climbing upward.
+- Altitude shaping must be smooth and secondary; obstacle-risk handling must take priority.
+- Include explicit penalties for low speed and upward escape near obstacles.
+- If the reward can be maximized by moving very slowly, add an explicit low-speed penalty.
+- If the reward can be maximized by rising when obstacles are near, add a near-obstacle vertical-motion penalty.
+- Prefer a speed band: add both low-speed and high-speed penalties so the best behavior is neither too slow nor too fast.
+
+[ASSISTANT_LAST_CODE]
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    tilt_cos = kwargs["tilt_cos"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    target_altitude = 2.0
+
+    target_vec = target_pos - curr_pos
+    target_dist_safe = torch.norm(target_vec, dim=-1).clamp_min(eps)
+    target_dir = target_vec / target_dist_safe.unsqueeze(-1)
+    forward_align = (x_body * target_dir).sum(dim=-1).clamp(-1.0, 1.0)
+
+    progress = prev_dist - curr_dist
+    progress_reward = torch.tanh(2.5 * progress)
+    dist_reward = torch.exp(-0.25 * curr_dist)
+
+    goal_radius = 6.0
+    goal_bonus = (curr_dist < goal_radius).float() * 8.0
+    close_goal_bonus = torch.exp(-1.2 * curr_dist) * 3.0
+
+    speed_target = 2.0
+    speed_low_penalty = torch.relu(speed_target - v_norm)
+    speed_high_penalty = torch.relu(v_norm - speed_target)
+    speed_band_penalty = 0.35 * torch.square(speed_low_penalty) + 0.25 * torch.square(speed_high_penalty)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = 0.08 * action_diff + 0.04 * omega_norm + 0.03 * torch.square(omega_norm)
+
+    global_tilt_penalty = 0.8 * torch.relu(0.85 - tilt_cos) + 0.15 * torch.square(torch.relu(0.95 - tilt_cos))
+
+    altitude_reg = -0.35 * torch.square(z_pos - target_altitude)
+
+    flip_mask = tilt_cos < 0.2
+    out_z_mask = (z_pos < 0.8) | (z_pos > 3.5)
+    death_penalty = (flip_mask | out_z_mask).float() * 60.0
+
+    safe_dist = min_lidar_dist.clamp_min(eps)
+    near_mask = (min_lidar_dist < 2.0).float()
+    critical_mask = (min_lidar_dist < 0.6).float()
+
+    obstacle_penalty = (
+        0.35 * torch.exp(-1.2 * safe_dist)
+        + 1.2 * torch.exp(-4.5 * safe_dist)
+        + 4.0 * torch.relu(0.4 - safe_dist)
+        + 10.0 * torch.relu(0.2 - safe_dist)
+    )
+
+    vz = v[:, 2]
+    near_speed_penalty = near_mask * (0.18 * v_norm + 0.08 * torch.square(v_norm))
+    near_vz_penalty = near_mask * (0.25 * torch.abs(vz) + 0.10 * torch.square(vz))
+    near_omega_penalty = near_mask * (0.10 * omega_norm + 0.05 * torch.square(omega_norm))
+    near_upward_escape_penalty = near_mask * torch.relu(vz) * 0.25
+
+    collision_risk_penalty = critical_mask * (
+        0.40 * v_norm
+        + 0.20 * torch.abs(vz)
+        + 0.12 * omega_norm
+        + 0.08 * torch.square(v_norm)
+        + 0.08 * torch.square(torch.abs(vz))
+        + 0.05 * torch.square(omega_norm)
+    )
+
+    alignment_reward = 0.8 * torch.relu(forward_align) * torch.exp(-0.15 * curr_dist)
+
+    reward = (
+        3.5 * progress_reward
+        + 1.4 * dist_reward
+        + 0.6 * close_goal_bonus
+        + goal_bonus
+        + alignment_reward
+        + altitude_reg
+        - obstacle_penalty
+        - near_speed_penalty
+        - near_vz_penalty
+        - near_omega_penalty
+        - near_upward_escape_penalty
+        - collision_risk_penalty
+        - speed_band_penalty
+        - smooth_penalty
+        - global_tilt_penalty
+        - death_penalty
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```
+
+[USER]
+Based on the reward function you just wrote, the current RL policy's actual success rate in the parallel simulator is 0.0%.
+
+Here is the replay-based relabeling feedback from historical trajectories:
+- selected 1 / 1 samples | collisions=1 | successes=0
+- selected altitude stats: z_max_mean=2.057 z_max_peak=2.057
+- selected vertical speed stats: v_z_mean=1.201 v_z_peak=1.201
+- sample 00 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.057 z_max=2.057 v_norm=2.314 v_z=-1.201 tilt_cos=0.372 action_abs_mean=13.308
+
+Special anomaly check:
+If the drone suddenly shoots upward or keeps gaining altitude without reaching the goal, treat it as a first-class failure mode.
+Before changing the reward, explicitly check whether:
+- upward thrust or z-position is being rewarded too strongly
+- obstacle avoidance is indirectly incentivizing climbing instead of navigating
+- the action-to-thrust mapping is too aggressive or inverted
+- the altitude penalty is weaker than the forward-progress reward
+- the coordinate frame or body-frame heading terms are mixed up
+- there is no hard ceiling termination or the ceiling is set too high
+
+When the feedback includes altitude-rich samples, reduce vertical runaway but DO NOT overfit by forcing a narrow altitude tunnel.
+
+Root-cause correction priority:
+- If near-obstacle trajectories still crash/flip, fix near-obstacle speed, angular-rate, and attitude terms first.
+- Penalize risky motion near obstacles (high v_norm, high |v_z|, high omega when min_lidar_dist is small) instead of relying on a hard altitude squeeze.
+- Avoid reward designs where altitude penalty dominates all other terms and suppresses forward navigation.
+- Prefer balanced shaping: progress + obstacle-aware slowdown + stability + moderate altitude regularization.
+- If the previous version reduced crashes only by staying at low altitude, treat this as a shortcut failure and rewrite the reward logic.
+- If the agent is minimizing reward by crawling forward very slowly, add a dedicated low-speed penalty and require meaningful motion for progress reward.
+- If the agent is racing too fast or crawling too slowly, add both low-speed and high-speed penalties and make the best reward occur at a moderate speed band.
+- If the agent is escaping obstacles by climbing upward, add a near-obstacle vertical-motion penalty and make it stronger than altitude regularization.
+
+Mandatory term retention across iterations:
+- Preserve an explicit death-like penalty term for severe flip and altitude out-of-bounds; do not delete it.
+- Preserve a global tilt penalty term that is always active; do not apply near_mask to this term.
+- Preserve smoothness penalties using both action_diff and omega norm.
+- Preserve a quadratic altitude regularization term; tune its coefficient instead of deleting it.
+- Preserve near-obstacle dynamic penalties for speed and vertical motion tied to min_lidar_dist.
+- Preserve an explicit low-speed penalty so near-zero-speed behavior cannot farm reward.
+- Preserve a high-speed penalty as well so the reward prefers moderate speed instead of rushing.
+- Preserve a near-obstacle upward-motion penalty so climbing is not used as the main collision-avoidance shortcut.
+
+Please carefully analyze this feedback and rewrite the entire compute_reward function.
+
+Critical diagnostic rules:
+1. If a collision/crash trajectory received a HIGH positive reward, then your obstacle penalty is broken, too weak, or logically inconsistent. You should strengthen the negative penalty for small min_lidar_dist, but keep it moderate and bounded. Avoid huge constants that dominate the whole reward or produce saturated negative values.
+2. If a successful target-reaching trajectory received a LOW reward, then your target-reaching incentive is too weak. You should strengthen progress reward, target proximity reward, or success bonus.
+3. If reward values are exploding, unstable, NaN, or Inf, your formula is numerically unsafe. Use clamp_min(1e-6) in denominators and avoid unstable expressions.
+4. If your code mixes a vector tensor of shape [num_envs, 3] directly with scalar tensors of shape [num_envs], the code is invalid. You MUST reduce vector-valued tensors to shape [num_envs] before combining them with scalar reward terms.
+5. Every reward component in the final sum MUST have shape [num_envs].
+6. The final returned reward MUST be a 1D PyTorch Tensor of shape [num_envs].
+7. Do NOT introduce any variables that are not explicitly provided in kwargs.
+8. Do NOT output import statements, helper functions, or extra explanations.
+9. Do NOT use ultra-tight altitude thresholds (for example, immediate strong penalties slightly above 2.0m such as 2.02/2.03) as the main anti-crash mechanism.
+10. Near-obstacle stability terms must be explicit and shape-safe, not implicit through altitude suppression.
+11. The rewritten code MUST include named terms equivalent to death_penalty, global_tilt_penalty, smooth_penalty, altitude_reg, obstacle_penalty, near_speed_penalty, and near_vz_penalty (exact names may differ, semantics must remain).
+12. Do NOT solve failures by removing safety terms; only rebalance coefficients and thresholds.
+
+Rewrite the full compute_reward function to fix the logical and numerical flaws.
+
+Output ONLY the improved code wrapped in a single python code block:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```
+
+[Environment Reward Parameters]
+goal_radius: 6.0
+goal_bonus: 2000.0
+collision_dist: 0.4
+collision_penalty: -10.0
+v_max: 4.0
+lambda_esdf: 0.5
+k_esdf: 1.6
+w_forward: 20
+w_smooth: -0.1
+w_max_speed: -0.5
+w_z: -2
+w_esdf: 2
+w_yaw: 1
+w_thrust: -0.5
+terminate_z_min: 0.8
+terminate_z_max: 3.5
+terminate_v_norm: 8
+Keep reward scales compatible with these values.
+
+[Baseline Reward Reference]
+You may borrow stable parts from this baseline while fixing failure cases.
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    tilt_cos = kwargs["tilt_cos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    # Goal-directed shaping.
+    progress_reward = torch.tanh(3.0 * (prev_dist - curr_dist))
+    proximity_reward = 1.8 * torch.exp(-0.30 * curr_dist)
+    goal_bonus = (curr_dist < 0.75).float() * 12.0
+
+    target_vec = target_pos - curr_pos
+    target_dir = target_vec / torch.norm(target_vec, dim=-1).clamp_min(eps).unsqueeze(-1)
+    forward_align = (x_body * target_dir).sum(dim=-1).clamp(-1.0, 1.0)
+    forward_reward = 0.40 * torch.clamp(forward_align, 0.0, 1.0)
+
+    # Always-on stability regularization.
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = 0.08 * action_diff + 0.05 * omega_norm
+    global_tilt_penalty = 0.5 * torch.relu(0.9 - tilt_cos)
+
+    # Quadratic altitude regularization around target altitude 2.0m.
+    altitude_reg = -0.3 * torch.square(z_pos - 2.0)
+
+    # Explicit death-like penalty (anti-termination-hacking).
+    is_flipped = tilt_cos < 0.18
+    is_out_of_bounds = (z_pos > 3.5) | (z_pos < 0.3)
+    death_penalty = (is_flipped | is_out_of_bounds).float() * 50.0
+
+    # Obstacle and near-obstacle dynamic penalties.
+    safe_dist = min_lidar_dist.clamp_min(eps)
+    near_mask = (min_lidar_dist < 2.0).float()
+    critical_mask = (min_lidar_dist < 0.35).float()
+
+    obstacle_penalty = (
+        0.5 * torch.exp(-1.5 * safe_dist)
+        + 1.5 * torch.exp(-4.0 * safe_dist)
+        + critical_mask * 10.0
+    )
+
+    near_speed_penalty = near_mask * (0.2 * v_norm + 0.1 * torch.square(v_norm))
+    near_vz_penalty = near_mask * (0.2 * torch.abs(v[:, 2]))
+
+    reward = (
+        3.8 * progress_reward
+        + 1.6 * proximity_reward
+        + goal_bonus
+        + forward_reward
+        + altitude_reg
+        - smooth_penalty
+        - global_tilt_penalty
+        - obstacle_penalty
+        - near_speed_penalty
+        - near_vz_penalty
+        - death_penalty
+    )
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```
+The output must be EXACTLY one python code block wrapped by ```python ... ```.
+Do NOT output anything outside that single python code block.
+
+Do NOT output:
+- import statements
+- explanations
+- comments outside the code block
+- helper functions
+- classes
+- markdown text outside the code block
+
+You must follow these coding requirements:
+
+1. Use only PyTorch vectorized tensor operations.
+2. Do NOT use numpy, math, scipy, or Python loops.
+3. Every reward component that contributes to the final reward MUST have shape [num_envs].
+4. If you use vector inputs such as curr_pos, target_pos, v, omega, or x_body, reduce them first to shape [num_envs] before combining them with scalar reward terms.
+5. Do NOT reduce scalar variables such as curr_dist, prev_dist, v_norm, min_lidar_dist, action_diff, tilt_cos, or z_pos across the batch dimension.
+6. Use numerically stable formulas. If a denominator appears, protect it with clamp_min(1e-6).
+7. Avoid reward explosions. Prefer bounded or smoothly scaled terms such as torch.tanh(...), torch.exp(-scale * error), or clamped penalties.
+8. The obstacle penalty should become very severe when min_lidar_dist approaches zero.
+9. Do NOT modify environment state. Only compute the reward tensor.
+10. Before returning reward, ensure it is a 1D PyTorch Tensor of shape [num_envs].
+11. Do NOT rely on a narrow altitude clamp as the main way to prevent collisions.
+12. Include explicit near-obstacle motion penalties tied to min_lidar_dist (for speed, vertical motion, and/or angular instability) in a numerically stable way.
+13. Keep altitude control as a secondary smooth regularizer; it must not dominate progress and obstacle-avoidance logic.
+14. Include an explicit death-like penalty term for severe flip or altitude out-of-bounds and subtract it in final reward.
+15. Include a global tilt penalty term that is always active (not multiplied by near_mask).
+16. Include a smoothness penalty term using both action_diff and omega norm.
+17. Include a quadratic altitude regularization term based on z_pos deviation from target altitude.
+18. If prior code already has the safety terms above, keep them and tune coefficients; do not remove them.
+
+Your final output must look like:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```

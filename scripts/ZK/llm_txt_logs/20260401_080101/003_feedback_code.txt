@@ -1,0 +1,62 @@
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    progress = prev_dist - curr_dist
+    r_progress = torch.tanh(8.0 * progress)
+
+    r_dist = torch.exp(-1.2 * curr_dist)
+    r_near_goal = torch.exp(-0.8 * curr_dist) * 3.0
+    r_success = (curr_dist < 0.75).to(curr_dist.dtype) * 100.0
+
+    direction = target_pos - curr_pos
+    direction_norm = torch.norm(direction, dim=-1).clamp_min(1e-6)
+    direction_unit = direction / direction_norm.unsqueeze(-1)
+    forward_align = (x_body * direction_unit).sum(dim=-1).clamp(-1.0, 1.0)
+    r_align = forward_align * torch.tanh(v_norm / 3.0)
+
+    z_err = torch.abs(z_pos - 2.0)
+    r_z = torch.relu(z_err - 0.25)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    r_omega = torch.tanh(omega_norm / 8.0)
+    r_smooth = torch.tanh(action_diff / 10.0)
+
+    r_speed = torch.relu(v_norm - 6.0).pow(2)
+
+    safe_lidar = min_lidar_dist.clamp_min(1e-6)
+    inv1 = 1.0 / safe_lidar
+    inv2 = 1.0 / safe_lidar.pow(2)
+    inv3 = 1.0 / safe_lidar.pow(3)
+    r_collision = -(2.0 * inv1 + 10.0 * inv2 + 30.0 * inv3)
+
+    r_danger = -20.0 * torch.exp(-6.0 * min_lidar_dist.clamp_min(0.0))
+    r_hard_collision = (min_lidar_dist < 0.35).to(min_lidar_dist.dtype) * (-200.0 - 500.0 * torch.relu(0.35 - min_lidar_dist))
+
+    reward = (
+        12.0 * r_progress
+        + 5.0 * r_dist
+        + 4.0 * r_near_goal
+        + r_success
+        + 2.0 * r_align
+        - 3.0 * r_z
+        - 0.5 * r_omega
+        - 0.2 * r_smooth
+        - 0.3 * r_speed
+        + r_collision
+        + r_danger
+        + r_hard_collision
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward

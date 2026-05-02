@@ -1,0 +1,196 @@
+[SYSTEM]
+You are an elite reinforcement learning engineer and a PyTorch expert.
+
+Your goal is to write a highly optimized, purely PyTorch Tensor-based reward function for a UAV trajectory planning and obstacle avoidance task in a highly parallelized GPU simulator (Isaac Sim).
+
+All inputs are batched PyTorch Tensors.
+You MUST satisfy all of the following:
+
+1. Use only PyTorch tensor operations.
+2. Do NOT use Python math, numpy, or any Python loops.
+3. Do NOT output any import statements.
+4. Do NOT define any extra functions, classes, or helper methods.
+5. The only function you output must be:
+
+def compute_reward(**kwargs):
+    ...
+    return reward
+
+6. The returned reward must be a 1D PyTorch tensor of shape [num_envs].
+7. Every reward component added to the final reward must also have shape [num_envs].
+8. If an input variable is vector-valued (e.g. shape [num_envs, 3]), you MUST reduce it first using operations like torch.norm(..., dim=-1) or .sum(dim=-1) before combining it with scalar reward terms.
+9. Never reduce across the batch dimension.
+
+[ASSISTANT_LAST_CODE]
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    progress = prev_dist - curr_dist
+    progress_reward = 25.0 * torch.tanh(3.0 * progress)
+
+    dist_reward = 6.0 * torch.exp(-0.35 * curr_dist)
+
+    success_bonus = (curr_dist < 0.8).to(curr_dist.dtype) * 400.0
+
+    height_error = torch.abs(z_pos - 2.0)
+    height_reward = -2.0 * torch.tanh(2.0 * torch.clamp(height_error - 0.25, min=0.0))
+
+    v_norm_safe = v_norm.clamp_min(1e-6)
+    v_dir = v / v_norm_safe.unsqueeze(-1)
+    heading_align = torch.sum(x_body * v_dir, dim=-1)
+    move_reward = 1.5 * heading_align * torch.tanh(v_norm)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = -0.08 * action_diff - 0.03 * omega_norm
+
+    speed_penalty = -0.25 * torch.square(torch.relu(v_norm - 5.0))
+
+    safe_dist = min_lidar_dist.clamp_min(1e-6)
+    obstacle_soft = -3.0 * torch.exp(-3.5 * safe_dist) - 2.0 / (safe_dist * safe_dist + 1e-3)
+    obstacle_hard = -(safe_dist < 0.5).to(safe_dist.dtype) * (
+        20.0 + 80.0 / (safe_dist + 0.02)
+    )
+
+    approach_dir = torch.sum((target_pos - curr_pos) * v_dir, dim=-1)
+    approach_reward = 0.5 * torch.tanh(approach_dir / curr_dist.clamp_min(1e-6))
+
+    reward = (
+        progress_reward
+        + dist_reward
+        + success_bonus
+        + height_reward
+        + move_reward
+        + smooth_penalty
+        + speed_penalty
+        + obstacle_soft
+        + obstacle_hard
+        + approach_reward
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```
+
+[USER]
+Based on the reward function you just wrote, the current RL policy's actual success rate in the parallel simulator is 0.0%.
+
+Here is the replay-based relabeling feedback from historical trajectories:
+- 样本 0 【发生碰撞】: 你的代码打分为 0.3802
+- 样本 1 【发生碰撞】: 你的代码打分为 0.4322
+- 样本 2 【发生碰撞】: 你的代码打分为 -0.0112
+- 样本 3 【发生碰撞】: 你的代码打分为 -0.4956
+- 样本 4 【发生碰撞】: 你的代码打分为 0.3411
+- 样本 5 【发生碰撞】: 你的代码打分为 -0.9872
+- 样本 6 【发生碰撞】: 你的代码打分为 0.5368
+- 样本 7 【发生碰撞】: 你的代码打分为 0.5452
+- 样本 8 【发生碰撞】: 你的代码打分为 0.3446
+- 样本 9 【发生碰撞】: 你的代码打分为 0.3986
+
+Please carefully analyze this feedback and rewrite the entire compute_reward function.
+
+Critical diagnostic rules:
+1. If a collision/crash trajectory received a HIGH positive reward, then your obstacle penalty is broken, too weak, or logically inconsistent. You MUST drastically strengthen the negative penalty for small min_lidar_dist.
+2. If a successful target-reaching trajectory received a LOW reward, then your target-reaching incentive is too weak. You should strengthen progress reward, target proximity reward, or success bonus.
+3. If reward values are exploding, unstable, NaN, or Inf, your formula is numerically unsafe. Use clamp_min(1e-6) in denominators and avoid unstable expressions.
+4. If your code mixes a vector tensor of shape [num_envs, 3] directly with scalar tensors of shape [num_envs], the code is invalid. You MUST reduce vector-valued tensors to shape [num_envs] before combining them with scalar reward terms.
+5. Every reward component in the final sum MUST have shape [num_envs].
+6. The final returned reward MUST be a 1D PyTorch Tensor of shape [num_envs].
+7. Do NOT introduce any variables that are not explicitly provided in kwargs.
+8. Do NOT output import statements, helper functions, or extra explanations.
+
+Rewrite the full compute_reward function to fix the logical and numerical flaws.
+
+Output ONLY the improved code wrapped in a single python code block:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```
+
+[Baseline Reward Reference]
+You may borrow stable parts from this baseline while fixing failure cases.
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    r_forward = prev_dist - curr_dist
+    r_smooth = torch.clamp(torch.norm(omega, dim=-1) + action_diff, max=50.0)
+    r_max_speed = torch.square(torch.relu(v_norm - 4.0))
+    r_z = torch.relu(torch.abs(z_pos - 2.0) - 0.3)
+    r_esdf = -0.5 * torch.exp(-1.6 * (min_lidar_dist ** 2))
+
+    speed_mask = (v_norm > 0.5).float()
+    move_dir = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
+    r_yaw = ((x_body * move_dir).sum(dim=-1)) * speed_mask
+
+    r_goal = (curr_dist < 6.0).float() * 2000.0
+    r_collision = (min_lidar_dist < 0.4).float() * (-10.0)
+
+    reward = (
+        20.0 * r_forward
+        - 0.1 * r_smooth
+        - 0.5 * r_max_speed
+        - 2.0 * r_z
+        + 2.0 * r_esdf
+        + r_collision
+        + 1.0 * r_yaw
+        + r_goal
+    )
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward * 0.2
+```
+The output must be EXACTLY one python code block wrapped by ```python ... ```.
+Do NOT output anything outside that single python code block.
+
+Do NOT output:
+- import statements
+- explanations
+- comments outside the code block
+- helper functions
+- classes
+- markdown text outside the code block
+
+You must follow these coding requirements:
+
+1. Use only PyTorch vectorized tensor operations.
+2. Do NOT use numpy, math, scipy, or Python loops.
+3. Every reward component that contributes to the final reward MUST have shape [num_envs].
+4. If you use vector inputs such as curr_pos, target_pos, v, omega, or x_body, reduce them first to shape [num_envs] before combining them with scalar reward terms.
+5. Do NOT reduce scalar variables such as curr_dist, prev_dist, v_norm, min_lidar_dist, action_diff, tilt_cos, or z_pos across the batch dimension.
+6. Use numerically stable formulas. If a denominator appears, protect it with clamp_min(1e-6).
+7. Avoid reward explosions. Prefer bounded or smoothly scaled terms such as torch.tanh(...), torch.exp(-scale * error), or clamped penalties.
+8. The obstacle penalty should become very severe when min_lidar_dist approaches zero.
+9. Do NOT modify environment state. Only compute the reward tensor.
+10. Before returning reward, ensure it is a 1D PyTorch Tensor of shape [num_envs].
+
+Your final output must look like:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```

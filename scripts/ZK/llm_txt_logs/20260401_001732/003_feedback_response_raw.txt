@@ -1,0 +1,60 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    progress = prev_dist - curr_dist
+    progress_reward = 25.0 * torch.tanh(3.0 * progress)
+
+    dist_reward = 6.0 * torch.exp(-0.35 * curr_dist)
+
+    success_bonus = (curr_dist < 0.8).to(curr_dist.dtype) * 400.0
+
+    height_error = torch.abs(z_pos - 2.0)
+    height_reward = -2.0 * torch.tanh(2.0 * torch.clamp(height_error - 0.25, min=0.0))
+
+    v_norm_safe = v_norm.clamp_min(1e-6)
+    v_dir = v / v_norm_safe.unsqueeze(-1)
+    heading_align = torch.sum(x_body * v_dir, dim=-1)
+    move_reward = 1.5 * heading_align * torch.tanh(v_norm)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = -0.08 * action_diff - 0.03 * omega_norm
+
+    speed_penalty = -0.25 * torch.square(torch.relu(v_norm - 5.0))
+
+    safe_dist = min_lidar_dist.clamp_min(1e-6)
+    obstacle_soft = -3.0 * torch.exp(-3.5 * safe_dist) - 2.0 / (safe_dist * safe_dist + 1e-3)
+    obstacle_hard = -(safe_dist < 0.5).to(safe_dist.dtype) * (
+        20.0 + 80.0 / (safe_dist + 0.02)
+    )
+
+    approach_dir = torch.sum((target_pos - curr_pos) * v_dir, dim=-1)
+    approach_reward = 0.5 * torch.tanh(approach_dir / curr_dist.clamp_min(1e-6))
+
+    reward = (
+        progress_reward
+        + dist_reward
+        + success_bonus
+        + height_reward
+        + move_reward
+        + smooth_penalty
+        + speed_penalty
+        + obstacle_soft
+        + obstacle_hard
+        + approach_reward
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```

@@ -1,0 +1,46 @@
+hydra:
+  searchpath:
+    - file://../../cfg
+
+headless: false
+
+sim: ${task.sim}
+env: ${task.env}
+
+seed: 0
+sim_gpu_index: 0
+enable_viewport: false
+final_eval_rounds: 10
+max_steps: 6000
+num_episodes: 10
+camera_update_interval: 1
+stop_on_done: true
+auto_reset_when_done: false
+
+demo_num_envs: 100
+demo_relaxed_termination: true
+demo_reset_on_collision: false
+demo_collision_dist: 0.03
+demo_collision_force_threshold: 9999.0
+demo_flip_consecutive_steps: 12
+demo_terminate_z_min: 0.2
+demo_terminate_z_max: 6.0
+demo_terminate_v_norm: 20.0
+
+# 支持 .pt 文件或目录；目录时优先 checkpoint_final.pt，否则自动选最新 .pt
+checkpoint_path: goodpt/4-18_best_return_520.11.pt
+
+viewer:
+  resolution: [2560, 1440]
+  eye: [5.5, -5.5, 2.6]
+  lookat: [0.0, 0.0, 1.0]
+
+task:
+  follow_camera: true
+  follow_camera_eye_offset: [6.0, 0.0, 2.0]
+  follow_camera_lookat_offset: [2.5, 0.0, 0.5]
+
+defaults:
+  - task: forest_singal
+  - algo: ppo
+  - _self_

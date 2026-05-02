@@ -151,3 +151,6 @@ examples/*.mp4
 
 # sphinx docs output
 docs/html
+
+# depth debug dumps
+scripts/ZK/depth_debug/

@@ -1,0 +1,53 @@
+name: forest_weues
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+env:
+  num_envs: 150
+  max_episode_length: 1500
+
+# ../viewer:
+#   eye: [0., 8., 6.]
+
+drone_model:
+  name: Hummingbird
+  controller: LeePositionController
+
+time_encoding: true
+
+lidar_range: 10.
+lidar_vfov: [-10., 20.]
+
+action_transform: null
+
+reward_effort_weight: 0.1
+
+# ===== curriculum stage-1 (easy) =====
+goal_radius: 6.0
+goal_bonus: 2000.0
+collision_dist: 0.4
+collision_penalty: -10.0
+
+v_max: 4.0
+z_min: 0.4
+z_max: 3.8
+lambda_esdf: 0.5
+k_esdf: 1.6
+
+w_forward: 20
+w_smooth: -0.1
+w_max_speed: -0.5
+w_z: -2
+w_esdf: 2
+w_yaw: 1
+w_thrust: -0.5
+
+terminate_z_min: 0.8
+terminate_z_max: 3.5
+terminate_v_norm: 8
+
+sim:
+  enable_replicator: true

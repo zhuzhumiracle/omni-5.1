@@ -1,0 +1,56 @@
+Based on the reward function you just wrote, the current RL policy's actual success rate in the parallel simulator is {win_rate}.
+
+Here is the replay-based relabeling feedback from historical trajectories:
+{current_output}
+
+Special anomaly check:
+If the drone suddenly shoots upward or keeps gaining altitude without reaching the goal, treat it as a first-class failure mode.
+Before changing the reward, explicitly check whether:
+- upward thrust or z-position is being rewarded too strongly
+- obstacle avoidance is indirectly incentivizing climbing instead of navigating
+- the action-to-thrust mapping is too aggressive or inverted
+- the altitude penalty is weaker than the forward-progress reward
+- the coordinate frame or body-frame heading terms are mixed up
+- there is no hard ceiling termination or the ceiling is set too high
+
+When the feedback includes altitude-rich samples, reduce vertical runaway but DO NOT overfit by forcing a narrow altitude tunnel.
+
+Root-cause correction priority:
+- If near-obstacle trajectories still crash/flip, fix near-obstacle speed, angular-rate, and attitude terms first.
+- Penalize risky motion near obstacles (high v_norm, high |v_z|, high omega when min_lidar_dist is small) instead of relying on a hard altitude squeeze.
+- Avoid reward designs where altitude penalty dominates all other terms and suppresses forward navigation.
+- Prefer balanced shaping: progress + obstacle-aware slowdown + stability + moderate altitude regularization.
+- If the previous version reduced crashes only by staying at low altitude, treat this as a shortcut failure and rewrite the reward logic.
+- If the agent is minimizing reward by crawling forward very slowly, add a dedicated low-speed penalty and require meaningful motion for progress reward.
+- If the agent is racing too fast or crawling too slowly, add both low-speed and high-speed penalties and make the best reward occur at a moderate speed band.
+- If the agent is escaping obstacles by climbing upward, add a near-obstacle vertical-motion penalty and make it stronger than altitude regularization.
+
+Mandatory term retention across iterations:
+- Prefer keeping strong safety logic across iterations (failure/flip handling, tilt stabilization, smoothness, altitude regularization, and near-obstacle motion control), and tune coefficients first.
+- If removing a term, ensure equivalent behavior is preserved by other terms and explain it via the resulting code structure.
+
+Please carefully analyze this feedback and rewrite the entire compute_reward function.
+
+Critical diagnostic rules:
+1. If a collision/crash trajectory received a HIGH positive reward, then your obstacle penalty is broken, too weak, or logically inconsistent. You should strengthen the negative penalty for small min_lidar_dist, but keep it moderate and bounded. Avoid huge constants that dominate the whole reward or produce saturated negative values.
+2. If a successful target-reaching trajectory received a LOW reward, then your target-reaching incentive is too weak. You should strengthen progress reward, target proximity reward, or success bonus.
+3. If reward values are exploding, unstable, NaN, or Inf, your formula is numerically unsafe. Use clamp_min(1e-6) in denominators and avoid unstable expressions.
+4. If your code mixes a vector tensor of shape [num_envs, 3] directly with scalar tensors of shape [num_envs], the code is invalid. You MUST reduce vector-valued tensors to shape [num_envs] before combining them with scalar reward terms.
+5. Every reward component in the final sum MUST have shape [num_envs].
+6. The final returned reward MUST be a 1D PyTorch Tensor of shape [num_envs].
+7. Do not assume unavailable keys exist in kwargs; use safe access patterns and fallbacks when needed.
+8. Do NOT output import statements, helper functions, or extra explanations.
+9. Do NOT use ultra-tight altitude thresholds (for example, immediate strong penalties slightly above 2.0m such as 2.02/2.03) as the main anti-crash mechanism.
+10. Near-obstacle stability terms must be explicit and shape-safe, not implicit through altitude suppression.
+11. Prefer keeping terms semantically equivalent to failure penalty, global tilt stabilization, smoothness, altitude regularization, obstacle handling, near-speed penalty, and near-vertical-motion penalty.
+12. Prioritize coefficient/threshold rebalancing before drastic structural deletion of safety logic.
+
+Rewrite the full compute_reward function to fix the logical and numerical flaws.
+
+Output ONLY the improved code wrapped in a single python code block:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```

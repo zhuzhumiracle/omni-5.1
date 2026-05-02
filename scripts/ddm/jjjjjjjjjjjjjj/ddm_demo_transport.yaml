@@ -1,0 +1,38 @@
+# hydra.job.chdir: false
+hydra:
+  searchpath: # 去哪里找配置文件？
+    # see https://hydra.cc/docs/advanced/search_path/
+    - file:///home/descfly/visualandlidar/base/omni-5.1/OmniDrones/cfg
+
+headless: True # 是否弹出渲染窗口
+
+# 这里实在映射，就是把我们cfg/task/Forest.yaml文件夹下面的sim/env参数映射到根节点的sim/env
+sim: ${task.sim}
+env: ${task.env}
+
+total_frames: 100_000 # 总共训练多少帧
+max_iters: -1
+eval_interval: -1
+save_interval: -1
+seed: 0
+
+viewer:
+  resolution: [960, 720] # 可视化窗口分辨率
+  eye: [8, 0., 6.] # 相机坐标
+  lookat: [0., 0., 1.]
+
+wandb:
+  group: ${oc.select:..task.name}
+  run_name: ${oc.select:..task.name,test}-${oc.select:..algo.name,none}
+  job_type: train
+  entity: "3218371195-" 
+  project:  "c"
+  mode: online # set to 'offonline' when debugging locally
+  run_id:
+  monitor_gym: True
+  tags:
+
+defaults:
+  - task: Transport/TransportFlyThrough
+  - algo: ppo
+  - _self_

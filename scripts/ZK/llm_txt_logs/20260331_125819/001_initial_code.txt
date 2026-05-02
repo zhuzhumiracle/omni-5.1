@@ -1,0 +1,56 @@
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    tilt_cos = kwargs["tilt_cos"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    dist_progress = prev_dist - curr_dist
+    progress_reward = torch.tanh(3.0 * dist_progress)
+
+    goal_close = torch.exp(-1.5 * curr_dist)
+    reach_bonus = (curr_dist < 0.6).to(curr_dist.dtype) * 20.0
+    near_goal_bonus = (curr_dist < 2.0).to(curr_dist.dtype) * 3.0 * goal_close
+
+    height_error = torch.abs(z_pos - 2.0)
+    height_reward = torch.exp(-1.2 * height_error)
+    height_penalty = torch.relu(height_error - 0.35)
+
+    speed_penalty = torch.relu(v_norm - 4.0) ** 2
+    smooth_penalty = action_diff + 0.05 * torch.norm(omega, dim=-1)
+    upright_reward = tilt_cos.clamp(min=-1.0, max=1.0)
+
+    vel_norm = v_norm.clamp_min(1e-6)
+    move_dir = v / vel_norm.unsqueeze(-1)
+    align = (x_body * move_dir).sum(dim=-1)
+    align_reward = torch.where(v_norm > 0.3, align, torch.zeros_like(v_norm))
+
+    obs_safe = torch.clamp(min_lidar_dist, min=1e-3)
+    obstacle_penalty = 1.5 * torch.exp(-3.0 * obs_safe) + 0.2 / obs_safe
+    danger_penalty = (min_lidar_dist < 0.6).to(min_lidar_dist.dtype) * (2.0 + 4.0 * torch.relu(0.6 - min_lidar_dist))
+
+    reward = (
+        6.0 * progress_reward
+        + 2.0 * goal_close
+        + reach_bonus
+        + near_goal_bonus
+        + 1.5 * height_reward
+        - 2.5 * height_penalty
+        - 0.8 * speed_penalty
+        - 0.6 * smooth_penalty
+        + 0.8 * upright_reward
+        + 0.4 * align_reward
+        - 3.0 * obstacle_penalty
+        - 4.0 * danger_penalty
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward

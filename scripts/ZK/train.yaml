@@ -1,0 +1,56 @@
+# hydra.job.chdir: false
+hydra:
+  searchpath: # 去哪里找配置文件？
+    # see https://hydra.cc/docs/advanced/search_path/
+    - file:///home/descfly/visualandlidar/base/omni-5.1/OmniDrones/cfg
+
+headless: true # 是否弹出渲染窗口
+
+# 这里实在映射，就是把我们cfg/task/Forest.yaml文件夹下面的sim/env参数映射到根节点的sim/env
+sim: ${task.sim}
+env: ${task.env}
+
+total_frames: 40_000_000 # 总共训练多少帧
+max_iters: -1
+eval_interval: -1
+save_interval: -1
+eval_video_interval: 1
+eval_export_topk: true
+eval_topk_trajectories: 150
+seed: 0
+
+# 训练初始化模式：
+
+# - scratch: 从头开始训练
+# - goodpt: 从已有 checkpoint 继续训练
+init_mode: scratch
+# 可填 .pt 文件，或填写目录（优先 checkpoint_final.pt，否则选最新修改的 .pt）
+# 相对路径按本脚本所在目录 OmniDrones/scripts/ZK 解析
+goodpt_path: goodpt/4-17_return_501.84.pt
+
+viewer:
+  resolution: [2560, 1440] # 可视化窗口分辨率
+  eye: [8, 0., 6.] # 相机坐标
+  lookat: [0., 0., 1.]
+
+
+wandb:
+  group: ${oc.select:..task.name}
+  run_name: ${oc.select:..task.name,test}-${oc.select:..algo.name,none}
+  job_type: train
+  entity: "3218371195-" 
+  project:  "c"
+  mode: online # set to 'offonline' when debugging locally
+  run_id:
+  monitor_gym: True
+  tags:
+
+tensorboard:
+  enabled: true
+  # 留空则默认写入 wandb 运行目录下的 tb 子目录
+  log_dir: ""
+
+defaults:
+  - task: forest_lc
+  - algo: ppo
+  - _self_

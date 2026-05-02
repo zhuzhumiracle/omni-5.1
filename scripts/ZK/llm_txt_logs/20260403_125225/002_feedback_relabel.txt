@@ -1,0 +1,33 @@
+- selected 30 / 90 samples | collisions=30 | successes=0
+- selected altitude stats: z_max_mean=1.969 z_max_peak=2.023
+- selected vertical speed stats: v_z_mean=0.199 v_z_peak=1.076
+- sample 00 [collision] score=0.2866 z_mean=1.983 z_max=1.983 v_norm=1.130 v_z=-0.572 tilt_cos=0.429 action_abs_mean=0.907
+- sample 01 [collision] score=0.2477 z_mean=1.876 z_max=1.876 v_norm=1.627 v_z=-0.398 tilt_cos=0.495 action_abs_mean=1.211
+- sample 02 [collision] score=0.2412 z_mean=1.849 z_max=1.849 v_norm=2.231 v_z=-1.076 tilt_cos=0.644 action_abs_mean=0.933
+- sample 03 [collision] score=0.2465 z_mean=1.983 z_max=1.983 v_norm=0.995 v_z=-0.517 tilt_cos=0.539 action_abs_mean=0.852
+- sample 04 [collision] score=0.5959 z_mean=1.805 z_max=1.805 v_norm=1.387 v_z=0.103 tilt_cos=0.692 action_abs_mean=1.020
+- sample 05 [collision] score=0.3925 z_mean=1.992 z_max=1.992 v_norm=1.070 v_z=0.534 tilt_cos=0.623 action_abs_mean=0.932
+- sample 06 [collision] score=1.1623 z_mean=1.956 z_max=1.956 v_norm=1.245 v_z=-0.236 tilt_cos=0.982 action_abs_mean=0.842
+- sample 07 [collision] score=0.8384 z_mean=2.023 z_max=2.023 v_norm=0.650 v_z=0.287 tilt_cos=0.882 action_abs_mean=0.774
+- sample 08 [collision] score=0.2963 z_mean=1.845 z_max=1.845 v_norm=1.504 v_z=0.091 tilt_cos=0.773 action_abs_mean=1.071
+- sample 09 [collision] score=0.3117 z_mean=1.991 z_max=1.991 v_norm=0.361 v_z=-0.142 tilt_cos=0.927 action_abs_mean=0.898
+- sample 10 [collision] score=0.3985 z_mean=1.993 z_max=1.993 v_norm=0.341 v_z=-0.086 tilt_cos=0.953 action_abs_mean=0.787
+- sample 11 [collision] score=0.7815 z_mean=1.955 z_max=1.955 v_norm=1.176 v_z=-0.490 tilt_cos=0.796 action_abs_mean=0.727
+- sample 12 [collision] score=0.4697 z_mean=1.999 z_max=1.999 v_norm=0.193 v_z=0.094 tilt_cos=0.996 action_abs_mean=0.829
+- sample 13 [collision] score=0.8680 z_mean=2.008 z_max=2.008 v_norm=0.479 v_z=0.246 tilt_cos=0.955 action_abs_mean=0.853
+- sample 14 [collision] score=0.6778 z_mean=1.996 z_max=1.996 v_norm=0.449 v_z=-0.031 tilt_cos=0.921 action_abs_mean=0.842
+- sample 15 [collision] score=1.1099 z_mean=1.980 z_max=1.980 v_norm=0.719 v_z=-0.122 tilt_cos=0.959 action_abs_mean=0.908
+- sample 16 [collision] score=-5.7469 z_mean=2.000 z_max=2.000 v_norm=0.000 v_z=0.000 tilt_cos=0.749 action_abs_mean=0.787
+- sample 17 [collision] score=-6.7062 z_mean=2.000 z_max=2.000 v_norm=0.000 v_z=0.000 tilt_cos=0.812 action_abs_mean=0.914
+- sample 18 [collision] score=0.2074 z_mean=2.005 z_max=2.005 v_norm=0.284 v_z=0.028 tilt_cos=0.992 action_abs_mean=0.666
+- sample 19 [collision] score=0.9909 z_mean=1.937 z_max=1.937 v_norm=1.506 v_z=0.032 tilt_cos=0.999 action_abs_mean=0.822
+- sample 20 [collision] score=-6.0268 z_mean=2.000 z_max=2.000 v_norm=0.000 v_z=0.000 tilt_cos=0.991 action_abs_mean=1.379
+- sample 21 [collision] score=0.5654 z_mean=1.985 z_max=1.985 v_norm=0.359 v_z=-0.100 tilt_cos=0.871 action_abs_mean=0.847
+- sample 22 [collision] score=0.5225 z_mean=2.022 z_max=2.022 v_norm=0.447 v_z=0.050 tilt_cos=0.881 action_abs_mean=0.811
+- sample 23 [collision] score=0.6521 z_mean=1.997 z_max=1.997 v_norm=0.333 v_z=-0.050 tilt_cos=0.884 action_abs_mean=0.695
+- sample 24 [collision] score=-5.3565 z_mean=2.000 z_max=2.000 v_norm=0.000 v_z=0.000 tilt_cos=0.864 action_abs_mean=0.764
+- sample 25 [collision] score=1.3410 z_mean=1.909 z_max=1.909 v_norm=1.506 v_z=0.172 tilt_cos=0.984 action_abs_mean=0.809
+- sample 26 [collision] score=0.3228 z_mean=1.997 z_max=1.997 v_norm=0.133 v_z=-0.026 tilt_cos=0.929 action_abs_mean=0.847
+- sample 27 [collision] score=0.9164 z_mean=1.994 z_max=1.994 v_norm=0.255 v_z=-0.033 tilt_cos=0.893 action_abs_mean=0.741
+- sample 28 [collision] score=1.3665 z_mean=1.985 z_max=1.985 v_norm=0.513 v_z=0.152 tilt_cos=0.955 action_abs_mean=0.710
+- sample 29 [collision] score=0.8714 z_mean=2.016 z_max=2.016 v_norm=0.733 v_z=0.305 tilt_cos=0.925 action_abs_mean=0.863

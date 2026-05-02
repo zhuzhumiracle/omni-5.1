@@ -1,0 +1,63 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    tilt_cos = kwargs["tilt_cos"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    progress = prev_dist - curr_dist
+    progress_reward = 25.0 * torch.tanh(4.0 * progress)
+
+    target_reward = 6.0 * torch.exp(-0.35 * curr_dist)
+    close_target_bonus = (curr_dist < 3.0).to(curr_dist.dtype) * (20.0 * torch.exp(-0.8 * curr_dist))
+    success_bonus = (curr_dist < 0.5).to(curr_dist.dtype) * 500.0
+
+    height_error = torch.abs(z_pos - 2.0)
+    height_penalty = 6.0 * torch.square(torch.relu(height_error - 0.2))
+
+    speed_penalty = 0.25 * torch.square(torch.relu(v_norm - 4.5)) + 0.02 * torch.square(v_norm)
+    smooth_penalty = 0.10 * action_diff + 0.05 * torch.norm(omega, dim=-1)
+
+    upright_reward = 1.5 * torch.clamp(tilt_cos, min=-1.0, max=1.0)
+
+    move_dir = v / v_norm.clamp_min(eps).unsqueeze(-1)
+    align_reward = 0.8 * torch.sum(x_body * move_dir, dim=-1) * torch.tanh(v_norm)
+
+    lidar = min_lidar_dist.clamp_min(0.0)
+    obstacle_warning = 8.0 * torch.exp(-4.0 * lidar)
+    obstacle_penalty = 60.0 * torch.exp(-10.0 * lidar) + 180.0 * torch.exp(-25.0 * lidar)
+    obstacle_crash_penalty = 1200.0 / lidar.clamp_min(0.05) + 5000.0 * torch.exp(-80.0 * lidar)
+    collision_penalty = (min_lidar_dist < 0.4).to(min_lidar_dist.dtype) * (
+        300.0 + 2000.0 * torch.square(torch.relu(0.4 - min_lidar_dist))
+    )
+
+    reward = (
+        progress_reward
+        + target_reward
+        + close_target_bonus
+        + success_bonus
+        + upright_reward
+        + align_reward
+        - height_penalty
+        - speed_penalty
+        - smooth_penalty
+        - obstacle_warning
+        - obstacle_penalty
+        - obstacle_crash_penalty
+        - collision_penalty
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```

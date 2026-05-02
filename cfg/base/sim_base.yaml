@@ -1,11 +1,11 @@
 sim:
-  dt: 0.016
+  dt: 0.02
   substeps: 1
   gravity: [0, 0, -9.81]
   replicate_physics: false
   use_flatcache: true
   use_gpu_pipeline: true
-  device: "cuda:0"
+  device: "cuda:1"
 
   solver_type: 1
   use_gpu: True # set to False to run on CPU

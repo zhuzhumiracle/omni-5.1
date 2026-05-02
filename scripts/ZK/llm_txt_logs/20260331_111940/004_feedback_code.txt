@@ -1,0 +1,61 @@
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    progress = prev_dist - curr_dist
+    progress_reward = 35.0 * torch.tanh(3.0 * progress)
+
+    target_proximity = 18.0 * torch.exp(-0.25 * curr_dist)
+    near_goal_bonus = (curr_dist < 4.0).to(curr_dist.dtype) * (40.0 * torch.exp(-0.5 * curr_dist))
+    success_bonus = (curr_dist < 0.6).to(curr_dist.dtype) * 1200.0
+
+    height_error = torch.abs(z_pos - 2.0)
+    height_penalty = 10.0 * torch.square(torch.relu(height_error - 0.25))
+
+    speed_penalty = 0.15 * torch.square(torch.relu(v_norm - 5.0)) + 0.015 * torch.square(v_norm)
+    smooth_penalty = 0.08 * torch.clamp(torch.norm(omega, dim=-1) + action_diff, max=50.0)
+
+    move_dir = v / v_norm.clamp_min(eps).unsqueeze(-1)
+    heading_alignment = torch.sum(x_body * move_dir, dim=-1)
+    align_reward = 1.0 * torch.tanh(v_norm) * heading_alignment
+
+    upright_proxy = torch.clamp(1.0 - 0.5 * torch.square(torch.relu(torch.abs(z_pos - 2.0) - 0.5)), min=-1.0, max=1.0)
+    upright_reward = 0.5 * upright_proxy
+
+    lidar = min_lidar_dist.clamp_min(0.0)
+    safe_dist = torch.clamp(lidar - 0.4, min=0.0)
+    obstacle_warning = 12.0 * torch.exp(-3.0 * lidar)
+    obstacle_penalty = 80.0 * torch.exp(-10.0 * lidar) + 400.0 * torch.exp(-30.0 * lidar) + 2500.0 * torch.exp(-80.0 * lidar)
+    collision_penalty = (min_lidar_dist < 0.4).to(min_lidar_dist.dtype) * (500.0 + 4000.0 * torch.square(torch.relu(0.4 - min_lidar_dist)))
+    severe_crash_penalty = 3000.0 / lidar.clamp_min(1e-3)
+
+    reward = (
+        progress_reward
+        + target_proximity
+        + near_goal_bonus
+        + success_bonus
+        + align_reward
+        + upright_reward
+        - height_penalty
+        - speed_penalty
+        - smooth_penalty
+        - obstacle_warning
+        - obstacle_penalty
+        - collision_penalty
+        - severe_crash_penalty * (lidar < 0.15).to(lidar.dtype)
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward

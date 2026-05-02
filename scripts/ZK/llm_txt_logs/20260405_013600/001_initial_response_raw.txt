@@ -1,0 +1,93 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    tilt_cos = kwargs["tilt_cos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    z_vel = v[:, 2].abs()
+    omega_norm = torch.norm(omega, dim=-1)
+    v_xy = torch.norm(v[:, :2], dim=-1)
+
+    target_vec = target_pos - curr_pos
+    target_dist = torch.norm(target_vec, dim=-1).clamp_min(eps)
+    target_dir = target_vec / target_dist.unsqueeze(-1)
+    forward_align = (x_body * target_dir).sum(dim=-1).clamp(-1.0, 1.0)
+
+    progress = prev_dist - curr_dist
+    progress_reward = torch.tanh(2.5 * progress)
+
+    close_goal = torch.exp(-0.8 * curr_dist)
+    goal_bonus = (curr_dist < 0.75).float() * 20.0
+
+    forward_reward = 0.8 * torch.clamp(forward_align, 0.0, 1.0) * torch.tanh(v_norm / 2.5)
+
+    speed_target = 2.0
+    speed_band_penalty = -0.35 * torch.square((v_norm - speed_target) / speed_target)
+    low_speed_penalty = -0.55 * torch.relu(0.8 - v_norm)
+    high_speed_penalty = -0.25 * torch.relu(v_norm - 3.2)
+
+    altitude_penalty = -0.22 * torch.square(z_pos - 2.0)
+    upright_reward = 0.7 * torch.clamp(tilt_cos, 0.0, 1.0)
+    tilt_penalty = -0.9 * torch.square(torch.relu(0.82 - tilt_cos))
+
+    smooth_penalty = -0.08 * action_diff - 0.05 * omega_norm
+
+    safe_d = min_lidar_dist.clamp_min(eps)
+    inv_d = 1.0 / safe_d
+    obstacle_core = -0.35 * torch.exp(-1.2 * safe_d) - 0.9 * torch.exp(-3.5 * safe_d) - 0.08 * torch.square(inv_d)
+    near_mask = (min_lidar_dist < 2.0).float()
+    close_mask = (min_lidar_dist < 0.8).float()
+    critical_mask = (min_lidar_dist < 0.4).float()
+
+    near_speed_penalty = -near_mask * (0.22 * v_norm + 0.10 * torch.square(v_norm))
+    near_vz_penalty = -near_mask * (0.35 * z_vel + 0.12 * torch.square(z_vel))
+    near_omega_penalty = -near_mask * (0.08 * omega_norm + 0.03 * torch.square(omega_norm))
+    escape_up_penalty = -near_mask * 0.35 * torch.relu(v[:, 2])
+
+    critical_motion_penalty = -critical_mask * (
+        0.45 * v_norm + 0.25 * z_vel + 0.10 * omega_norm + 0.12 * torch.square(v_norm)
+    )
+
+    collision_penalty = -critical_mask * 12.0
+
+    death_mask = ((z_pos < 0.8) | (z_pos > 3.5) | (tilt_cos < 0.15) | (v_norm > 8.0)).float()
+    death_penalty = -death_mask * 25.0
+
+    reward = (
+        4.5 * progress_reward
+        + 2.2 * close_goal
+        + goal_bonus
+        + forward_reward
+        + speed_band_penalty
+        + low_speed_penalty
+        + high_speed_penalty
+        + altitude_penalty
+        + upright_reward
+        + tilt_penalty
+        + smooth_penalty
+        + obstacle_core
+        + near_speed_penalty
+        + near_vz_penalty
+        + near_omega_penalty
+        + escape_up_penalty
+        + close_mask * (-0.10 * v_xy - 0.08 * torch.square(v_xy))
+        + critical_motion_penalty
+        + collision_penalty
+        + death_penalty
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = reward.view(-1)
+    return reward
+```

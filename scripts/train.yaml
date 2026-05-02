@@ -4,12 +4,13 @@ hydra:
     # see https://hydra.cc/docs/advanced/search_path/
     - file://../cfg
 
-headless: true
+headless: false # 是否弹出渲染窗口
+
 
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 200_000_000
+total_frames: 1_000_00
 max_iters: -1
 eval_interval: -1
 save_interval: -1
@@ -26,12 +27,12 @@ wandb:
   job_type: train
   entity: "3218371195-" 
   project:  "c"
-  mode: online # set to 'disabled' when debugging locally
+  mode: online # set to 'offonline' when debugging locally
   run_id:
   monitor_gym: True
   tags:
 
 defaults:
   - task: Hover
-  - algo: ppo
+  - algo: mappo
   - _self_

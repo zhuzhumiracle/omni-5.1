@@ -1,0 +1,80 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    dist_progress = prev_dist - curr_dist
+    progress_reward = torch.tanh(8.0 * dist_progress)
+
+    goal_progress_reward = torch.exp(-0.6 * curr_dist)
+    approach_reward = 8.0 * progress_reward + 6.0 * goal_progress_reward
+
+    success_1 = (curr_dist < 2.0).float()
+    success_2 = (curr_dist < 1.0).float()
+    success_3 = (curr_dist < 0.5).float()
+    success_bonus = 30.0 * success_1 + 80.0 * success_2 + 180.0 * success_3
+
+    dir_vec = target_pos - curr_pos
+    dir_norm = torch.norm(dir_vec, dim=-1, keepdim=True).clamp_min(1e-6)
+    dir_unit = dir_vec / dir_norm
+
+    v_unit = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
+    align_target = torch.sum(x_body * dir_unit, dim=-1).clamp(-1.0, 1.0)
+    vel_align_target = torch.sum(v_unit * dir_unit, dim=-1).clamp(-1.0, 1.0)
+    heading_reward = 0.8 * align_target + 0.7 * vel_align_target
+
+    desired_altitude = 2.0
+    altitude_error = torch.abs(z_pos - desired_altitude)
+    altitude_reward = torch.exp(-1.5 * altitude_error)
+    altitude_penalty = torch.relu(altitude_error - 0.4)
+
+    speed_over = torch.relu(v_norm - 5.0)
+    speed_penalty = speed_over * speed_over
+
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = 0.03 * action_diff + 0.02 * omega_norm
+
+    lidar = min_lidar_dist.clamp_min(1e-6)
+    obstacle_repulsion = (
+        2.0 * torch.exp(-1.5 * lidar)
+        + 8.0 * torch.exp(-4.0 * lidar)
+        + 35.0 * torch.exp(-10.0 * lidar)
+        + 160.0 * torch.exp(-22.0 * lidar)
+        + 600.0 * torch.exp(-45.0 * lidar)
+    )
+
+    collision_penalty = (
+        20.0 * torch.relu(0.6 - min_lidar_dist) ** 2
+        + 120.0 * torch.relu(0.35 - min_lidar_dist) ** 2
+        + 600.0 * torch.relu(0.20 - min_lidar_dist) ** 2
+        + 3000.0 * torch.relu(0.10 - min_lidar_dist) ** 2
+        + 12000.0 * torch.relu(0.05 - min_lidar_dist) ** 2
+        + 30000.0 * torch.relu(0.02 - min_lidar_dist) ** 2
+        + 50000.0 * torch.exp(-80.0 * lidar)
+    )
+
+    reward = (
+        approach_reward
+        + success_bonus
+        + 1.2 * heading_reward
+        + 0.8 * altitude_reward
+        - 1.5 * altitude_penalty
+        - 0.4 * speed_penalty
+        - smooth_penalty
+        - obstacle_repulsion
+        - collision_penalty
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```

@@ -1,0 +1,96 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    target_vec = target_pos - curr_pos
+    target_dist = torch.norm(target_vec, dim=-1).clamp_min(eps)
+    target_dir = target_vec / target_dist.unsqueeze(-1)
+
+    v_dir = v / v_norm.unsqueeze(-1).clamp_min(eps)
+    x_body_dir = x_body / torch.norm(x_body, dim=-1).clamp_min(eps).unsqueeze(-1)
+
+    progress = prev_dist - curr_dist
+    r_progress = torch.tanh(8.0 * progress)
+
+    r_dist = torch.exp(-0.35 * curr_dist)
+    r_near_goal = torch.exp(-1.2 * curr_dist)
+
+    align_v = (v_dir * target_dir).sum(dim=-1)
+    align_body = (x_body_dir * target_dir).sum(dim=-1)
+    r_align = 0.5 * (align_v + align_body)
+
+    alt_err = torch.abs(z_pos - 2.0)
+    r_alt = torch.exp(-1.5 * alt_err)
+    r_alt_pen = torch.relu(alt_err - 0.35)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    r_smooth = torch.tanh(action_diff)
+    r_turn = torch.tanh(0.35 * omega_norm)
+
+    speed_over = torch.relu(v_norm - 6.0)
+    speed_under = torch.relu(0.2 - v_norm)
+    r_speed_pen = speed_over.pow(2) + 0.5 * speed_under.pow(2)
+
+    d = min_lidar_dist.clamp_min(eps)
+    inv_d = 1.0 / d
+    inv_d2 = inv_d * inv_d
+    inv_d3 = inv_d2 * inv_d
+    inv_d4 = inv_d2 * inv_d2
+
+    obstacle_severe = (
+        0.5 * torch.exp(-3.0 * d)
+        + 2.0 * torch.exp(-10.0 * d)
+        + 8.0 * torch.exp(-25.0 * d)
+        + 30.0 * torch.exp(-60.0 * d)
+        + 120.0 * torch.exp(-140.0 * d)
+        + 400.0 * torch.exp(-300.0 * d)
+        + 1200.0 * torch.exp(-700.0 * d)
+    )
+
+    close_mask = (d < 0.8).to(d.dtype)
+    danger_mask = (d < 0.4).to(d.dtype)
+    collision_mask = (d < 0.2).to(d.dtype)
+    near_zero_mask = (d < 0.08).to(d.dtype)
+
+    obstacle_pen = (
+        close_mask * (5.0 * torch.relu(0.8 - d).pow(2) + 20.0 * inv_d2 + 60.0 * inv_d3)
+        + danger_mask * (100.0 + 120.0 * inv_d2 + 300.0 * inv_d3 + 500.0 * inv_d4)
+        + collision_mask * (500.0 + 1000.0 * inv_d3 + 3000.0 * inv_d4)
+        + near_zero_mask * (2000.0 + 5000.0 * inv_d4)
+    )
+
+    r_goal_bonus = (curr_dist < 0.8).to(curr_dist.dtype) * 1500.0
+    r_success_bonus = (curr_dist < 0.25).to(curr_dist.dtype) * 6000.0
+
+    reward = (
+        60.0 * r_progress
+        + 20.0 * r_dist
+        + 15.0 * r_near_goal
+        + 4.0 * r_align
+        + 3.0 * r_alt
+        + r_goal_bonus
+        + r_success_bonus
+        - 2.0 * r_speed_pen
+        - 0.8 * r_turn
+        - 0.5 * r_smooth
+        - 2.0 * r_alt_pen
+        - 12.0 * obstacle_severe
+        - 2.0 * obstacle_pen
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```

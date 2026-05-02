@@ -1,0 +1,78 @@
+# # cfg/eval_gui.yaml
+# hydra:
+#   searchpath:
+#     - file://../cfg
+
+# defaults:
+#   - train    # 👈 核心修复：直接继承原版的 train.yaml，不要自己去写 algo 和 task！
+#   - _self_
+# # ================= 测试专用配置 =================
+# # 如果你在有屏幕的本地电脑跑，设为 false
+# # 如果你在远程服务器跑准备用 WebRTC 网页看，必须设为 true！
+# headless: false
+
+# # 将你刚才的最优模型路径写在这里
+# checkpoint_path: /home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/wandb/run-20260220_092443-t4xcsggf/files/checkpoint_best_return_310.36.pt
+
+# # ================= 🚀 关键：与训练对齐的参数 =================
+# task:
+#   # 必须和训练时一样，否则动作维度不匹配 (4 vs 6)
+#   drone_model:
+#     name: Hummingbird
+  
+#   # 必须和训练时一样，否则观测维度不匹配 (167 vs 32)
+#   lidar_range: 4.0
+#   lidar_vfov: [-10.0, 20.0]
+  
+#   # 降低测试时的环境数量，防止渲染时显存爆炸 (原本训练是 256)
+#   env:
+#     num_envs: 16
+
+# # ================= 继承底层配置 =================
+# sim: ${task.sim}
+# env: ${task.env}
+
+# # 让它无限飞下去（如果用 -1 有些版本会直接退出）
+# total_frames: -1  
+# seed: 0
+
+# viewer:
+#   resolution: [960, 720]
+#   eye: [8, 0., 6.]
+#   lookat: [0., 0., 1.]
+
+# cfg/eval_gui.yaml
+hydra:
+  searchpath:
+    - file://../cfg
+
+defaults:
+  - task: Forest
+  # 1. 借壳：去读系统里存在的 mappo 配置文件，不让 Hydra 报错
+  - algo: mappo    
+  - _self_
+
+# 2. 还魂：把算法名字强行改回 ppo，让代码能加载正确的 PPO 策略网络
+algo:
+  name: ppo
+
+headless: False
+checkpoint_path: /home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/wandb/run-20260220_092443-t4xcsggf/files/checkpoint_best_return_310.36.pt
+
+task:
+  drone_model:
+    name: Hummingbird
+  lidar_range: 4.0
+  lidar_vfov: [-10.0, 20.0]
+  
+env:
+  num_envs: 16
+
+sim: ${task.sim}
+total_frames: -1  
+seed: 0
+
+viewer:
+  resolution: [960, 720]
+  eye: [8, 0., 6.]
+  lookat: [0., 0., 1.]

@@ -1,0 +1,13 @@
+{
+  "obstacles_per_tile": 40,
+  "trial": 4,
+  "seed": 9,
+  "success_rate": 0.748,
+  "success_count": 374,
+  "episode_count": 500,
+  "mean_return": 224.72339038085937,
+  "mean_episode_len": 441.92,
+  "mean_completion_pct": 75.7,
+  "result": "ok",
+  "duration_s": 212.561
+}

@@ -1,0 +1,72 @@
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    dist_delta = prev_dist - curr_dist
+    r_progress = torch.tanh(8.0 * dist_delta)
+    r_close = torch.exp(-0.8 * curr_dist.clamp_min(0.0))
+
+    success = (curr_dist < 0.75).to(curr_dist.dtype)
+    r_success = success * 12000.0
+
+    direction = target_pos - curr_pos
+    direction_norm = torch.norm(direction, dim=-1).clamp_min(eps)
+    direction_unit = direction / direction_norm.unsqueeze(-1)
+    align = (x_body * direction_unit).sum(dim=-1).clamp(-1.0, 1.0)
+    r_align = torch.relu(align)
+
+    speed = torch.norm(v, dim=-1)
+    r_forward = torch.tanh((speed * torch.relu(align)) / 3.5)
+
+    z_err = torch.abs(z_pos - 2.0)
+    r_z = torch.relu(z_err - 0.25)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    r_omega = torch.tanh(omega_norm / 2.5)
+
+    r_smooth = torch.tanh(action_diff / 1.0)
+
+    speed_pen = torch.relu(v_norm - 6.0).pow(2)
+
+    d = min_lidar_dist.clamp_min(eps)
+    collision = (min_lidar_dist < 0.45).to(min_lidar_dist.dtype)
+    near = (min_lidar_dist < 1.5).to(min_lidar_dist.dtype)
+
+    obstacle_inv = 1.0 / d
+    obstacle_core = -50.0 * obstacle_inv.pow(2) - 500.0 * obstacle_inv.pow(4)
+    obstacle_exp = -150.0 * torch.exp(-3.0 * min_lidar_dist.clamp_min(0.0))
+    obstacle_near = -400.0 * torch.exp(-1.8 * min_lidar_dist.clamp_min(0.0))
+    obstacle_collision = collision * (-50000.0 - 200000.0 * torch.relu(0.25 - min_lidar_dist))
+    obstacle_close = near * (-2000.0 * torch.exp(-2.5 * min_lidar_dist.clamp_min(0.0)))
+
+    reward = (
+        120.0 * r_progress
+        + 8.0 * r_close
+        + 4.0 * r_align
+        + 3.0 * r_forward
+        - 6.0 * r_z
+        - 1.5 * r_omega
+        - 0.8 * r_smooth
+        - 2.0 * speed_pen
+        + obstacle_core
+        + obstacle_exp
+        + obstacle_near
+        + obstacle_close
+        + obstacle_collision
+        + r_success
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward

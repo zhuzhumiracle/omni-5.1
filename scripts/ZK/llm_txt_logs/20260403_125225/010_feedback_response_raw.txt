@@ -1,0 +1,76 @@
+```python
+def compute_reward(**kwargs):
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    tilt_cos = kwargs["tilt_cos"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    dist_delta = prev_dist - curr_dist
+    r_progress = 18.0 * torch.tanh(2.5 * dist_delta)
+    r_goal_close = 10.0 * torch.exp(-0.8 * curr_dist)
+    r_success = (curr_dist < 0.6).float() * 35.0 + (curr_dist < 0.25).float() * 65.0
+
+    z_err = torch.abs(z_pos - 2.0)
+    r_alt_band = -6.0 * torch.relu(z_err - 0.10)
+    r_alt_far = -14.0 * torch.relu(z_err - 0.25)
+    r_low = -20.0 * torch.relu(1.0 - z_pos)
+    r_high = -16.0 * torch.relu(z_pos - 2.02)
+    r_ceiling = -(z_pos > 2.05).float() * (12.0 + 30.0 * torch.relu(z_pos - 2.05))
+    r_vertical_runaway = -18.0 * torch.relu(z_pos - 2.0) * torch.tanh(1.5 * (v_norm + torch.relu(z_pos - 2.0)))
+
+    speed_over = torch.relu(v_norm - 3.0)
+    r_speed = -1.2 * torch.square(speed_over)
+    r_stall = -0.25 * torch.relu(0.08 - v_norm)
+
+    omega_norm = torch.norm(omega, dim=-1)
+    r_smooth = -0.06 * torch.tanh(0.8 * action_diff + 0.35 * omega_norm)
+
+    tilt = torch.clamp(tilt_cos, min=-1.0, max=1.0)
+    r_upright = 1.2 * torch.relu(tilt - 0.55)
+
+    v_safe = v_norm.clamp_min(1e-6)
+    v_dir = v / v_safe.unsqueeze(-1)
+    heading_align = (x_body * v_dir).sum(dim=-1)
+    r_heading = 0.8 * heading_align * (v_norm > 0.15).float()
+
+    safe_lidar = min_lidar_dist.clamp_min(1e-6)
+    r_obstacle_soft = -1.0 * torch.exp(-2.5 * safe_lidar)
+    r_obstacle_near = -3.0 * torch.relu(0.50 - safe_lidar).pow(2)
+    r_obstacle_hard = -10.0 * torch.relu(0.20 - safe_lidar).pow(2)
+    r_collision = -(safe_lidar < 0.08).float() * (8.0 + 18.0 * torch.relu(0.08 - safe_lidar))
+
+    v_z = v[..., 2]
+    r_vertical = -0.18 * torch.tanh(torch.abs(v_z) + 0.2 * omega_norm)
+
+    reward = (
+        r_progress
+        + r_goal_close
+        + r_success
+        + r_alt_band
+        + r_alt_far
+        + r_low
+        + r_high
+        + r_ceiling
+        + r_vertical_runaway
+        + r_speed
+        + r_stall
+        + r_smooth
+        + r_upright
+        + r_heading
+        + r_obstacle_soft
+        + r_obstacle_near
+        + r_obstacle_hard
+        + r_collision
+        + r_vertical
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```

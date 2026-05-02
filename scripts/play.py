@@ -30,7 +30,12 @@ FILE_PATH = os.path.dirname(__file__)
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
+    
     OmegaConf.set_struct(cfg, False)
+    # 在 init_simulation_app(cfg) 上方添加这两行：
+    cfg.sim.enable_replicator = True
+    cfg.sim.enable_viewport = True 
+    
     simulation_app = init_simulation_app(cfg)
 
     setproctitle(cfg.task.name)
@@ -116,9 +121,14 @@ def main(cfg):
         device=cfg.sim.device,
         return_same_td=True,
     )
-
+# 1. 开启底层环境的渲染开关
+    base_env.enable_render(True)
+    
+    # 2. 将底层环境和 TorchRL 包装环境都切换为评估模式
+    base_env.eval()
+    env.eval()
+    
     pbar = tqdm(collector)
-    env.train()
     for i, data in enumerate(pbar):
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
         episode_stats.add(data.to_tensordict())

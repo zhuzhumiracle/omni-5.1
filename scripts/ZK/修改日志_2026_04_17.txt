@@ -1,0 +1,212 @@
+================================================================================
+        训练崩溃诊断与代码修复报告 — 2026年4月17日
+================================================================================
+
+一、问题现象
+--------------------------------------------------------------------------------
+任务：forest_singal（森林单机避障导航）
+训练配置：150 个并行环境，PPO + SPO 目标函数，DualStreamBackbone 双流网络
+
+从 wandb 训练日志（run-20260416_055034-uzkfx4e4）中观察到：
+
+  ✅ iter 0 ~ 3880：训练正常收敛
+     - success 从 0% 稳步上升至 ~83%
+     - best_success 达到 100%（iter 2100）
+     - approx_kl 稳定在 0.003 ~ 0.01 范围
+     - actor_grad_norm 约 20 ~ 150
+
+  ❌ iter 3900 起：突然全面崩溃
+     - clip_frac 跳至 0.969（正常 <0.1）
+     - approx_kl 跳至 9.688（正常 <0.05）
+     - actor_grad_norm 从 ~100 暴涨至 1e4 → 1e8 → 1e11
+     - success 归零，永不恢复
+     - 训练持续空转至 iter 5200 结束
+
+  📊 最终评估（用 best checkpoint）：50 轮平均成功率仅 56.03%
+     远低于训练中曾达到的 ~95% 水平
+
+二、根因分析
+--------------------------------------------------------------------------------
+
+【根本原因】forest_singal.py 中 _pre_sim_step 的动作写回问题
+
+在 forest_singal.py 的 _pre_sim_step 方法中，原代码流程为：
+
+    actions = tensordict[("agents", "action")]   # 从 buffer 读出原始动作
+    actions = torch.tanh(actions)                 # 压缩到 [-1, 1]
+    actions = actions * self.action_scale + ...   # 线性变换
+    tensordict.set(("agents", "action"), actions) # ⚠️ 写回 buffer！
+
+问题在于最后一步 tensordict.set() 将变换后的 tanh(a) 写回了 buffer。
+但 buffer 中的 sample_log_prob 是在策略采样时基于原始动作 a 计算的。
+
+当 PPO 训练时重新计算 log_prob：
+    new_log_prob = dist.log_prob(tensordict["action"])  # 这里取到的是 tanh(a)
+
+由于 dist 是基于原始高斯分布的，log_prob(tanh(a)) ≠ log_prob(a)，
+导致 ratio = exp(new_log_prob - old_log_prob) 被系统性扭曲。
+
+随着训练进行，策略分布逐渐收窄（std 变小），这个偏差会被指数级放大，
+最终在 iter 3900 左右触发策略爆炸：ratio 远离 1.0，KL 散度飙升，
+梯度爆炸，策略完全失控。
+
+【辅助原因1】ppo.py 中 KL early stopping 仅在 minibatch 级别生效
+
+原实现：当某个 minibatch 的 approx_kl > 0.05 时，仅跳过该 minibatch 的
+optimizer.step()，但同一 epoch 内后续 minibatch 仍会继续更新。这意味着
+即使检测到 KL 过大，策略仍可能在同 epoch 内被进一步推离安全区域。
+
+【辅助原因2】ppo.py 中用 clamp 后的 log_ratio 计算监控 KL
+
+原实现：log_ratio = (log_probs - old_log_probs).clamp(-10, 10)
+然后 approx_kl = (-log_ratio).mean()
+
+当真实 log_ratio 超出 [-10, 10] 时（崩溃时完全可能），clamp 会低估真实
+KL 散度，导致 early stopping 触发延迟，错过最佳干预时机。
+
+三、修复方案与代码改动
+--------------------------------------------------------------------------------
+
+【修复1】forest_singal.py — 不再将变换后的动作写回 tensordict
+
+文件：OmniDrones/omni_drones/envs/single/forest_singal.py
+方法：_pre_sim_step()
+
+修改前：
+    actions = tensordict[("agents", "action")]
+    actions = torch.tanh(actions)
+    actions = actions * self.action_scale + self.action_bias
+    tensordict.set(("agents", "action"), actions)
+    ... 使用 actions 进行控制 ...
+
+修改后：
+    actions = tensordict[("agents", "action")]
+    actions_exec = torch.tanh(actions)                              # 用局部变量
+    actions_exec = actions_exec * self.action_scale + self.action_bias
+    # 不再执行 tensordict.set()，保持 buffer 中的原始动作不被污染
+    ... 使用 actions_exec 进行控制 ...
+
+原理：执行层面用 tanh 压缩后的动作驱动控制器，但存储层面保留原始高斯采样值，
+确保 PPO 训练时 action 与 log_prob 的一致性。
+
+【修复2】ppo.py — KL early stopping 升级为 epoch 级别
+
+文件：OmniDrones/omni_drones/learning/ppo/ppo.py
+方法：train_op()
+
+修改前：
+    for epoch in range(self.cfg.ppo_epochs):
+        batch = make_batch(tensordict, self.cfg.num_minibatches)
+        for minibatch in batch:
+            infos.append(self._update(minibatch))
+
+修改后：
+    kl_early_stop = False
+    for epoch in range(self.cfg.ppo_epochs):
+        if kl_early_stop:
+            break                                    # 跳过后续所有 epoch
+        batch = make_batch(tensordict, self.cfg.num_minibatches)
+        for minibatch in batch:
+            info = self._update(minibatch)
+            infos.append(info)
+            if info["approx_kl"].item() > 0.05:
+                kl_early_stop = True
+                break                                # 立即终止当前 epoch
+
+原理：一旦任何 minibatch 检测到 KL 过大，立即停止当前及后续所有 epoch 的
+参数更新，防止策略在单次 train_op 内被推离安全区域。
+
+【修复3】ppo.py — 使用未 clamp 的 log_ratio 计算监控 KL
+
+文件：OmniDrones/omni_drones/learning/ppo/ppo.py
+方法：_update()
+
+修改前：
+    log_ratio = (log_probs - tensordict["sample_log_prob"]).clamp(-10.0, 10.0)
+    ratio = torch.exp(log_ratio).unsqueeze(-1)
+    ...
+    approx_kl = (-log_ratio).mean()
+
+修改后：
+    log_ratio_raw = log_probs - tensordict["sample_log_prob"]   # 未 clamp，真实值
+    log_ratio = log_ratio_raw.clamp(-10.0, 10.0)               # clamp 后用于 ratio
+    ratio = torch.exp(log_ratio).unsqueeze(-1)
+    ...
+    approx_kl = (-log_ratio).mean()  # 注意：ratio 计算仍用 clamp 版本保证数值稳定
+
+原理：分离"数值计算用"和"监控用"的 log_ratio，确保 KL 监控能真实反映
+策略偏移程度，不会因 clamp 而低估风险。
+
+四、预期效果
+--------------------------------------------------------------------------------
+1. 消除 action 写回导致的 ratio 系统性偏差，从根本上防止策略爆炸
+2. epoch 级 KL early stopping 提供更强的安全保障
+3. 真实 KL 监控确保 early stopping 能及时触发
+
+五、涉及文件清单
+--------------------------------------------------------------------------------
+1. OmniDrones/omni_drones/envs/single/forest_singal.py  — _pre_sim_step 动作处理
+2. OmniDrones/omni_drones/learning/ppo/ppo.py           — train_op + _update
+
+六、本次追加修改（评估口径对齐）
+--------------------------------------------------------------------------------
+
+【追加修改A】play_goodpt.py — 评估统计从“仅 env0”改为“全 batch”
+
+文件：OmniDrones/scripts/ZK/play_goodpt.py
+
+背景：旧版评估日志虽然运行了 150 个并行环境，但多数指标通过 _tensor_scalar()
+逐级取 [0]，本质只在看第 0 号环境轨迹，导致“并行规模”和“日志含义”不一致。
+
+主要改动：
+1) 新增 _summarize_stats_batch(stats_td)
+    - 对 stats 各项按全环境求均值，不再只取 env0。
+
+2) 评估主循环改为批量统计
+    - 每步统计并输出：
+      - reward_mean_active（未完成环境平均奖励）
+      - new_done（本步新增 done 数）
+      - done_total（累计 done 数 / num_envs）
+      - success_so_far（当前 batch 成功率）
+
+3) Episode 汇总改为全 batch 指标
+    - 输出 episode_return(mean±std)
+    - 输出 success_rate(batch) = 成功环境数 / num_envs
+    - round 与 overall 成功率统计由“每 episode 单标量”改为“汇总全部环境成功标记”
+
+效果：play_goodpt 的评估口径与并行环境数量一致，避免把 150 并行误读为单轨迹评估。
+
+
+【追加修改B】test_base.py — best checkpoint 改为按 eval/success_rate 保存
+
+文件：OmniDrones/scripts/ZK/test_base.py
+
+背景：原先 best_success checkpoint 由 train/stats.success 触发保存，
+该指标来自训练采样统计，不等价于独立正式评估指标。
+
+主要改动：
+1) 新增双 best 指标
+    - best_train_success_rate：仅用于训练监控展示
+    - best_eval_success_rate：用于模型选择与保存
+
+2) 保存逻辑切换
+    - 删除“train/stats.success 触发保存 best_success checkpoint”
+    - 改为仅在 evaluate() 产出 eval/success_rate 时，按其刷新 best 并保存：
+      checkpoint_best_eval_success_xxxx.pt
+
+3) 新增 eval_interval 建议提示
+    - 当 eval_interval<=0 时输出 warning，建议使用 recommended_eval_interval（默认 20）
+    - 目的：提醒启用周期性正式评估，保证模型选择口径一致
+
+效果：训练过程中的模型选择从“训练统计最优”切换为“正式评估最优”，
+与 play_goodpt 的评估结论更一致。
+
+
+七、本次追加涉及文件
+--------------------------------------------------------------------------------
+1. OmniDrones/scripts/ZK/play_goodpt.py                 — 全 batch 评估统计与日志口径修复
+2. OmniDrones/scripts/ZK/test_base.py                   — 按 eval/success_rate 保存 best checkpoint
+
+================================================================================
+                              报告结束
+================================================================================

@@ -1,0 +1,60 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    tilt_cos = kwargs["tilt_cos"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    dist_progress = prev_dist - curr_dist
+    progress_reward = 12.0 * torch.tanh(2.0 * dist_progress)
+    distance_reward = 2.0 * torch.exp(-0.6 * curr_dist)
+
+    close_to_goal = (curr_dist < 1.0).to(curr_dist.dtype)
+    goal_bonus = close_to_goal * 80.0 * torch.exp(-3.0 * curr_dist)
+
+    target_vec = target_pos - curr_pos
+    target_dir = target_vec / target_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    v_dir = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
+    align_term = (x_body * target_dir).sum(dim=-1)
+    move_align_term = (v_dir * target_dir).sum(dim=-1)
+    alignment_reward = 0.8 * torch.clamp(align_term, -1.0, 1.0) + 0.4 * torch.clamp(move_align_term, -1.0, 1.0)
+
+    altitude_error = torch.abs(z_pos - 2.0)
+    altitude_reward = -2.5 * torch.tanh(1.5 * altitude_error)
+
+    obstacle_penalty = -8.0 / (min_lidar_dist.clamp_min(1e-3) ** 2 + 1e-3)
+    near_obstacle_penalty = -4.0 * torch.exp(-8.0 * min_lidar_dist)
+
+    speed_penalty = -0.3 * torch.relu(v_norm - 4.0) ** 2
+    action_smooth_penalty = -0.15 * torch.tanh(action_diff)
+    ang_smooth_penalty = -0.05 * torch.tanh(torch.norm(omega, dim=-1))
+
+    upright_reward = 1.5 * torch.clamp(tilt_cos, -1.0, 1.0)
+
+    reward = (
+        progress_reward
+        + distance_reward
+        + goal_bonus
+        + alignment_reward
+        + altitude_reward
+        + obstacle_penalty
+        + near_obstacle_penalty
+        + speed_penalty
+        + action_smooth_penalty
+        + ang_smooth_penalty
+        + upright_reward
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    reward = reward.view(-1)
+    return reward
+```

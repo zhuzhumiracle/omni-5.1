@@ -1,0 +1,4 @@
+- selected 1 / 1 samples | collisions=1 | successes=0
+- selected altitude stats: z_max_mean=2.057 z_max_peak=2.057
+- selected vertical speed stats: v_z_mean=1.201 v_z_peak=1.201
+- sample 00 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.057 z_max=2.057 v_norm=2.314 v_z=-1.201 tilt_cos=0.372 action_abs_mean=13.308

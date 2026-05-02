@@ -1,0 +1,11 @@
+- selected 8 / 8 samples | collisions=8 | successes=0
+- selected altitude stats: z_max_mean=2.211 z_max_peak=2.504
+- selected vertical speed stats: v_z_mean=0.621 v_z_peak=1.201
+- sample 00 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.210 z_max=2.210 v_norm=1.191 v_z=-1.006 tilt_cos=0.826 action_abs_mean=23.127
+- sample 01 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.057 z_max=2.057 v_norm=2.314 v_z=-1.201 tilt_cos=0.372 action_abs_mean=13.308
+- sample 02 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.374 z_max=2.374 v_norm=0.961 v_z=0.631 tilt_cos=0.978 action_abs_mean=17.866
+- sample 03 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.210 z_max=2.210 v_norm=2.374 v_z=-0.230 tilt_cos=0.950 action_abs_mean=20.590
+- sample 04 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.069 z_max=2.069 v_norm=2.343 v_z=0.861 tilt_cos=0.786 action_abs_mean=17.827
+- sample 05 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.267 z_max=2.267 v_norm=2.613 v_z=0.681 tilt_cos=0.986 action_abs_mean=17.188
+- sample 06 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.000 z_max=2.000 v_norm=0.338 v_z=0.236 tilt_cos=0.823 action_abs_mean=16.925
+- sample 07 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.504 z_max=2.504 v_norm=1.788 v_z=-0.123 tilt_cos=0.870 action_abs_mean=15.749

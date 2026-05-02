@@ -6,7 +6,7 @@ defaults:
   - /base/sim_base@_here_
 
 env:
-  num_envs: 256
+  num_envs: 2
   max_episode_length: 800
 
 # ../viewer:
@@ -18,7 +18,7 @@ drone_model:
 
 time_encoding: true
 
-lidar_range: 4.
+lidar_range: 10.
 lidar_vfov: [-10., 20.]
 
 action_transform: null

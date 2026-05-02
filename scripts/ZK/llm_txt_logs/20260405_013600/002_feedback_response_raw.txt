@@ -1,0 +1,109 @@
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs.get("curr_pos", None)
+    target_pos = kwargs.get("target_pos", None)
+    curr_dist = kwargs.get("curr_dist", None)
+    prev_dist = kwargs.get("prev_dist", None)
+    v = kwargs.get("v", None)
+    v_norm = kwargs.get("v_norm", None)
+    omega = kwargs.get("omega", None)
+    min_lidar_dist = kwargs.get("min_lidar_dist", None)
+    action_diff = kwargs.get("action_diff", None)
+    z_pos = kwargs.get("z_pos", None)
+    tilt_cos = kwargs.get("tilt_cos", None)
+    x_body = kwargs.get("x_body", None)
+
+    eps = 1e-6
+
+    if curr_pos is None or target_pos is None:
+        raise KeyError("compute_reward requires curr_pos and target_pos")
+    if curr_dist is None or prev_dist is None or v is None or omega is None or min_lidar_dist is None:
+        raise KeyError("compute_reward requires curr_dist, prev_dist, v, omega, and min_lidar_dist")
+    if action_diff is None or z_pos is None or tilt_cos is None or x_body is None:
+        raise KeyError("compute_reward requires action_diff, z_pos, tilt_cos, and x_body")
+
+    target_vec = target_pos - curr_pos
+    target_dist = torch.norm(target_vec, dim=-1).clamp_min(eps)
+    target_dir = target_vec / target_dist.unsqueeze(-1)
+    forward_align = (x_body * target_dir).sum(dim=-1).clamp(-1.0, 1.0)
+
+    v_norm_safe = torch.clamp(v_norm, min=0.0)
+    omega_norm = torch.norm(omega, dim=-1)
+    z_vel = v[:, 2]
+    z_speed = torch.abs(z_vel)
+    v_xy = torch.norm(v[:, :2], dim=-1)
+
+    progress = prev_dist - curr_dist
+    progress_reward = torch.tanh(3.0 * progress)
+    proximity_reward = torch.exp(-0.18 * curr_dist)
+    forward_reward = torch.clamp(forward_align, 0.0, 1.0) * torch.tanh(v_norm_safe / 2.5)
+
+    speed_target = 2.0
+    speed_band_penalty = -0.22 * torch.square((v_norm_safe - speed_target) / speed_target)
+    low_speed_penalty = -0.45 * torch.relu(0.7 - v_norm_safe)
+    high_speed_penalty = -0.18 * torch.relu(v_norm_safe - 3.4)
+
+    smooth_penalty = -0.10 * action_diff - 0.06 * omega_norm
+    tilt_penalty = -0.75 * torch.relu(0.88 - tilt_cos) - 0.25 * torch.square(torch.relu(0.92 - tilt_cos))
+    altitude_reg = -0.18 * torch.square(z_pos - 2.0)
+
+    safe_d = min_lidar_dist.clamp_min(eps)
+    near_mask = (min_lidar_dist < 2.0).float()
+    close_mask = (min_lidar_dist < 0.8).float()
+    critical_mask = (min_lidar_dist < 0.4).float()
+
+    obstacle_penalty = (
+        0.25 * torch.exp(-1.2 * safe_d)
+        + 0.85 * torch.exp(-3.8 * safe_d)
+        + 0.20 * torch.reciprocal(safe_d + 0.15)
+    )
+
+    near_motion_penalty = near_mask * (
+        0.22 * v_norm_safe
+        + 0.16 * z_speed
+        + 0.08 * omega_norm
+        + 0.05 * torch.square(v_norm_safe)
+    )
+    near_upward_penalty = near_mask * 0.30 * torch.relu(z_vel)
+    near_xy_penalty = close_mask * (0.10 * v_xy + 0.08 * torch.square(v_xy))
+
+    critical_motion_penalty = critical_mask * (
+        0.55 * v_norm_safe
+        + 0.35 * z_speed
+        + 0.18 * omega_norm
+        + 0.10 * torch.square(v_norm_safe)
+    )
+    collision_penalty = critical_mask * 8.0
+
+    goal_bonus = (curr_dist < 6.0).float() * 14.0
+    close_goal_bonus = torch.exp(-0.10 * curr_dist) * 2.0
+
+    is_flipped = tilt_cos < 0.20
+    is_out_of_bounds = (z_pos < 0.8) | (z_pos > 3.5) | (v_norm_safe > 8.0)
+    death_penalty = (is_flipped | is_out_of_bounds).float() * 20.0
+
+    reward = (
+        5.0 * progress_reward
+        + 2.4 * proximity_reward
+        + 0.8 * forward_reward
+        + close_goal_bonus
+        + goal_bonus
+        + speed_band_penalty
+        + low_speed_penalty
+        + high_speed_penalty
+        + smooth_penalty
+        + tilt_penalty
+        + altitude_reg
+        - obstacle_penalty
+        - near_motion_penalty
+        - near_upward_penalty
+        - near_xy_penalty
+        - critical_motion_penalty
+        - collision_penalty
+        - death_penalty
+    )
+
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = reward.view(-1)
+    return reward
+```

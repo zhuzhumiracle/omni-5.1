@@ -1,0 +1,6 @@
+- selected 3 / 3 samples | collisions=3 | successes=0
+- selected altitude stats: z_max_mean=2.112 z_max_peak=2.210
+- selected vertical speed stats: v_z_mean=0.764 v_z_peak=1.201
+- sample 00 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.210 z_max=2.210 v_norm=2.374 v_z=-0.230 tilt_cos=0.950 action_abs_mean=20.590
+- sample 01 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.057 z_max=2.057 v_norm=2.314 v_z=-1.201 tilt_cos=0.372 action_abs_mean=13.308
+- sample 02 [collision] score=ERR(index 2 is out of bounds for dimension 1 with size 1) z_mean=2.069 z_max=2.069 v_norm=2.343 v_z=0.861 tilt_cos=0.786 action_abs_mean=17.827

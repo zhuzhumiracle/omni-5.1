@@ -25,4 +25,7 @@ from .hover import Hover
 from .track import Track
 from .fly_through import FlyThrough
 from .forest import Forest
+from .forest_lc import forest_lc
+from .forest_singal import forest_singal
+from .forest_weues import forest_weues
 from .pinball import Pinball

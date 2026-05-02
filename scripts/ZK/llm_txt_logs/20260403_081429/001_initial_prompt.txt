@@ -1,0 +1,151 @@
+[SYSTEM]
+You are an elite reinforcement learning engineer and a PyTorch expert.
+
+Your goal is to write a highly optimized, purely PyTorch Tensor-based reward function for a UAV trajectory planning and obstacle avoidance task in a highly parallelized GPU simulator (Isaac Sim).
+
+All inputs are batched PyTorch Tensors.
+You MUST satisfy all of the following:
+
+1. Use only PyTorch tensor operations.
+2. Do NOT use Python math, numpy, or any Python loops.
+3. Do NOT output any import statements.
+4. Do NOT define any extra functions, classes, or helper methods.
+5. The only function you output must be:
+
+def compute_reward(**kwargs):
+    ...
+    return reward
+
+6. The returned reward must be a 1D PyTorch tensor of shape [num_envs].
+7. Every reward component added to the final reward must also have shape [num_envs].
+8. If an input variable is vector-valued (e.g. shape [num_envs, 3]), you MUST reduce it first using operations like torch.norm(..., dim=-1) or .sum(dim=-1) before combining it with scalar reward terms.
+9. Never reduce across the batch dimension.
+
+[USER]
+The task is: 无人机森林避障与目标抵达
+
+You must write the reward function EXACTLY in the following format:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```
+
+Available key string from runtime:
+"curr_pos", "target_pos", "curr_dist", "prev_dist", "v", "v_norm", "omega", "min_lidar_dist", "action_diff", "tilt_cos", "z_pos", "x_body"
+
+You can ONLY use the following keys from kwargs. Do NOT introduce any new keys.
+
+Available variables and shapes:
+
+curr_pos: [num_envs, 3] # current drone position vector
+target_pos: [num_envs, 3] # target position vector
+curr_dist: [num_envs] # scalar current distance to target
+prev_dist: [num_envs] # scalar previous distance to target
+v: [num_envs, 3] # linear velocity vector
+v_norm: [num_envs] # scalar speed magnitude
+omega: [num_envs, 3] # angular velocity vector
+min_lidar_dist: [num_envs] # scalar nearest obstacle distance
+action_diff: [num_envs] # scalar action change magnitude
+tilt_cos: [num_envs] # scalar uprightness indicator
+z_pos: [num_envs] # scalar altitude
+x_body: [num_envs, 3] # drone forward/heading direction vector
+Strict shape rules:
+
+Variables with shape [num_envs, 3] are vector-valued. You MUST reduce them to shape [num_envs] before adding them into the reward.
+Variables with shape [num_envs] are already scalar reward terms. Do NOT further reduce them across the batch dimension.
+The final returned reward MUST have shape [num_envs].
+
+Task objectives:
+
+Encourage the drone to reduce curr_dist and make consistent progress toward the target.
+Encourage target reaching strongly when the drone is close to the target.
+Maintain a stable flying height near 2.0 meters by penalizing large deviations in z_pos.
+Penalize dangerous proximity to obstacles when min_lidar_dist becomes small, but keep the collision penalty moderate and numerically stable. Avoid extremely large negative constants that cause the reward to saturate at -Inf or clamp to a minimum too often.
+Penalize excessive speed when v_norm is too large.
+Penalize rapid drastic control changes using action_diff for smoother flight.
+Encourage stable upright attitude using tilt_cos.
+Optionally use direction alignment terms, but only in a shape-safe way.
+Keep the reward numerically stable and free of NaN/Inf.
+
+Repeatedly verify that:
+
+every variable you use exists in the list above,
+every reward term summed into the final reward has shape [num_envs],
+the returned reward is a 1D PyTorch Tensor of shape [num_envs].
+The output must be EXACTLY one python code block wrapped by ```python ... ```.
+Do NOT output anything outside that single python code block.
+
+Do NOT output:
+- import statements
+- explanations
+- comments outside the code block
+- helper functions
+- classes
+- markdown text outside the code block
+
+You must follow these coding requirements:
+
+1. Use only PyTorch vectorized tensor operations.
+2. Do NOT use numpy, math, scipy, or Python loops.
+3. Every reward component that contributes to the final reward MUST have shape [num_envs].
+4. If you use vector inputs such as curr_pos, target_pos, v, omega, or x_body, reduce them first to shape [num_envs] before combining them with scalar reward terms.
+5. Do NOT reduce scalar variables such as curr_dist, prev_dist, v_norm, min_lidar_dist, action_diff, tilt_cos, or z_pos across the batch dimension.
+6. Use numerically stable formulas. If a denominator appears, protect it with clamp_min(1e-6).
+7. Avoid reward explosions. Prefer bounded or smoothly scaled terms such as torch.tanh(...), torch.exp(-scale * error), or clamped penalties.
+8. The obstacle penalty should become very severe when min_lidar_dist approaches zero.
+9. Do NOT modify environment state. Only compute the reward tensor.
+10. Before returning reward, ensure it is a 1D PyTorch Tensor of shape [num_envs].
+
+Your final output must look like:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```
+
+[Baseline Reward Reference - Inherit Good Parts, Fix Weak Parts]
+Use this as a starting point and improve it. Keep vectorized shape-safe implementation.
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    x_body = kwargs["x_body"]
+
+    r_forward = prev_dist - curr_dist
+    r_smooth = torch.clamp(torch.norm(omega, dim=-1) + action_diff, max=50.0)
+    r_max_speed = torch.square(torch.relu(v_norm - 4.0))
+    r_z = torch.relu(torch.abs(z_pos - 2.0) - 0.3)
+    r_esdf = -0.5 * torch.exp(-1.6 * (min_lidar_dist ** 2))
+
+    speed_mask = (v_norm > 0.5).float()
+    move_dir = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
+    r_yaw = ((x_body * move_dir).sum(dim=-1)) * speed_mask
+
+    r_goal = (curr_dist < 6.0).float() * 2000.0
+    r_collision = (min_lidar_dist < 0.4).float() * (-10.0)
+
+    reward = (
+        20.0 * r_forward
+        - 0.1 * r_smooth
+        - 0.5 * r_max_speed
+        - 2.0 * r_z
+        + 2.0 * r_esdf
+        + r_collision
+        + 1.0 * r_yaw
+        + r_goal
+    )
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward * 0.2
+```

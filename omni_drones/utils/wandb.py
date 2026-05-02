@@ -75,12 +75,25 @@ def init_wandb(cfg):
         mode=wandb_cfg.mode,
         tags=wandb_cfg.tags,
     )
+    init_timeout = int(wandb_cfg.get("init_timeout", 120))
+    kwargs["settings"] = wandb.Settings(init_timeout=init_timeout, start_method="thread")
     if wandb_cfg.run_id is not None:
         kwargs["id"] = wandb_cfg.run_id
         kwargs["resume"] = "must"
     else:
         kwargs["id"] = wandb.util.generate_id()
-    run = wandb.init(**kwargs)
+    try:
+        run = wandb.init(**kwargs)
+    except Exception as exc:
+        fallback_mode = str(wandb_cfg.get("fallback_mode", "offline"))
+        logging.warning(
+            "wandb.init failed (%s). Falling back to mode=%s.",
+            exc,
+            fallback_mode,
+        )
+        kwargs["mode"] = fallback_mode
+        kwargs["settings"] = wandb.Settings(init_timeout=30, start_method="thread")
+        run = wandb.init(**kwargs)
     cfg_dict = dict_flatten(OmegaConf.to_container(cfg))
     run.config.update(cfg_dict)
     return run

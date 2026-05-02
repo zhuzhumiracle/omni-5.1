@@ -1,0 +1,249 @@
+[SYSTEM]
+You are an elite reinforcement learning engineer and a PyTorch expert.
+
+Your goal is to write a highly optimized, purely PyTorch Tensor-based reward function for a UAV trajectory planning and obstacle avoidance task in a highly parallelized GPU simulator (Isaac Sim).
+
+All inputs are batched PyTorch Tensors.
+You MUST satisfy all of the following:
+
+1. Use only PyTorch tensor operations.
+2. Do NOT use Python math, numpy, or any Python loops.
+3. Do NOT output any import statements.
+4. Do NOT define any extra functions, classes, or helper methods.
+5. The only function you output must be:
+
+def compute_reward(**kwargs):
+    ...
+    return reward
+
+6. The returned reward must be a 1D PyTorch tensor of shape [num_envs].
+7. Every reward component added to the final reward must also have shape [num_envs].
+8. If an input variable is vector-valued (e.g. shape [num_envs, 3]), you MUST reduce it first using operations like torch.norm(..., dim=-1) or .sum(dim=-1) before combining it with scalar reward terms.
+9. Never reduce across the batch dimension.
+
+Anti-shortcut constraints:
+
+- Do NOT reward hovering or near-zero-speed behavior as a safe solution.
+- Do NOT reward very slow crawling or very high-speed rushing; prefer a moderate, task-appropriate forward speed.
+- When obstacle risk increases, penalize high v_norm, high |v_z|, and large omega together.
+- Do NOT solve obstacle avoidance mainly by climbing upward.
+- Altitude shaping must be smooth and secondary; obstacle-risk handling must take priority.
+- Include explicit penalties for low speed and upward escape near obstacles.
+- If the reward can be maximized by moving very slowly, add an explicit low-speed penalty.
+- If the reward can be maximized by rising when obstacles are near, add a near-obstacle vertical-motion penalty.
+- Prefer a speed band: add both low-speed and high-speed penalties so the best behavior is neither too slow nor too fast.
+
+[USER]
+The task is: 无人机森林避障与目标抵达
+
+Write a reward function using the following signature:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```
+
+Available key string from runtime:
+"curr_pos", "target_pos", "curr_dist", "prev_dist", "v", "v_norm", "omega", "min_lidar_dist", "action_diff", "tilt_cos", "z_pos", "x_body"
+
+Key usage policy (relaxed):
+
+- Prefer keys that appear in runtime key string above.
+- You may probe optional keys using kwargs.get("key", None) and provide safe fallbacks.
+- Do not assume unavailable keys always exist; code must remain robust if some keys are missing.
+
+Available variables and shapes:
+
+curr_pos: [num_envs, 3] # current drone position vector
+target_pos: [num_envs, 3] # target position vector
+curr_dist: [num_envs] # scalar current distance to target
+prev_dist: [num_envs] # scalar previous distance to target
+v: [num_envs, 3] # linear velocity vector
+v_norm: [num_envs] # scalar speed magnitude
+omega: [num_envs, 3] # angular velocity vector
+min_lidar_dist: [num_envs] # scalar nearest obstacle distance
+action_diff: [num_envs] # scalar action change magnitude
+tilt_cos: [num_envs] # scalar uprightness indicator
+z_pos: [num_envs] # scalar altitude
+x_body: [num_envs, 3] # drone forward/heading direction vector
+Shape safety rules:
+
+Variables with shape [num_envs, 3] are vector-valued. Reduce them to shape [num_envs] before combining with scalar terms.
+Variables with shape [num_envs] are scalar reward terms and should stay per-env.
+The final returned reward should be shape [num_envs].
+
+Task objectives:
+
+Encourage the drone to reduce curr_dist and make consistent progress toward the target.
+Encourage target reaching strongly when the drone is close to the target.
+Maintain a stable flying height near 2.0 meters by penalizing large deviations in z_pos.
+Penalize dangerous proximity to obstacles when min_lidar_dist becomes small, but keep the collision penalty moderate and numerically stable. Avoid extremely large negative constants that cause the reward to saturate at -Inf or clamp to a minimum too often.
+Penalize excessive speed when v_norm is too large.
+Penalize rapid drastic control changes using action_diff for smoother flight.
+Encourage stable upright attitude using tilt_cos.
+Optionally use direction alignment terms, but only in a shape-safe way.
+Keep the reward numerically stable and free of NaN/Inf.
+
+Anti-shortcut constraints:
+
+- Do NOT allow very slow movement to become a profitable strategy.
+- Do NOT allow very slow movement or very fast rushing to become profitable; speed should stay in a moderate range.
+- If min_lidar_dist is small, the reward must penalize high v_norm, high |v_z|, and large omega together.
+- Do NOT use altitude increase as the primary escape mechanism from obstacles.
+- Altitude regularization must remain supportive and smooth, not the dominant safety mechanism.
+- If the agent can farm reward by crawling forward or by climbing near obstacles, the reward design is wrong and must be revised.
+- Prefer a speed-band formulation: include both low-speed and high-speed penalties so the optimum is moderate speed, not extreme speed.
+
+Anti-shortcut constraints (must follow):
+
+Do NOT solve obstacle collisions mainly by forcing a very narrow altitude band (for example, heavy penalties around z_pos ~= 2.0 +/- 0.05).
+Prioritize root-cause prevention near obstacles: as min_lidar_dist decreases, penalize high v_norm, high |v_z|, and large omega more strongly.
+When close to obstacles, encourage slowing down and maintaining attitude stability instead of climbing to escape.
+Altitude terms should be supportive and smooth, not the dominant driver of behavior.
+If obstacle-risk terms and altitude terms conflict, obstacle-risk handling and stable navigation should take priority.
+
+Recommended safety components:
+
+- Prefer including a severe-failure/death-like penalty (flip or altitude out-of-bounds).
+- Prefer a global tilt-related stabilization term.
+- Prefer smoothness/stability penalty terms using action_diff and omega norm.
+- Prefer a smooth altitude regularization term (quadratic or similarly smooth).
+- Prefer near-obstacle dynamic penalties tied to min_lidar_dist (speed and vertical motion).
+- If performance is poor, rebalance coefficients first before deleting core safety logic.
+
+Repeatedly verify that:
+
+every variable you use is available from kwargs (or has a safe fallback),
+every reward term summed into the final reward has shape [num_envs],
+the returned reward is a 1D PyTorch Tensor of shape [num_envs].
+The output must be EXACTLY one python code block wrapped by ```python ... ```.
+Do NOT output anything outside that single python code block.
+
+Do NOT output:
+- import statements
+- explanations
+- comments outside the code block
+- helper functions
+- classes
+- markdown text outside the code block
+
+You must follow these coding requirements:
+
+1. Use only PyTorch vectorized tensor operations.
+2. Do NOT use numpy, math, scipy, or Python loops.
+3. Every reward component that contributes to the final reward MUST have shape [num_envs].
+4. If you use vector inputs such as curr_pos, target_pos, v, omega, or x_body, reduce them first to shape [num_envs] before combining them with scalar reward terms.
+5. Do NOT reduce scalar variables such as curr_dist, prev_dist, v_norm, min_lidar_dist, action_diff, tilt_cos, or z_pos across the batch dimension.
+6. Use numerically stable formulas. If a denominator appears, protect it with clamp_min(1e-6).
+7. Avoid reward explosions. Prefer bounded or smoothly scaled terms such as torch.tanh(...), torch.exp(-scale * error), or clamped penalties.
+8. The obstacle penalty should become very severe when min_lidar_dist approaches zero.
+9. Do NOT modify environment state. Only compute the reward tensor.
+10. Before returning reward, ensure it is a 1D PyTorch Tensor of shape [num_envs].
+11. Do NOT rely on a narrow altitude clamp as the main way to prevent collisions.
+12. Prefer explicit near-obstacle motion penalties tied to min_lidar_dist (for speed, vertical motion, and/or angular instability) in a numerically stable way.
+13. Keep altitude control as a secondary smooth regularizer; avoid making it dominate progress and obstacle-avoidance logic.
+14. Prefer including severe-failure penalties (e.g., flip/out-of-bounds), tilt stabilization, and smoothness terms, but tune based on observed behavior.
+15. Keep the design compact and readable: a few clear terms are better than many brittle terms.
+
+Your final output must look like:
+
+```python
+def compute_reward(**kwargs):
+    ...
+    return reward
+```
+
+[Environment Reward Parameters]
+goal_radius: 6.0
+goal_bonus: 2000.0
+collision_dist: 0.4
+collision_penalty: -10.0
+v_max: 4.0
+lambda_esdf: 0.5
+k_esdf: 1.6
+w_forward: 20
+w_smooth: -0.1
+w_max_speed: -0.5
+w_z: -2
+w_esdf: 2
+w_yaw: 1
+w_thrust: -0.5
+terminate_z_min: 0.8
+terminate_z_max: 3.5
+terminate_v_norm: 8
+Please keep reward magnitude compatible with these parameter scales.
+
+[Baseline Reward Reference - Inherit Good Parts, Fix Weak Parts]
+Use this as a starting point and improve it. Keep vectorized shape-safe implementation.
+```python
+def compute_reward(**kwargs):
+    curr_pos = kwargs["curr_pos"]
+    target_pos = kwargs["target_pos"]
+    curr_dist = kwargs["curr_dist"]
+    prev_dist = kwargs["prev_dist"]
+    v = kwargs["v"]
+    v_norm = kwargs["v_norm"]
+    omega = kwargs["omega"]
+    min_lidar_dist = kwargs["min_lidar_dist"]
+    action_diff = kwargs["action_diff"]
+    z_pos = kwargs["z_pos"]
+    tilt_cos = kwargs["tilt_cos"]
+    x_body = kwargs["x_body"]
+
+    eps = 1e-6
+
+    # Goal-directed shaping.
+    progress_reward = torch.tanh(3.0 * (prev_dist - curr_dist))
+    proximity_reward = 1.8 * torch.exp(-0.30 * curr_dist)
+    goal_bonus = (curr_dist < 0.75).float() * 12.0
+
+    target_vec = target_pos - curr_pos
+    target_dir = target_vec / torch.norm(target_vec, dim=-1).clamp_min(eps).unsqueeze(-1)
+    forward_align = (x_body * target_dir).sum(dim=-1).clamp(-1.0, 1.0)
+    forward_reward = 0.40 * torch.clamp(forward_align, 0.0, 1.0)
+
+    # Always-on stability regularization.
+    omega_norm = torch.norm(omega, dim=-1)
+    smooth_penalty = 0.08 * action_diff + 0.05 * omega_norm
+    global_tilt_penalty = 0.5 * torch.relu(0.9 - tilt_cos)
+
+    # Quadratic altitude regularization around target altitude 2.0m.
+    altitude_reg = -0.3 * torch.square(z_pos - 2.0)
+
+    # Explicit death-like penalty (anti-termination-hacking).
+    is_flipped = tilt_cos < 0.18
+    is_out_of_bounds = (z_pos > 3.5) | (z_pos < 0.3)
+    death_penalty = (is_flipped | is_out_of_bounds).float() * 50.0
+
+    # Obstacle and near-obstacle dynamic penalties.
+    safe_dist = min_lidar_dist.clamp_min(eps)
+    near_mask = (min_lidar_dist < 2.0).float()
+    critical_mask = (min_lidar_dist < 0.35).float()
+
+    obstacle_penalty = (
+        0.5 * torch.exp(-1.5 * safe_dist)
+        + 1.5 * torch.exp(-4.0 * safe_dist)
+        + critical_mask * 10.0
+    )
+
+    near_speed_penalty = near_mask * (0.2 * v_norm + 0.1 * torch.square(v_norm))
+    near_vz_penalty = near_mask * (0.2 * torch.abs(v[:, 2]))
+
+    reward = (
+        3.8 * progress_reward
+        + 1.6 * proximity_reward
+        + goal_bonus
+        + forward_reward
+        + altitude_reg
+        - smooth_penalty
+        - global_tilt_penalty
+        - obstacle_penalty
+        - near_speed_penalty
+        - near_vz_penalty
+        - death_penalty
+    )
+    reward = torch.nan_to_num(reward, nan=-1e4, posinf=1e4, neginf=-1e4)
+    reward = torch.clamp(reward, min=-1e4, max=1e4)
+    return reward
+```
