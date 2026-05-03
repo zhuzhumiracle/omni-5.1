@@ -38,19 +38,20 @@ from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
 class DualStreamBackbone(torch.nn.Module):
     """
-    轻量三输入 backbone：state + LiDAR-KU + camera risk。
-    LiDAR 仍是主导航模态，camera risk 只通过轻量 gate 调制 LiDAR 特征。
+    三输入 backbone：state + LiDAR-KU + camera risk。
+    LiDAR 是主导航模态，camera risk 通过空间 Gate 在像素级调制 LiDAR KU 图。
+    相机的 3 个前方扇区（左/中/右）各自独立计算 gate，只作用于对应空间区域。
+    FoV 外的 LiDAR 区域 gate=1，不受相机影响。
     """
 
     def __init__(
         self,
         state_dim,
         lidar_dim=3200,
-        camera_risk_dim=21,
+        camera_risk_dim=13,
         ku_value_max=20.0,
         output_dim=128,
-        camera_risk_gate_alpha=0.2,
-        camera_risk_fusion_mode="gate",
+        camera_h_fov_rad=None,
     ):
         super().__init__()
         if lidar_dim != 3200:
@@ -61,12 +62,6 @@ class DualStreamBackbone(torch.nn.Module):
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.camera_risk_dim = int(camera_risk_dim)
-        self.camera_risk_gate_alpha = float(camera_risk_gate_alpha)
-        self.camera_risk_fusion_mode = str(camera_risk_fusion_mode).lower()
-        if self.camera_risk_fusion_mode not in {"gate", "concat"}:
-            raise ValueError(
-                f"camera_risk_fusion_mode must be 'gate' or 'concat', got {camera_risk_fusion_mode}"
-            )
         self.ku_value_max = float(ku_value_max)
         if self.ku_value_max <= 0.0:
             raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
@@ -75,7 +70,16 @@ class DualStreamBackbone(torch.nn.Module):
         self.ku_h = 40
         self.ku_w = 80
 
-        # LiDAR-KU 编码分支: lidar_ku_norm [B,1,40,80] -> lidar_feat:[B,128]
+        # 相机水平 FoV（从环境配置传入）
+        if camera_h_fov_rad is None:
+            # 默认：深度相机 ~96° 水平 FoV（160px / fx≈320px 的典型值）
+            camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
+        self.camera_h_fov_rad = float(camera_h_fov_rad)
+
+        # 预计算 3 前方扇区的列掩码
+        self._build_sector_column_masks()
+
+        # ================= 1. LiDAR-KU 编码分支 =================
         self.ku_encoder = torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
             torch.nn.GroupNorm(4, 16),
@@ -94,27 +98,33 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.LeakyReLU(0.1, inplace=True),
         )
 
+        # ================= 2. 自身状态编码 =================
         self.state_encoder = torch.nn.Sequential(
             torch.nn.Linear(self.state_dim, 64),
             torch.nn.ELU(),
             torch.nn.Linear(64, 64),
             torch.nn.ELU(),
         )
-        self.camera_risk_encoder = torch.nn.Sequential(
-            torch.nn.Linear(self.camera_risk_dim, 32),
-            torch.nn.ELU(),
-            torch.nn.Linear(32, 64),
-            torch.nn.ELU(),
+
+        # ================= 3. 逐扇区空间 Gate 头 =================
+        # 3 个独立轻量门控头，每个将 4 维扇区风险映射为一个标量 gate ∈ [0,1]
+        self.gate_head_L = torch.nn.Sequential(
+            torch.nn.Linear(4, 1),
+            torch.nn.Sigmoid(),
         )
-        self.camera_gate = torch.nn.Sequential(
-            torch.nn.Linear(128 + 64, 128),
-            torch.nn.ELU(),
-            torch.nn.Linear(128, 128),
+        self.gate_head_C = torch.nn.Sequential(
+            torch.nn.Linear(4, 1),
+            torch.nn.Sigmoid(),
+        )
+        self.gate_head_R = torch.nn.Sequential(
+            torch.nn.Linear(4, 1),
             torch.nn.Sigmoid(),
         )
 
+        # ================= 4. 最终融合 MLP =================
+        # state_z(64) + lidar_z(128) = 192
         self.fusion_mlp = torch.nn.Sequential(
-            torch.nn.Linear(64 + 128 + 64, 256),
+            torch.nn.Linear(64 + 128, 256),
             torch.nn.ELU(),
             torch.nn.Linear(256, 256),
             torch.nn.ELU(),
@@ -122,11 +132,22 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.ELU(),
         )
 
+    def _build_sector_column_masks(self):
+        """预计算 [40,80] LiDAR KU 网格中属于前方左/中/右扇区的列索引。"""
+        h_fov = self.camera_h_fov_rad
+
+        # 80 列覆盖 360°: [-π, π]，列中心方位角
+        col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
+        col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
+
+        self.register_buffer("_mask_L", (col_yaws > h_fov / 6.0).bool(), persistent=False)          # 前方左扇区
+        self.register_buffer("_mask_C", ((col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(), persistent=False)  # 前方中扇区
+        self.register_buffer("_mask_R", (col_yaws < -h_fov / 6.0).bool(), persistent=False)          # 前方右扇区
+
     def get_probe_params(self):
         """Expose representative parameters for optimizer/gradient debug checks."""
         return {
             "ku_encoder": self.ku_encoder[0].weight,
-            "camera_risk": self.camera_risk_encoder[0].weight,
             "fusion": self.fusion_mlp[0].weight,
         }
 
@@ -141,6 +162,7 @@ class DualStreamBackbone(torch.nn.Module):
         batch_shape = state.shape[:-1]
         b = int(math.prod(batch_shape)) if len(batch_shape) > 0 else 1
 
+        # ---------- LiDAR-KU 预处理 ----------
         x_ku_raw = x_ku_flat.reshape(b, 1, self.ku_h, self.ku_w)
         x_ku_raw = torch.nan_to_num(
             x_ku_raw,
@@ -149,20 +171,37 @@ class DualStreamBackbone(torch.nn.Module):
             nan=self.ku_unknown_value,
         )
         x_ku_raw = torch.clamp(x_ku_raw, 0.0, self.ku_unknown_value)
-        lidar_feat = self.ku_encoder(x_ku_raw / self.ku_value_max)
-        lidar_z = self.ku_global_head(lidar_feat)
 
-        state_2d = state.reshape(b, self.state_dim)
+        # ---------- 空间 Gate：相机风险逐扇区调制 LiDAR KU ----------
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+        # 取前 12 维 = 3 扇区 × 4 特征
+        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)  # [B, 3, 4]
+
+        gate_L = self.gate_head_L(sector_features[:, 0, :])  # [B, 1]
+        gate_C = self.gate_head_C(sector_features[:, 1, :])  # [B, 1]
+        gate_R = self.gate_head_R(sector_features[:, 2, :])  # [B, 1]
+
+        # 构建空间 gate 图：FoV 外 = 1.0（不调制），FoV 内各扇区用对应的 gate 值
+        spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
+        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
+        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
+        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
+
+        # LiDAR KU × 空间 gate（逐像素乘法）
+        x_ku_gated = x_ku_raw * spatial_gate
+
+        # ---------- LiDAR-KU 编码 ----------
+        lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
+        lidar_z = self.ku_global_head(lidar_feat)
+
+        # ---------- 自身状态编码 ----------
+        state_2d = state.reshape(b, self.state_dim)
         state_z = self.state_encoder(state_2d)
-        camera_z = self.camera_risk_encoder(camera_risk_2d)
 
-        if self.camera_risk_fusion_mode == "gate":
-            gate = self.camera_gate(torch.cat([lidar_z, camera_z], dim=-1))
-            lidar_z = lidar_z * (1.0 - self.camera_risk_gate_alpha * gate)
-
-        fused = torch.cat([state_z, lidar_z, camera_z], dim=-1)
+        # ---------- 最终融合 ----------
+        fused = torch.cat([state_z, lidar_z], dim=-1)
         out = self.fusion_mlp(fused)
         return out.reshape(*batch_shape, -1)
 
@@ -649,9 +688,12 @@ def main(cfg):
             expected_camera_risk_dim,
         )
     expected_feature_dim = 128
-    camera_risk_gate_alpha = float(cfg.task.get("camera_risk_gate_alpha", 0.2))
-    camera_risk_fusion_mode = str(cfg.task.get("camera_risk_fusion_mode", "gate"))
-    _read_depth_camera_geometry_from_stage(base_env)
+    camera_geom = _read_depth_camera_geometry_from_stage(base_env)
+
+    # 从深度相机内参计算水平 FoV
+    fx = camera_geom["intrinsic_matrix"][0][0]
+    depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
+    camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
 
     actor_backbone = DualStreamBackbone(
         state_dim=state_dim,
@@ -659,8 +701,7 @@ def main(cfg):
         camera_risk_dim=camera_risk_dim,
         ku_value_max=ku_value_max,
         output_dim=expected_feature_dim,
-        camera_risk_gate_alpha=camera_risk_gate_alpha,
-        camera_risk_fusion_mode=camera_risk_fusion_mode,
+        camera_h_fov_rad=camera_h_fov_rad,
     ).to(base_env.device)
 
     critic_backbone = DualStreamBackbone(
@@ -669,8 +710,7 @@ def main(cfg):
         camera_risk_dim=camera_risk_dim,
         ku_value_max=ku_value_max,
         output_dim=expected_feature_dim,
-        camera_risk_gate_alpha=camera_risk_gate_alpha,
-        camera_risk_fusion_mode=camera_risk_fusion_mode,
+        camera_h_fov_rad=camera_h_fov_rad,
     ).to(base_env.device)
 
     print("type(policy.actor) =", type(policy.actor))
@@ -750,9 +790,9 @@ def main(cfg):
         print("actor after replace:", policy.actor.module[0].module)
     print("critic after replace:", policy.critic.module)
     print(
-        f"✅ 成功注入 camera-risk gating 骨干网络！state_dim={state_dim}, "
+        f"✅ 成功注入空间感知 camera-risk gating 骨干网络！state_dim={state_dim}, "
         f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}, "
-        f"fusion_mode={camera_risk_fusion_mode}, gate_alpha={camera_risk_gate_alpha}, "
+        f"camera_h_fov_rad={camera_h_fov_rad:.4f}, "
         f"output_dim={expected_feature_dim}"
     )
     # ================= 🌟 致命 Bug 修复 =================
