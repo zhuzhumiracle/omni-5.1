@@ -4,6 +4,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -128,6 +129,74 @@ def write_results(output_dir, rows):
     except Exception as exc:
         print(f"[density sweep] plot skipped: {exc}")
     return csv_path
+
+
+def _sanitize_run_label(label):
+    cleaned = re.sub(r"[^A-Za-z0-9._+=-]+", "_", str(label or "").strip())
+    cleaned = cleaned.strip("._")
+    return cleaned or "run"
+
+
+def _extract_override_value(hydra_overrides, key):
+    prefix = f"{key}="
+    for token in reversed(list(hydra_overrides or [])):
+        if str(token).startswith(prefix):
+            return str(token)[len(prefix):].strip().strip("\"'")
+    return ""
+
+
+def _checkpoint_path_from_play_yaml():
+    cfg_path = ZK_DIR / "play_camlidar.yaml"
+    if not cfg_path.exists():
+        return ""
+    try:
+        for line in cfg_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("checkpoint_path:"):
+                return stripped.split(":", 1)[1].strip().strip("\"'")
+    except Exception:
+        return ""
+    return ""
+
+
+def infer_run_label(args, hydra_overrides):
+    checkpoint_path = str(getattr(args, "checkpoint_path", "") or "").strip()
+    if not checkpoint_path:
+        checkpoint_path = _extract_override_value(hydra_overrides, "checkpoint_path")
+    if not checkpoint_path:
+        checkpoint_path = _checkpoint_path_from_play_yaml()
+    if not checkpoint_path:
+        return ""
+
+    name = Path(checkpoint_path).name or Path(checkpoint_path).stem
+    if name.endswith(".pt"):
+        name = Path(name).stem
+    return _sanitize_run_label(name)
+
+
+def make_run_output_dir(base_output_dir, run_subdir=True, run_label=""):
+    base_output_dir = Path(base_output_dir).expanduser().resolve()
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    if not bool(run_subdir):
+        return base_output_dir
+
+    if run_label:
+        stem = _sanitize_run_label(run_label)
+    else:
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        stem = f"run_{stamp}"
+
+    candidate = base_output_dir / stem
+    suffix = 2
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = base_output_dir / f"{stem}_{suffix:02d}"
+            suffix += 1
 
 
 WEB_HTML = r"""<!doctype html>
@@ -652,8 +721,8 @@ def run_worker(args, hydra_overrides):
 
 
 def controller(args, hydra_overrides):
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_label = infer_run_label(args, hydra_overrides)
+    output_dir = make_run_output_dir(args.output_dir, args.run_subdir, run_label=run_label)
     live_state = output_dir / "live_state.json"
     summary_path = output_dir / "density_sweep_summary.json"
     densities = make_int_range(args.obstacles_per_tile_min, args.obstacles_per_tile_max, args.obstacles_per_tile_step)
@@ -672,6 +741,8 @@ def controller(args, hydra_overrides):
         f"step={args.obstacles_per_tile_step} trials={args.trials} total={total_trials} "
         f"seed_mode=density base_seed={args.seed}"
     )
+    if run_label:
+        print(f"[density sweep] run label: {run_label}")
     print(f"[density sweep] output: {output_dir}")
     if args.dry_run:
         dry_obstacles = make_preview_obstacles(densities[0], int(args.seed)) if densities else []
@@ -791,6 +862,12 @@ def parse_args(argv):
     parser.add_argument("--max-steps", type=int, default=1500)
     parser.add_argument("--checkpoint-path", default="")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    parser.add_argument(
+        "--no-run-subdir",
+        dest="run_subdir",
+        action="store_false",
+        help="Write directly into --output-dir without creating a per-run subdirectory",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8895)
     parser.add_argument("--no-web", action="store_true")
@@ -798,7 +875,7 @@ def parse_args(argv):
     parser.add_argument("--keep-going", dest="stop_on_error", action="store_false",
                         help="Continue the sweep after a worker error")
     parser.add_argument("--web-update-interval", type=int, default=10)
-    parser.set_defaults(stop_on_error=True)
+    parser.set_defaults(stop_on_error=True, run_subdir=True)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-density", type=int, default=40, help=argparse.SUPPRESS)
     parser.add_argument("--worker-trial", type=int, default=1, help=argparse.SUPPRESS)

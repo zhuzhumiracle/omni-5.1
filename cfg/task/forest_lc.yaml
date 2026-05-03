@@ -80,8 +80,8 @@ camera_risk_min_valid_ratio: 0.01
 lidar_free_start_dist: 3.0
 lidar_free_end_dist: 5.0
 min_lidar_points_per_sector: 3
-w_camera_risk: 0 #0.01
-camera_risk_gate_alpha: 0 # 先用极小 alpha，避免 risk 饱和干扰 LiDAR 主干0.02
+w_camera_risk: 0.01 #0.01
+camera_risk_gate_alpha: 0.02 # 先用极小 alpha，避免 risk 饱和干扰 LiDAR 主干0.02
 camera_risk_fusion_mode: gate 
 
 action_transform: null

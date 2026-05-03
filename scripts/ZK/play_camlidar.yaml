@@ -22,7 +22,7 @@ print_every: 50
 
 # Supports either a .pt file or a directory. For a directory, checkpoint_final.pt
 # is preferred; otherwise the newest .pt file is selected.
-checkpoint_path: wandb/run-20260427_131746-unbporyo/files/checkpoint_best_return_356.90.pt
+checkpoint_path: goodpt/5-3camrisk=0.01_best_return_840.81.pt
 
 viewer:
   resolution: [2560, 1440]
@@ -32,7 +32,7 @@ viewer:
 task:
   use_depth_ku_observation: false
   use_camera_risk_observation: true
-  camera_risk_num_bins: 5
+  camera_risk_num_bins: 3
   camera_risk_features_per_bin: 4
   camera_risk_add_stale_ratio: true
   camera_risk_gate_alpha: 0.2

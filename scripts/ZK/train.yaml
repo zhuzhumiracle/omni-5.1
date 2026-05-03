@@ -23,10 +23,10 @@ seed: 0
 
 # - scratch: 从头开始训练
 # - goodpt: 从已有 checkpoint 继续训练
-init_mode: scratch
+init_mode: goodpt
 # 可填 .pt 文件，或填写目录（优先 checkpoint_final.pt，否则选最新修改的 .pt）
 # 相对路径按本脚本所在目录 OmniDrones/scripts/ZK 解析
-goodpt_path: goodpt/4-17_return_501.84.pt
+goodpt_path: goodpt/5-2camrisk=0_best_return_815.30.pt
 
 viewer:
   resolution: [2560, 1440] # 可视化窗口分辨率
@@ -51,6 +51,6 @@ tensorboard:
   log_dir: ""
 
 defaults:
-  - task: forest_lc
+  - task: forest_lc_gate
   - algo: ppo
   - _self_

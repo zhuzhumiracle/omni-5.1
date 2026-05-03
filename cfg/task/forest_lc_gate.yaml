@@ -1,0 +1,152 @@
+name: forest_lc_gate
+
+
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /base/env_base@_here_
+  - /base/sim_base@_here_
+
+
+env:
+  num_envs: 30
+  max_episode_length: 1500
+
+# ../viewer:
+#   eye: [0., 8., 6.]
+
+drone_model:
+  name: Hummingbird
+  controller: LeePositionController
+
+time_encoding: true
+
+lidar_range: 10.
+# Mid-360 垂直扫描目标窗口（与 mid360_pattern 的 pitch 公式一致）
+lidar_vfov: [-7., 52.]
+lidar_pitch_min_deg: -7.0
+lidar_pitch_max_deg: 52.0
+num_lidar_points: 20000
+lidar_update_interval: 5
+
+# 深度相机观测配置。默认不再把完整 depth_ku 作为主模态输入策略，
+# 而是计算低维 camera-LiDAR disagreement risk 作为 LiDAR 的补盲信号。
+use_depth_ku_observation: false
+use_camera_risk_observation: true
+depth_channels: 1
+depth_resolution: [96, 160]
+depth_data_type: distance_to_camera
+depth_max_range: 10.0
+depth_yaw_center_deg: 0.0
+depth_camera_pos: [0.12, 0.0, 0.03]
+depth_camera_target: [2.0, 0.0, 0.03]
+# Explicit pinhole camera intrinsics. USD defaults are narrow for obstacle
+# avoidance, so keep the sensor FOV controlled by config instead.
+depth_camera_focal_length: 12.0
+depth_camera_horizontal_aperture: 20.955
+depth_camera_clip_near: 0.05
+depth_camera_clip_far: 10.0
+sync_depth_to_lidar: true
+depth_update_interval: 5
+depth_prim_name: DepthCamera
+# KU 编码归一化上界（与环境编码范围保持一致，默认 [0, 20]）
+ku_value_max: 20.0
+# 深度链路调试开关：用于验证多环境相机批次和帧更新
+depth_debug_checks: true
+depth_debug_log_interval: 100
+camera_debug_log_interval: 100
+camera_debug_log_first_n: 5
+save_depth_debug_outputs: false
+depth_debug_save_interval: 100
+depth_debug_save_dir: depth_debug
+depth_debug_save_env_index: 0
+# GUI 下可选：打开第 0 个无人机 distance_to_camera 深度灰度图预览小窗
+show_depth_preview_window: true
+depth_preview_window_name: DepthCamEnv0
+depth_preview_window_width: 640
+depth_preview_window_height: 360
+depth_preview_window_pos_x: 30
+depth_preview_window_pos_y: 30
+depth_preview_update_interval: 1
+
+# Camera-projected LiDAR disagreement risk: 3 个相机前方 FoV 扇区 (left/center/right) × 4 个特征，
+# 再额外拼接 stale ratio，作为轻量补盲观测。
+camera_risk_num_bins: 3  # front-left / front-center / front-right
+camera_risk_features_per_bin: 4
+camera_risk_add_stale_ratio: true
+camera_danger_dist: 0.5
+camera_risk_percentile: 0.05
+camera_risk_min_valid_depth: 0.1
+camera_risk_min_valid_ratio: 0.01
+lidar_free_start_dist: 3.0
+lidar_free_end_dist: 5.0
+min_lidar_points_per_sector: 3
+w_camera_risk: 0.01 #0.01
+camera_risk_gate_alpha: 0.02 # 先用极小 alpha，避免 risk 饱和干扰 LiDAR 主干0.02
+camera_risk_fusion_mode: gate 
+
+action_transform: null
+
+# 固定俯视相机参数（仅影响可视化）
+# 主视口跟随第 0 个无人机；关闭时才使用下面的固定俯视参数。
+follow_camera: true
+follow_camera_eye_offset: [6.0, 0.0, 2.0]
+follow_camera_lookat_offset: [2.0, 0.0, 0.5]
+# 棋盘中心（世界坐标）
+topdown_center_xyz: [0.0, 0.0, 0.0]
+# 相机绝对高度（世界坐标 z）
+topdown_camera_z: 70.0
+# 兼容旧参数（当 topdown_camera_z 缺失时生效）
+topdown_view_height: 70.0
+topdown_lookat_z: 0.0
+
+reward_effort_weight: 0.1
+
+# ===== curriculum stage-1 (easy) =====
+goal_radius: 7 #7.0
+goal_bonus: 2000 #2000
+collision_dist: 0.1
+collision_penalty: -5.0 #-30
+
+# 分段里程碑奖励：按路程比例触发一次性奖励。
+# 当 milestone_segments=3 且 milestone_include_goal_segment=false 时，阈值为 1/3、2/3。
+milestone_segments: 10 #5
+milestone_include_goal_segment: false
+milestone_mid_reward: 1000 #1000
+# 每段奖励 = milestone_mid_reward * 对应百分比 / 100
+# 下面示例表示：第1段 100%，第2段 160%
+milestone_reward_percents: [50, 40, 30, 30, 20, 20, 20, 20, 20] #5个20
+
+v_max: 8 #最新的报告好像显示最快的是8m/s，说是这个无人机的最高速度是15m/s，暂时设置成15，后续可以调整
+z_min: 0.4
+z_max: 3.8
+lambda_esdf: 0.5 
+k_esdf: 1.6 #1.6
+
+w_forward: 10 # 3 30 6
+w_smooth: -0.3 #-0.5
+w_max_speed: -0.5  #-0.1
+w_z: -2 #-2
+w_esdf: 1 # 2
+w_yaw: 0.3 #0.3
+w_thrust: -0.1
+# 延迟型时间惩罚：只惩罚“过了宽限期仍缺少路程进度”的拖延行为。
+# 30s episode 中 12s 后平滑启动，进度越高惩罚越弱，避免误伤慢速避障。
+w_time: 1.0
+time_penalty_grace_seconds: 12.0
+time_penalty_power: 2.0
+time_penalty_progress_thresholds: [0.2, 0.4, 0.6]
+time_penalty_progress_discounts: [1.0, 0.5, 0.25, 0.0]
+
+terminate_z_min: 0.4
+terminate_z_max: 10
+terminate_v_norm: 15 #8
+
+sim:
+  device: "cuda:1"
+  enable_replicator: true
+  enable_viewport: true
+  # DepthSensor expects color/depth render textures at the requested resolution.
+  # DLSS can internally render depth at half resolution (e.g. 80x48 for 160x96).
+  anti_aliasing: 0
+  active_gpu: 1
+  physics_gpu: 1
