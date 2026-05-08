@@ -37,19 +37,19 @@ topdown_lookat_z: 0.0
 reward_effort_weight: 0.1
 
 # ===== curriculum stage-1 (easy) =====
-goal_radius: 4 #7.0
+goal_radius: 7 #7.0 4
 goal_bonus: 2000 #2000
 collision_dist: 0.1
 collision_penalty: -5.0 #-30
 
 # 分段里程碑奖励：按路程比例触发一次性奖励。
 # 当 milestone_segments=3 且 milestone_include_goal_segment=false 时，阈值为 1/3、2/3。
-milestone_segments: 5
+milestone_segments: 10 #5
 milestone_include_goal_segment: false
 milestone_mid_reward: 1000 #1000
 # 每段奖励 = milestone_mid_reward * 对应百分比 / 100
 # 下面示例表示：第1段 100%，第2段 160%
-milestone_reward_percents: [20, 20, 20, 20, 20]
+milestone_reward_percents: [50, 40, 30, 30, 20, 20, 20, 20, 20]                         #[20, 20, 20, 20, 20]
 
 v_max: 8 #最新的报告好像显示最快的是8m/s，说是这个无人机的最高速度是15m/s，暂时设置成15，后续可以调整
 z_min: 0.4

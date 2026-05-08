@@ -32,9 +32,21 @@ def make_int_range(min_value, max_value, step):
     return list(range(min_value, max_value + 1, step))
 
 
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
 def write_json(path, payload):
     tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -43,6 +55,27 @@ def read_json(path, default):
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _finite_float(value, default=float("nan")):
+    try:
+        value = float(value)
+    except Exception:
+        return default
+    return value if np.isfinite(value) else default
+
+
+def _weighted_success_mean(rows, key):
+    total_weight = 0
+    weighted_sum = 0.0
+    for row in rows:
+        value = _finite_float(row.get(key))
+        weight = int(row.get("success_count", 0) or 0)
+        if weight <= 0 or not np.isfinite(value):
+            continue
+        weighted_sum += value * weight
+        total_weight += weight
+    return weighted_sum / total_weight if total_weight > 0 else float("nan")
 
 
 def write_results(output_dir, rows):
@@ -58,6 +91,9 @@ def write_results(output_dir, rows):
         "mean_return",
         "mean_episode_len",
         "mean_completion_pct",
+        "mean_arrival_time_s",
+        "mean_path_length_m",
+        "mean_speed_mps",
         "result",
         "duration_s",
     ]
@@ -87,16 +123,20 @@ def write_results(output_dir, rows):
                 "mean_return": float(np.mean([float(r.get("mean_return", 0.0)) for r in combo])),
                 "mean_episode_len": float(np.mean([float(r.get("mean_episode_len", 0.0)) for r in combo])),
                 "avg_completion_pct": round(avg_completion, 1),
+                "mean_arrival_time_s": round(_weighted_success_mean(combo, "mean_arrival_time_s"), 3),
+                "mean_path_length_m": round(_weighted_success_mean(combo, "mean_path_length_m"), 3),
+                "mean_speed_mps": round(_weighted_success_mean(combo, "mean_speed_mps"), 3),
             }
         )
     write_json(output_dir / "density_sweep_summary.json", summary)
     if not summary:
         return csv_path
     try:
-        import matplotlib
+        with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stderr(devnull):
+            import matplotlib
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
         xs = [x["obstacles_per_tile"] for x in summary]
         ys = [x["success_rate"] * 100.0 for x in summary]
@@ -126,6 +166,28 @@ def write_results(output_dir, rows):
         fig2.tight_layout()
         fig2.savefig(output_dir / "completion_pct.png")
         plt.close(fig2)
+
+        metric_specs = [
+            ("mean_arrival_time_s", "arrival_time.png", "Avg Arrival Time (success only)", "Avg arrival time (s)", "#dc2626"),
+            ("mean_path_length_m", "path_length.png", "Avg Path Length (success only)", "Avg path length (m)", "#9333ea"),
+            ("mean_speed_mps", "mean_speed.png", "Avg Speed (success only)", "Avg speed (m/s)", "#ea580c"),
+        ]
+        for key, filename, title_suffix, ylabel, color in metric_specs:
+            metric_summary = [x for x in summary if np.isfinite(_finite_float(x.get(key)))]
+            if not metric_summary:
+                continue
+            fig_m, ax_m = plt.subplots(figsize=(7.2, 4.2), dpi=140)
+            xs_m = [x["obstacles_per_tile"] for x in metric_summary]
+            ys_m = [x[key] for x in metric_summary]
+            ax_m.plot(xs_m, ys_m, marker="o", linewidth=2.0, color=color)
+            ax_m.set_xlabel("Obstacles per 8x8m tile")
+            ax_m.set_ylabel(ylabel)
+            ax_m.set_title(f"OmniDrones Cam+LiDAR Policy Density Sweep — {title_suffix}")
+            ax_m.set_xlim(min(xs_m) - 1, max(xs_m) + 1)
+            ax_m.grid(True, alpha=0.35)
+            fig_m.tight_layout()
+            fig_m.savefig(output_dir / filename)
+            plt.close(fig_m)
     except Exception as exc:
         print(f"[density sweep] plot skipped: {exc}")
     return csv_path
@@ -226,7 +288,7 @@ WEB_HTML = r"""<!doctype html>
   <aside>
     <h1>OmniDrones Density Sweep</h1>
     <div id="metrics"></div>
-    <table><thead><tr><th>density</th><th>trials</th><th>success</th></tr></thead><tbody id="summary"></tbody></table>
+    <table><thead><tr><th>density</th><th>trials</th><th>success</th><th>speed</th></tr></thead><tbody id="summary"></tbody></table>
   </aside>
 </div>
 <script>
@@ -288,7 +350,10 @@ function render(state){
   ];
   metrics.innerHTML = rows.map(r=>`<div class="metric"><span class="label">${r[0]}</span><span class="value">${r[1]}</span></div>`).join("");
   const summary = state.summary || [];
-  summaryEl.innerHTML = summary.map(s=>`<tr><td>${s.obstacles_per_tile}</td><td>${s.trials}</td><td>${(s.success_rate*100).toFixed(1)}%</td></tr>`).join("");
+  summaryEl.innerHTML = summary.map(s=>{
+    const speed = Number.isFinite(s.mean_speed_mps) ? s.mean_speed_mps.toFixed(2) : "-";
+    return `<tr><td>${s.obstacles_per_tile}</td><td>${s.trials}</td><td>${(s.success_rate*100).toFixed(1)}%</td><td>${speed}</td></tr>`;
+  }).join("");
 }
 async function tick(){
   try { const r = await fetch("/state", {cache:"no-store"}); render(await r.json()); } catch(e) {}
@@ -550,6 +615,9 @@ def run_worker(args, hydra_overrides):
             episode_returns = []
             episode_lengths = []
             episode_completion_pct = []
+            episode_arrival_times = []
+            episode_path_lengths = []
+            episode_speeds = []
             latest_success_rate = 0.0
             trajectory = []
             with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
@@ -561,6 +629,20 @@ def run_worker(args, hydra_overrides):
                     target_pos = base_env.target_pos.detach().clone().reshape(num_envs_eval, 3)
                     start_dist = torch.norm(target_pos - init_pos, dim=-1)
                     final_positions = torch.full_like(init_pos, float("nan"))
+                    prev_positions = init_pos.clone()
+                    path_lengths = torch.zeros(num_envs_eval, dtype=torch.float32, device=base_env.device)
+                    arrival_steps = torch.full(
+                        (num_envs_eval,),
+                        -1,
+                        dtype=torch.int32,
+                        device=base_env.device,
+                    )
+                    finish_steps = torch.full(
+                        (num_envs_eval,),
+                        int(args.max_steps),
+                        dtype=torch.int32,
+                        device=base_env.device,
+                    )
                     finished = torch.zeros(num_envs_eval, dtype=torch.bool, device=base_env.device)
                     ep_returns = torch.zeros(num_envs_eval, dtype=torch.float32, device=base_env.device)
                     ep_success = torch.zeros(num_envs_eval, dtype=torch.int32, device=base_env.device)
@@ -573,19 +655,28 @@ def run_worker(args, hydra_overrides):
                         reward = td[("next", "agents", "reward")].reshape(-1).float()
                         done = td[("next", "done")].reshape(-1).bool()
                         stats_td = td[("next", "stats")]
+                        current_pos = base_env.drone.pos.detach().clone().reshape(num_envs_eval, 3)
+
+                        active = ~finished
+                        if active.any():
+                            path_lengths[active] += torch.norm(current_pos[active] - prev_positions[active], dim=-1)
+                            prev_positions[active] = current_pos[active]
 
                         # Capture final positions for envs that just finished
                         just_finished = ~finished & done
                         if just_finished.any():
-                            current_pos = base_env.drone.pos.detach().clone().reshape(num_envs_eval, 3)
                             final_positions[just_finished] = current_pos[just_finished]
+                            finish_steps[just_finished] = step_count
 
-                        active = ~finished
                         if active.any():
                             ep_returns[active] += reward[active]
                         finished = finished | done
                         if "success" in stats_td.keys():
-                            ep_success = torch.maximum(ep_success, (stats_td["success"].reshape(-1) >= 0.5).to(torch.int32))
+                            success_now = stats_td["success"].reshape(-1) >= 0.5
+                            first_success = success_now & (arrival_steps < 0)
+                            if first_success.any():
+                                arrival_steps[first_success] = step_count
+                            ep_success = torch.maximum(ep_success, success_now.to(torch.int32))
 
                         if step % int(args.web_update_interval) == 0 or finished.all():
                             try:
@@ -635,11 +726,24 @@ def run_worker(args, hydra_overrides):
                     completion_pct = torch.clamp(
                         (1.0 - final_dist / start_dist.clamp_min(1e-6)) * 100.0, 0.0, 100.0
                     )
+                    success_mask = ep_success.bool()
+                    sim_dt = float(getattr(base_env, "dt", 0.02))
+                    arrival_times = arrival_steps.to(torch.float32) * sim_dt
+                    episode_speeds_tensor = path_lengths / arrival_times.clamp_min(1e-6)
 
                     episode_success.extend(int(v) for v in ep_success.detach().cpu().tolist())
                     episode_returns.extend(float(v) for v in ep_returns.detach().cpu().tolist())
-                    episode_lengths.extend([step_count] * num_envs_eval)
+                    episode_lengths.extend(int(v) for v in finish_steps.detach().cpu().tolist())
                     episode_completion_pct.extend(float(v) for v in completion_pct.detach().cpu().tolist())
+                    episode_arrival_times.extend(
+                        float(v) for v in arrival_times[success_mask].detach().cpu().tolist()
+                    )
+                    episode_path_lengths.extend(
+                        float(v) for v in path_lengths[success_mask].detach().cpu().tolist()
+                    )
+                    episode_speeds.extend(
+                        float(v) for v in episode_speeds_tensor[success_mask].detach().cpu().tolist()
+                    )
 
             success_count = int(sum(episode_success))
             episode_count = int(len(episode_success))
@@ -654,6 +758,9 @@ def run_worker(args, hydra_overrides):
                 "mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
                 "mean_episode_len": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
                 "mean_completion_pct": round(mean_completion, 1),
+                "mean_arrival_time_s": round(float(np.mean(episode_arrival_times)), 3) if episode_arrival_times else float("nan"),
+                "mean_path_length_m": round(float(np.mean(episode_path_lengths)), 3) if episode_path_lengths else float("nan"),
+                "mean_speed_mps": round(float(np.mean(episode_speeds)), 3) if episode_speeds else float("nan"),
                 "result": "ok",
                 "duration_s": round(time.time() - trial_start, 3),
             }
@@ -678,6 +785,9 @@ def run_worker(args, hydra_overrides):
                     "mean_return": 0.0,
                     "mean_episode_len": 0.0,
                     "mean_completion_pct": 0.0,
+                    "mean_arrival_time_s": float("nan"),
+                    "mean_path_length_m": float("nan"),
+                    "mean_speed_mps": float("nan"),
                     "result": f"error:{type(exc).__name__}:{exc}",
                     "duration_s": 0.0,
                 }
@@ -709,6 +819,9 @@ def run_worker(args, hydra_overrides):
             "mean_return": 0.0,
             "mean_episode_len": 0.0,
             "mean_completion_pct": 0.0,
+            "mean_arrival_time_s": float("nan"),
+            "mean_path_length_m": float("nan"),
+            "mean_speed_mps": float("nan"),
             "result": f"error:{type(exc).__name__}:{exc}",
             "duration_s": round(time.time() - start_time, 3),
         }
@@ -810,6 +923,9 @@ def controller(args, hydra_overrides):
                         "mean_return": 0.0,
                         "mean_episode_len": 0.0,
                         "mean_completion_pct": 0.0,
+                        "mean_arrival_time_s": float("nan"),
+                        "mean_path_length_m": float("nan"),
+                        "mean_speed_mps": float("nan"),
                         "result": f"worker_exit_{proc.returncode}",
                         "duration_s": 0.0,
                     },
@@ -821,7 +937,11 @@ def controller(args, hydra_overrides):
                 print(
                     f"[density sweep] {completed}/{total_trials}: "
                     f"density={density} trial={trial}/{args.trials} "
-                    f"success={float(row['success_rate']) * 100.0:.1f}% result={row['result']}"
+                    f"success={float(row['success_rate']) * 100.0:.1f}% "
+                    f"arrival={_finite_float(row.get('mean_arrival_time_s')):.2f}s "
+                    f"path={_finite_float(row.get('mean_path_length_m')):.2f}m "
+                    f"speed={_finite_float(row.get('mean_speed_mps')):.2f}m/s "
+                    f"result={row['result']}"
                 )
             if proc.returncode != 0 and bool(args.stop_on_error):
                 write_json(

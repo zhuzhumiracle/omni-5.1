@@ -22,7 +22,7 @@ print_every: 50
 
 # Supports either a .pt file or a directory. For a directory, checkpoint_final.pt
 # is preferred; otherwise the newest .pt file is selected.
-checkpoint_path: goodpt/5-3camrisk=0.01_best_return_840.81.pt
+checkpoint_path: goodpt/5-2camrisk=0_best_return_815.30.pt
 
 viewer:
   resolution: [2560, 1440]
@@ -44,6 +44,6 @@ task:
   follow_camera_lookat_offset: [2.0, 0.0, 0.5]
 
 defaults:
-  - task: forest_lc
+  - task: forest_lc_gate
   - algo: ppo
   - _self_

@@ -28,7 +28,7 @@ demo_terminate_z_max: 6.0
 demo_terminate_v_norm: 20.0
 
 # 支持 .pt 文件或目录；目录时优先 checkpoint_final.pt，否则自动选最新 .pt
-checkpoint_path: goodpt/4-18_best_return_520.11.pt
+checkpoint_path: goodpt/5.5_lidar_best_return_754.57.pt
 
 viewer:
   resolution: [2560, 1440]
