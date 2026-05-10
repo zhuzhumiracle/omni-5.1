@@ -324,7 +324,7 @@ def start_web_server(host, port, live_state_path, summary_path):
 
 
 @contextlib.contextmanager
-def patched_obstacle_density(obstacles_per_tile, terrain_seed):
+def patched_obstacle_density(obstacles_per_tile, terrain_seed, obstacle_height_mode="choice"):
     import isaaclab.terrains as terrains
 
     original_obstacle_cfg = terrains.HfDiscreteObstaclesTerrainCfg
@@ -332,6 +332,7 @@ def patched_obstacle_density(obstacles_per_tile, terrain_seed):
 
     def obstacle_cfg_wrapper(*args, **kwargs):
         kwargs["num_obstacles"] = int(obstacles_per_tile)
+        kwargs["obstacle_height_mode"] = obstacle_height_mode
         return original_obstacle_cfg(*args, **kwargs)
 
     def generator_cfg_wrapper(*args, **kwargs):
@@ -475,7 +476,7 @@ def run_worker(args, hydra_overrides):
     simulation_app = None
     try:
         simulation_app = init_simulation_app(cfg)
-        with patched_obstacle_density(int(args.worker_density), int(args.worker_seed)):
+        with patched_obstacle_density(int(args.worker_density), int(args.worker_seed), obstacle_height_mode=args.obstacle_height_mode):
             from omni_drones.envs.isaac_env import IsaacEnv
             import importlib
 
@@ -809,6 +810,8 @@ def controller(args, hydra_overrides):
                 str(args.max_steps),
                 "--web-update-interval",
                 str(args.web_update_interval),
+                "--obstacle-height-mode",
+                args.obstacle_height_mode,
                 "--live-state",
                 str(live_state),
                 "--worker-result",
@@ -905,6 +908,8 @@ def parse_args(argv):
     parser.add_argument("--keep-going", dest="stop_on_error", action="store_false",
                         help="Continue the sweep after a worker error")
     parser.add_argument("--web-update-interval", type=int, default=10)
+    parser.add_argument("--obstacle-height-mode", default="fixed", choices=["choice", "fixed"],
+                        help="Obstacle height mode: choice (pillars+holes) or fixed (all pillars)")
     parser.set_defaults(stop_on_error=True)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-density", type=int, default=40, help=argparse.SUPPRESS)

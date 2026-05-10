@@ -1,0 +1,98 @@
+[
+  {
+    "obstacles_per_tile": 4,
+    "trials": 50,
+    "seeds": [
+      0
+    ],
+    "success_count": 8131,
+    "episode_count": 15000,
+    "success_rate": 0.5420666666666667,
+    "mean_return": 335.2859293205261,
+    "mean_episode_len": 175.81473333333327,
+    "avg_completion_pct": 55.5,
+    "mean_arrival_time_s": 4.982,
+    "mean_path_length_m": 39.888,
+    "mean_speed_mps": 8.018
+  },
+  {
+    "obstacles_per_tile": 8,
+    "trials": 50,
+    "seeds": [
+      1
+    ],
+    "success_count": 4728,
+    "episode_count": 15000,
+    "success_rate": 0.3152,
+    "mean_return": 151.42058748982745,
+    "mean_episode_len": 151.3766,
+    "avg_completion_pct": 43.5,
+    "mean_arrival_time_s": 4.978,
+    "mean_path_length_m": 40.06,
+    "mean_speed_mps": 8.058
+  },
+  {
+    "obstacles_per_tile": 12,
+    "trials": 50,
+    "seeds": [
+      2
+    ],
+    "success_count": 3975,
+    "episode_count": 15000,
+    "success_rate": 0.265,
+    "mean_return": 103.04607257461547,
+    "mean_episode_len": 140.0447333333333,
+    "avg_completion_pct": 39.1,
+    "mean_arrival_time_s": 4.938,
+    "mean_path_length_m": 40.115,
+    "mean_speed_mps": 8.13
+  },
+  {
+    "obstacles_per_tile": 16,
+    "trials": 50,
+    "seeds": [
+      3
+    ],
+    "success_count": 3323,
+    "episode_count": 15000,
+    "success_rate": 0.22153333333333333,
+    "mean_return": 65.50275554758707,
+    "mean_episode_len": 134.62359999999998,
+    "avg_completion_pct": 36.5,
+    "mean_arrival_time_s": 4.935,
+    "mean_path_length_m": 40.843,
+    "mean_speed_mps": 8.287
+  },
+  {
+    "obstacles_per_tile": 20,
+    "trials": 50,
+    "seeds": [
+      4
+    ],
+    "success_count": 2959,
+    "episode_count": 15000,
+    "success_rate": 0.19726666666666667,
+    "mean_return": 36.64117542419434,
+    "mean_episode_len": 128.48846666666668,
+    "avg_completion_pct": 34.0,
+    "mean_arrival_time_s": 4.94,
+    "mean_path_length_m": 41.378,
+    "mean_speed_mps": 8.386
+  },
+  {
+    "obstacles_per_tile": 24,
+    "trials": 50,
+    "seeds": [
+      5
+    ],
+    "success_count": 3613,
+    "episode_count": 15000,
+    "success_rate": 0.24086666666666667,
+    "mean_return": 77.42667326634724,
+    "mean_episode_len": 135.44753333333333,
+    "avg_completion_pct": 37.3,
+    "mean_arrival_time_s": 4.921,
+    "mean_path_length_m": 40.798,
+    "mean_speed_mps": 8.302
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "obstacles_per_tile": 32,
+  "trial": 2,
+  "seed": 7,
+  "success_rate": 0.9333333333333333,
+  "success_count": 280,
+  "episode_count": 300,
+  "mean_return": 708.9107319895427,
+  "mean_episode_len": 223.68666666666667,
+  "mean_completion_pct": 82.0,
+  "mean_arrival_time_s": 4.587,
+  "mean_path_length_m": 42.807,
+  "mean_speed_mps": 9.339,
+  "result": "ok",
+  "duration_s": 96.331
+}

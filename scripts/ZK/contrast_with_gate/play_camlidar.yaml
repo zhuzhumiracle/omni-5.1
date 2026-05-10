@@ -1,0 +1,47 @@
+hydra:
+  searchpath:
+    - file://../../../cfg
+
+headless: true
+
+sim: ${task.sim}
+env: ${task.env}
+
+seed: 0
+cuda_visible_devices: "0"
+sim_gpu_index: 0
+enable_viewport: false
+warn_multi_env_camera_eval: true
+
+# Batch evaluation settings. The script reports both per-round and total success rate.
+eval_num_envs: 30
+final_eval_rounds: 10
+num_episodes: 100
+max_steps: 1500
+print_every: 50
+
+# Supports either a .pt file or a directory. For a directory, checkpoint_final.pt
+# is preferred; otherwise the newest .pt file is selected.
+checkpoint_path: ../goodpt/5.6_lcgate_best_return_758.06.pt
+
+viewer:
+  resolution: [2560, 1440]
+  eye: [5.5, -5.5, 2.6]
+  lookat: [0.0, 0.0, 1.0]
+
+task:
+  use_depth_ku_observation: false
+  use_camera_risk_observation: true
+  camera_risk_num_bins: 3
+  camera_risk_features_per_bin: 4
+  camera_risk_add_stale_ratio: true
+  ku_value_max: 20.0
+  show_depth_preview_window: false
+  follow_camera: true
+  follow_camera_eye_offset: [6.0, 0.0, 2.0]
+  follow_camera_lookat_offset: [2.0, 0.0, 0.5]
+
+defaults:
+  - task: forest_lc_gate
+  - algo: ppo
+  - _self_
