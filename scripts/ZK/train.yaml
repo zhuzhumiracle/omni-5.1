@@ -10,7 +10,7 @@ headless: true # 是否弹出渲染窗口
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 40_000_000 # 总共训练多少帧
+total_frames: 10_000_000 # 总共训练多少帧
 max_iters: -1
 eval_interval: -1
 save_interval: -1
@@ -19,6 +19,20 @@ eval_export_topk: true
 eval_topk_trajectories: 150
 seed: 0
 
+# ── GPU selection (DO NOT use CUDA_VISIBLE_DEVICES with Isaac Sim) ──
+gpu_id: 0           # CUDA / PhysX GPU
+vulkan_gpu_id: 1    # Vulkan render GPU (must have a display for headless=false)
+
+# ── YOPO tree mesh obstacle config (used by train_camlidar_trees.py) ──
+tree:
+  obj_path: /home/descfly/visualandlidar/base/omni-5.1/YOPO/Simulator/src/pointcloud/tree_mesh.obj
+  map_size: 60.0
+  spacing: 4.0     # tree spacing in meters
+  scale_min: 0.4   # minimum tree scale
+  scale_max: 0.8   # maximum tree scale
+  tilt_deg: 10.0   # maximum random tilt in degrees
+  clear_radius: 2.0  # clear radius around start/target
+
 # 训练初始化模式：
 
 # - scratch: 从头开始训练
@@ -26,10 +40,10 @@ seed: 0
 init_mode: goodpt
 # 可填 .pt 文件，或填写目录（优先 checkpoint_final.pt，否则选最新修改的 .pt）
 # 相对路径按本脚本所在目录 OmniDrones/scripts/ZK 解析
-goodpt_path: goodpt/5.5_lcgate_best_return_720.16.pt
+goodpt_path: goodpt/5-14-vlim-lc_best_return_2619.32.pt
 
 viewer:
-  resolution: [2560, 1440] # 可视化窗口分辨率
+  resolution: [1080, 780] # 可视化窗口分辨率
   eye: [8, 0., 6.] # 相机坐标
   lookat: [0., 0., 1.]
 
@@ -51,6 +65,6 @@ tensorboard:
   log_dir: ""
 
 defaults:
-  - task: forest_lc_gate
+  - task: forest_lc
   - algo: ppo
   - _self_

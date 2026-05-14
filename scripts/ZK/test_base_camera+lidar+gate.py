@@ -140,9 +140,14 @@ class DualStreamBackbone(torch.nn.Module):
         col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
         col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
 
-        self.register_buffer("_mask_L", (col_yaws > h_fov / 6.0).bool(), persistent=False)          # 前方左扇区
-        self.register_buffer("_mask_C", ((col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(), persistent=False)  # 前方中扇区
-        self.register_buffer("_mask_R", (col_yaws < -h_fov / 6.0).bool(), persistent=False)          # 前方右扇区
+        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
+        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
+        self.register_buffer(
+            "_mask_C",
+            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
+            persistent=False,
+        )
+        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
 
     def get_probe_params(self):
         """Expose representative parameters for optimizer/gradient debug checks."""
@@ -176,12 +181,12 @@ class DualStreamBackbone(torch.nn.Module):
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-        # 取前 12 维 = 3 扇区 × 4 特征
+        # 取前 12 维 = 3 扇区 × 4 特征，环境输出顺序为 right / center / left。
         sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)  # [B, 3, 4]
 
-        gate_L = self.gate_head_L(sector_features[:, 0, :])  # [B, 1]
+        gate_R = self.gate_head_R(sector_features[:, 0, :])  # [B, 1]
         gate_C = self.gate_head_C(sector_features[:, 1, :])  # [B, 1]
-        gate_R = self.gate_head_R(sector_features[:, 2, :])  # [B, 1]
+        gate_L = self.gate_head_L(sector_features[:, 2, :])  # [B, 1]
 
         # 构建空间 gate 图：FoV 外 = 1.0（不调制），FoV 内各扇区用对应的 gate 值
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
@@ -376,8 +381,8 @@ def _read_depth_camera_geometry_from_stage(base_env):
         [0.0, 0.0, 1.0],
     ]
 
-    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.12, 0.0, 0.03])
-    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.03])
+    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18])
+    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18])
     expected_cam_pos = np.array(depth_cam_pos_cfg, dtype=np.float64)
     cam_pos_error = float(np.linalg.norm(cam_pos_lidar_np.astype(np.float64) - expected_cam_pos))
     if cam_pos_error > 1e-4:

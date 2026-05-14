@@ -1,0 +1,14 @@
+name: ppo
+
+train_every: 256
+ppo_epochs: 4
+num_minibatches: 8
+clip_param: 0.2
+value_clip_param: 0.2
+policy_mode: ppo
+spo_epsilon: 0.2
+
+priv_actor: true
+priv_critic: true
+
+checkpoint_path: null

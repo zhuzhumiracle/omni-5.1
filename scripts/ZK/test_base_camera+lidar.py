@@ -3,7 +3,7 @@ import os
 # 🌟 必须放在 import torch 和其他库的最前面！
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # 固定当前脚本只使用物理 0 号 GPU，避免继承到外部的多卡/错卡配置。
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import time
 import importlib
 import math
@@ -337,8 +337,8 @@ def _read_depth_camera_geometry_from_stage(base_env):
         [0.0, 0.0, 1.0],
     ]
 
-    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.12, 0.0, 0.03])
-    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.03])
+    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18])
+    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18])
     expected_cam_pos = np.array(depth_cam_pos_cfg, dtype=np.float64)
     cam_pos_error = float(np.linalg.norm(cam_pos_lidar_np.astype(np.float64) - expected_cam_pos))
     if cam_pos_error > 1e-4:
@@ -626,7 +626,21 @@ def main(cfg):
     obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
     lidar_dim = 3200
     ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-    state_dim = int(cfg.task.get("state_dim", 14))
+    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
+        cfg.task.get("camera_risk_features_per_bin", 4)
+    )
+    if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
+        expected_camera_risk_dim += 1
+    inferred_state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
+    configured_state_dim = cfg.task.get("state_dim", None)
+    if configured_state_dim is not None and int(configured_state_dim) != inferred_state_dim:
+        logging.warning(
+            "Configured state_dim=%d does not match inferred state_dim=%d from observation layout. "
+            "Using inferred value to keep [state, lidar_ku, camera_risk] split aligned.",
+            int(configured_state_dim),
+            inferred_state_dim,
+        )
+    state_dim = inferred_state_dim
     camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
     if camera_risk_dim <= 0:
         task_name_cfg = str(cfg.task.get("name", "<unknown>"))
@@ -636,11 +650,6 @@ def main(cfg):
             "This script expects observation=[state, lidar_ku(3200), camera_risk]. "
             "Ensure use_camera_risk_observation=true and use_depth_ku_observation=false."
         )
-    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
-        cfg.task.get("camera_risk_features_per_bin", 4)
-    )
-    if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
-        expected_camera_risk_dim += 1
     if camera_risk_dim != expected_camera_risk_dim:
         logging.warning(
             "camera_risk_dim=%d derived from observation, expected %d from config. "

@@ -1,0 +1,18 @@
+[
+  {
+    "obstacles_per_tile": 20,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 0,
+    "episode_count": 0,
+    "success_rate": 0.0,
+    "mean_return": 0.0,
+    "mean_episode_len": 0.0,
+    "avg_completion_pct": 0.0,
+    "mean_arrival_time_s": null,
+    "mean_path_length_m": null,
+    "mean_speed_mps": null
+  }
+]

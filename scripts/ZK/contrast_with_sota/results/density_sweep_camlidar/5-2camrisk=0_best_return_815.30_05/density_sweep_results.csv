@@ -1,0 +1,2 @@
+obstacles_per_tile,trial,seed,success_rate,success_count,episode_count,mean_return,mean_episode_len,mean_completion_pct,mean_arrival_time_s,mean_path_length_m,mean_speed_mps,result,duration_s
+8,1,0,0.6,6,10,408.25025787353513,217.2,60.1,5.817,41.695,7.157,ok,30.315

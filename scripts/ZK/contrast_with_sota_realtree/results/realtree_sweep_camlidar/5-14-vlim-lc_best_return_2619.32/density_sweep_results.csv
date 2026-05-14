@@ -1,0 +1,6 @@
+obstacles_per_tile,tree_spacing_m,target_speed_mps,tree_count,trial,seed,success_rate,success_count,episode_count,mean_return,mean_episode_len,mean_completion_pct,mean_arrival_time_s,mean_path_length_m,mean_speed_mps,result,duration_s
+8,8.0,1.0,24,1,0,0.0,0,0,0.0,0.0,0.0,,,,"error:RuntimeError:""bitwise_and_cuda"" not implemented for 'Float'",0.0
+8,8.0,2.0,24,1,0,0.0,0,1,127.10505676269531,130.0,10.7,,,,ok,9.026
+8,8.0,3.0,24,1,0,0.0,0,1,33.3499755859375,104.0,10.9,,,,ok,7.302
+8,8.0,4.0,24,1,0,0.0,0,1,-1.3616485595703125,94.0,11.0,,,,ok,6.812
+8,8.0,5.0,24,1,0,0.0,0,1,-31.4049072265625,84.0,11.1,,,,ok,6.132

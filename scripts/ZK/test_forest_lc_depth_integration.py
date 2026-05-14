@@ -135,8 +135,8 @@ def main():
         sensor = DepthSensorOfficial(depth_cfg)
         sensor.spawn(
             [f"/World/envs/env_0/{drone.name}_0/base_link/DepthCamera"],
-            translations=[(0.12, 0.0, 0.03)],
-            targets=[(2.0, 0.0, 0.03)],
+            translations=[(0.22, 0.0, 0.18)],
+            targets=[(2.0, 0.0, 0.18)],
         )
 
         print("[4/5] Initializing (mimics forest_lc.__init__ flow)...")

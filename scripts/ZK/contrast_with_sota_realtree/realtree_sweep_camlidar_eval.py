@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -18,7 +19,12 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 ZK_DIR = SCRIPT_DIR.parent
 OMNIDRONES_DIR = ZK_DIR.parent.parent
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "density_sweep_camlidar"
+REPO_ROOT = OMNIDRONES_DIR.parent
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar"
+DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
+DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-14-vlim-lc_best_return_2465.99.pt"
+DEFAULT_POLICY_TASK = "forest_lc"
 
 
 def make_int_range(min_value, max_value, step):
@@ -30,6 +36,34 @@ def make_int_range(min_value, max_value, step):
     if max_value < min_value:
         raise ValueError("obstacle max must be >= min")
     return list(range(min_value, max_value + 1, step))
+
+
+def make_float_range(min_value, max_value, step):
+    min_value = float(min_value)
+    max_value = float(max_value)
+    step = float(step)
+    if step <= 0.0:
+        raise ValueError("speed step must be positive")
+    if max_value < min_value:
+        raise ValueError("speed max must be >= min")
+    values = []
+    value = min_value
+    while value <= max_value + 1e-9:
+        values.append(round(value, 3))
+        value += step
+    return values
+
+
+def make_speed_values(args):
+    if args.speed_min is not None or args.speed_max is not None:
+        min_speed = args.speed if args.speed_min is None else args.speed_min
+        max_speed = args.speed if args.speed_max is None else args.speed_max
+        return make_float_range(min_speed, max_speed, args.speed_step)
+    return [round(float(args.speed), 3)]
+
+
+def _speed_tag(speed):
+    return str(round(float(speed), 3)).replace("-", "m").replace(".", "p")
 
 
 def _json_safe(value):
@@ -78,11 +112,176 @@ def _weighted_success_mean(rows, key):
     return weighted_sum / total_weight if total_weight > 0 else float("nan")
 
 
+def read_ply_xyz(path, max_source_points=200_000):
+    """Read XYZ vertices from a binary/ascii PLY file without requiring open3d."""
+    path = Path(path).expanduser().resolve()
+    with path.open("rb") as f:
+        header_lines = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"PLY header ended unexpectedly: {path}")
+            text = line.decode("ascii", errors="replace").strip()
+            header_lines.append(text)
+            if text == "end_header":
+                break
+
+        fmt = ""
+        vertex_count = None
+        vertex_props = []
+        in_vertex = False
+        for line in header_lines:
+            if line.startswith("format "):
+                fmt = line.split()[1]
+            elif line.startswith("element "):
+                parts = line.split()
+                in_vertex = len(parts) >= 3 and parts[1] == "vertex"
+                if in_vertex:
+                    vertex_count = int(parts[2])
+            elif in_vertex and line.startswith("property "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    vertex_props.append((parts[1], parts[2]))
+
+        if vertex_count is None:
+            raise ValueError(f"PLY has no vertex element: {path}")
+        prop_names = [name for _ptype, name in vertex_props]
+        try:
+            x_idx, y_idx, z_idx = prop_names.index("x"), prop_names.index("y"), prop_names.index("z")
+        except ValueError as exc:
+            raise ValueError(f"PLY vertex properties must include x/y/z: {path}") from exc
+
+        if fmt == "binary_little_endian":
+            dtype_fields = []
+            type_map = {
+                "char": "i1", "uchar": "u1", "int8": "i1", "uint8": "u1",
+                "short": "<i2", "ushort": "<u2", "int16": "<i2", "uint16": "<u2",
+                "int": "<i4", "uint": "<u4", "int32": "<i4", "uint32": "<u4",
+                "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+            }
+            for i, (ptype, name) in enumerate(vertex_props):
+                if ptype not in type_map:
+                    raise ValueError(f"Unsupported PLY property type {ptype!r} in {path}")
+                dtype_fields.append((name or f"prop_{i}", type_map[ptype]))
+            arr = np.fromfile(f, dtype=np.dtype(dtype_fields), count=vertex_count)
+            points = np.stack([arr[prop_names[x_idx]], arr[prop_names[y_idx]], arr[prop_names[z_idx]]], axis=1)
+        elif fmt == "ascii":
+            rows = []
+            for _ in range(vertex_count):
+                parts = f.readline().decode("ascii", errors="replace").split()
+                if len(parts) < len(vertex_props):
+                    continue
+                rows.append([float(parts[x_idx]), float(parts[y_idx]), float(parts[z_idx])])
+            points = np.asarray(rows, dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported PLY format {fmt!r}: {path}")
+
+    points = np.asarray(points, dtype=np.float32)
+    finite = np.isfinite(points).all(axis=1)
+    points = points[finite]
+    if points.shape[0] > int(max_source_points):
+        rng = np.random.default_rng(0)
+        idx = rng.choice(points.shape[0], size=int(max_source_points), replace=False)
+        points = points[idx]
+    return points
+
+
+def tree_positions_jittered_grid(map_size=60.0, spacing=4.0, seed=0, clear_radius=2.0):
+    """Poisson-like jittered grid positions matching YOPO's tree_dist intent."""
+    rng = np.random.default_rng(int(seed))
+    map_size = float(map_size)
+    spacing = float(spacing)
+    if spacing <= 0:
+        raise ValueError("tree spacing must be positive")
+    half = 0.5 * map_size
+    coords = np.arange(-half + 0.5 * spacing, half, spacing, dtype=np.float32)
+    positions = []
+    jitter = min(0.35 * spacing, 0.5 * max(spacing - 0.8, 0.0))
+    clear_points = np.asarray([[0.0, -24.0], [0.0, 24.0], [0.0, 0.0]], dtype=np.float32)
+    for x in coords:
+        for y in coords:
+            px = float(np.clip(x + rng.uniform(-jitter, jitter), -half + 0.3, half - 0.3))
+            py = float(np.clip(y + rng.uniform(-jitter, jitter), -half + 0.3, half - 0.3))
+            if clear_radius > 0:
+                d2 = np.sum((clear_points - np.asarray([px, py], dtype=np.float32)) ** 2, axis=1)
+                if np.any(d2 <= clear_radius * clear_radius):
+                    continue
+            positions.append((px, py))
+    return np.asarray(positions, dtype=np.float32)
+
+
+def make_realtree_forest_points(
+    tree_ply,
+    map_size=60.0,
+    spacing=4.0,
+    seed=0,
+    points_per_tree=320,
+    scale_min=0.5,
+    scale_max=1.0,
+    tilt_deg=10.0,
+    clear_radius=2.0,
+):
+    base_points = read_ply_xyz(tree_ply)
+    base_points = base_points - np.asarray(
+        [np.mean(base_points[:, 0]), np.mean(base_points[:, 1]), np.min(base_points[:, 2])],
+        dtype=np.float32,
+    )
+    rng = np.random.default_rng(int(seed))
+    if base_points.shape[0] > int(points_per_tree):
+        base_points = base_points[rng.choice(base_points.shape[0], size=int(points_per_tree), replace=False)]
+    # Random subsampling may miss the lowest source vertices; plant each sampled tree on z=0.
+    base_points[:, 2] -= float(np.min(base_points[:, 2]))
+    positions = tree_positions_jittered_grid(map_size=map_size, spacing=spacing, seed=seed, clear_radius=clear_radius)
+    forest = []
+    max_tilt = math.radians(float(tilt_deg))
+    for px, py in positions:
+        scale = float(rng.uniform(float(scale_min), float(scale_max)))
+        roll = float(rng.uniform(-max_tilt, max_tilt))
+        pitch = float(rng.uniform(-max_tilt, max_tilt))
+        yaw = float(rng.uniform(-math.pi, math.pi))
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        rx = np.asarray([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float32)
+        ry = np.asarray([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float32)
+        rz = np.asarray([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float32)
+        pts = (base_points * scale) @ (rz @ ry @ rx).T
+        pts += np.asarray([px, py, 0.0], dtype=np.float32)
+        pts[:, 2] = np.maximum(pts[:, 2], 0.02)
+        forest.append(pts.astype(np.float32))
+    if not forest:
+        return np.zeros((0, 3), dtype=np.float32), positions
+    return np.concatenate(forest, axis=0), positions
+
+
+def surfel_cross_mesh(points, surfel_size=0.08):
+    """Convert tree points into small crossed triangle surfels for USD/render/raycast."""
+    points = np.asarray(points, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32)
+    s = float(surfel_size) * 0.5
+    offsets = np.asarray(
+        [
+            [-s, 0.0, -s], [s, 0.0, -s], [s, 0.0, s], [-s, 0.0, s],
+            [0.0, -s, -s], [0.0, s, -s], [0.0, s, s], [0.0, -s, s],
+        ],
+        dtype=np.float32,
+    )
+    vertices = (points[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+    base = (np.arange(points.shape[0], dtype=np.int32) * 8)[:, None]
+    local_faces = np.asarray([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]], dtype=np.int32)
+    faces = (base[:, None, :] + local_faces[None, :, :]).reshape(-1, 3)
+    return vertices.astype(np.float32), faces.astype(np.int32)
+
+
 def write_results(output_dir, rows):
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "density_sweep_results.csv"
     fieldnames = [
         "obstacles_per_tile",
+        "tree_spacing_m",
+        "target_speed_mps",
+        "tree_count",
         "trial",
         "seed",
         "success_rate",
@@ -104,9 +303,23 @@ def write_results(output_dir, rows):
             writer.writerow({k: row.get(k, "") for k in fieldnames})
 
     summary = []
-    densities = sorted({int(r["obstacles_per_tile"]) for r in rows})
-    for density in densities:
-        combo = [r for r in rows if int(r["obstacles_per_tile"]) == density]
+    groups = sorted(
+        {
+            (
+                round(_finite_float(r.get("target_speed_mps"), float("nan")), 3),
+                int(r["obstacles_per_tile"]),
+            )
+            for r in rows
+        },
+        key=lambda item: (item[0] if np.isfinite(item[0]) else -1.0, item[1]),
+    )
+    for target_speed, density in groups:
+        combo = [
+            r
+            for r in rows
+            if round(_finite_float(r.get("target_speed_mps"), float("nan")), 3) == target_speed
+            and int(r["obstacles_per_tile"]) == density
+        ]
         if not combo:
             continue
         total_success = sum(int(r.get("success_count", 0)) for r in combo)
@@ -114,7 +327,10 @@ def write_results(output_dir, rows):
         avg_completion = float(np.mean([float(r.get("mean_completion_pct", 0.0)) for r in combo]))
         summary.append(
             {
+                "target_speed_mps": target_speed,
                 "obstacles_per_tile": density,
+                "tree_spacing_m": float(np.mean([_finite_float(r.get("tree_spacing_m"), density) for r in combo])),
+                "tree_count": int(round(float(np.mean([_finite_float(r.get("tree_count"), 0) for r in combo])))),
                 "trials": len(combo),
                 "seeds": sorted({int(r["seed"]) for r in combo}),
                 "success_count": total_success,
@@ -138,15 +354,19 @@ def write_results(output_dir, rows):
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-        xs = [x["obstacles_per_tile"] for x in summary]
+        xs = [x["target_speed_mps"] for x in summary]
+        labels = [f"sp={_finite_float(x.get('tree_spacing_m', x.get('obstacles_per_tile'))):g}m" for x in summary]
         ys = [x["success_rate"] * 100.0 for x in summary]
         fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=140)
         ax.plot(xs, ys, marker="o", linewidth=2.0, color="#2563eb")
-        ax.set_xlabel("Obstacles per 8x8m tile")
+        if len({x.get("obstacles_per_tile") for x in summary}) > 1:
+            for x, y, label in zip(xs, ys, labels):
+                ax.annotate(label, (x, y), textcoords="offset points", xytext=(4, 4), fontsize=8)
+        ax.set_xlabel("Target speed (m/s)")
         ax.set_ylabel("Success rate (%)")
-        ax.set_title("OmniDrones Cam+LiDAR Policy Density Sweep")
+        ax.set_title("OmniDrones Cam+LiDAR Policy Real-Tree Sweep")
         ax.set_ylim(-2, 102)
-        ax.set_xlim(min(xs) - 1, max(xs) + 1)
+        ax.set_xlim(min(xs) - 0.5, max(xs) + 0.5)
         ax.grid(True, alpha=0.35)
         fig.tight_layout()
         fig.savefig(output_dir / "success_rate.png")
@@ -154,14 +374,14 @@ def write_results(output_dir, rows):
 
         # ---- completion percentage chart ----
         fig2, ax2 = plt.subplots(figsize=(7.2, 4.2), dpi=140)
-        xs2 = [x["obstacles_per_tile"] for x in summary]
+        xs2 = [x["target_speed_mps"] for x in summary]
         ys2 = [x["avg_completion_pct"] for x in summary]
         ax2.plot(xs2, ys2, marker="o", linewidth=2.0, color="#16a34a")
-        ax2.set_xlabel("Obstacles per 8x8m tile")
+        ax2.set_xlabel("Target speed (m/s)")
         ax2.set_ylabel("Avg completion (%)")
-        ax2.set_title("OmniDrones Cam+LiDAR Policy Density Sweep — Completion %")
+        ax2.set_title("OmniDrones Cam+LiDAR Policy Real-Tree Sweep - Completion %")
         ax2.set_ylim(-2, 102)
-        ax2.set_xlim(min(xs2) - 1, max(xs2) + 1)
+        ax2.set_xlim(min(xs2) - 0.5, max(xs2) + 0.5)
         ax2.grid(True, alpha=0.35)
         fig2.tight_layout()
         fig2.savefig(output_dir / "completion_pct.png")
@@ -177,19 +397,19 @@ def write_results(output_dir, rows):
             if not metric_summary:
                 continue
             fig_m, ax_m = plt.subplots(figsize=(7.2, 4.2), dpi=140)
-            xs_m = [x["obstacles_per_tile"] for x in metric_summary]
+            xs_m = [x["target_speed_mps"] for x in metric_summary]
             ys_m = [x[key] for x in metric_summary]
             ax_m.plot(xs_m, ys_m, marker="o", linewidth=2.0, color=color)
-            ax_m.set_xlabel("Obstacles per 8x8m tile")
+            ax_m.set_xlabel("Target speed (m/s)")
             ax_m.set_ylabel(ylabel)
-            ax_m.set_title(f"OmniDrones Cam+LiDAR Policy Density Sweep — {title_suffix}")
-            ax_m.set_xlim(min(xs_m) - 1, max(xs_m) + 1)
+            ax_m.set_title(f"OmniDrones Cam+LiDAR Policy Real-Tree Sweep - {title_suffix}")
+            ax_m.set_xlim(min(xs_m) - 0.5, max(xs_m) + 0.5)
             ax_m.grid(True, alpha=0.35)
             fig_m.tight_layout()
             fig_m.savefig(output_dir / filename)
             plt.close(fig_m)
     except Exception as exc:
-        print(f"[density sweep] plot skipped: {exc}")
+        print(f"[realtree sweep] plot skipped: {exc}")
     return csv_path
 
 
@@ -205,6 +425,11 @@ def _extract_override_value(hydra_overrides, key):
         if str(token).startswith(prefix):
             return str(token)[len(prefix):].strip().strip("\"'")
     return ""
+
+
+def _has_override(hydra_overrides, key):
+    prefix = f"{key}="
+    return any(str(token).startswith(prefix) for token in hydra_overrides or [])
 
 
 def _checkpoint_path_from_play_yaml():
@@ -296,7 +521,7 @@ WEB_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OmniDrones Density Sweep</title>
+  <title>OmniDrones Real-Tree Sweep</title>
   <style>
     html, body { margin: 0; height: 100%; background: #101418; color: #e8edf2; font: 14px system-ui, sans-serif; }
     #wrap { display: grid; grid-template-columns: 1fr 320px; height: 100%; }
@@ -316,9 +541,9 @@ WEB_HTML = r"""<!doctype html>
 <div id="wrap">
   <canvas id="view"></canvas>
   <aside>
-    <h1>OmniDrones Density Sweep</h1>
+    <h1>OmniDrones Real-Tree Sweep</h1>
     <div id="metrics"></div>
-    <table><thead><tr><th>density</th><th>trials</th><th>success</th><th>speed</th></tr></thead><tbody id="summary"></tbody></table>
+    <table><thead><tr><th>spacing</th><th>target</th><th>trees</th><th>success</th><th>actual</th></tr></thead><tbody id="summary"></tbody></table>
   </aside>
 </div>
 <script>
@@ -369,7 +594,9 @@ function render(state){
   const cls = state.phase === "running" ? "run" : (state.result === "success" ? "ok" : (state.result ? "bad" : ""));
   const rows = [
     ["phase", `<span class="${cls}">${state.phase || "waiting"}</span>`],
-    ["density", state.obstacles_per_tile ?? "-"],
+    ["tree spacing", state.tree_spacing_m ?? state.obstacles_per_tile ?? "-"],
+    ["target speed", state.target_speed_mps == null ? "-" : `${Number(state.target_speed_mps).toFixed(2)} m/s`],
+    ["tree count", state.tree_count ?? "-"],
     ["trial", `${state.trial ?? "-"} / ${state.trials ?? "-"}`],
     ["seed", state.seed ?? "-"],
     ["step", state.step ?? "-"],
@@ -382,7 +609,8 @@ function render(state){
   const summary = state.summary || [];
   summaryEl.innerHTML = summary.map(s=>{
     const speed = Number.isFinite(s.mean_speed_mps) ? s.mean_speed_mps.toFixed(2) : "-";
-    return `<tr><td>${s.obstacles_per_tile}</td><td>${s.trials}</td><td>${(s.success_rate*100).toFixed(1)}%</td><td>${speed}</td></tr>`;
+    const target = Number.isFinite(s.target_speed_mps) ? s.target_speed_mps.toFixed(2) : "-";
+    return `<tr><td>${s.tree_spacing_m ?? s.obstacles_per_tile}</td><td>${target}</td><td>${s.tree_count ?? "-"}</td><td>${(s.success_rate*100).toFixed(1)}%</td><td>${speed}</td></tr>`;
   }).join("");
 }
 async function tick(){
@@ -435,28 +663,160 @@ def start_web_server(host, port, live_state_path, summary_path):
 
 
 @contextlib.contextmanager
-def patched_obstacle_density(obstacles_per_tile, terrain_seed, obstacle_height_mode="choice"):
+def patched_realtree_forest(args):
+    import importlib
     import isaaclab.terrains as terrains
+    ray_caster_mod = importlib.import_module("isaaclab.sensors.ray_caster.ray_caster")
 
     original_obstacle_cfg = terrains.HfDiscreteObstaclesTerrainCfg
-    original_generator_cfg = terrains.TerrainGeneratorCfg
+    original_terrain_init = terrains.TerrainImporter.__init__
+    original_ray_init_meshes = ray_caster_mod.RayCaster._initialize_warp_meshes
 
     def obstacle_cfg_wrapper(*args, **kwargs):
-        kwargs["num_obstacles"] = int(obstacles_per_tile)
-        kwargs["obstacle_height_mode"] = obstacle_height_mode
+        kwargs["num_obstacles"] = 0
+        kwargs["obstacle_height_mode"] = "fixed"
         return original_obstacle_cfg(*args, **kwargs)
 
-    def generator_cfg_wrapper(*args, **kwargs):
-        kwargs["seed"] = int(terrain_seed)
-        return original_generator_cfg(*args, **kwargs)
+    def install_realtree_mesh():
+        import omni.usd  # type: ignore
+        from pxr import Sdf, UsdGeom, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            raise RuntimeError("USD stage is unavailable while installing real-tree forest")
+
+        tree_obj_path = Path(str(args.tree_ply)).expanduser().resolve()
+        if not tree_obj_path.exists():
+            raise FileNotFoundError(f"Tree OBJ file not found: {tree_obj_path}")
+
+        rng = np.random.default_rng(int(args.worker_seed))
+        positions = tree_positions_jittered_grid(
+            map_size=float(args.tree_map_size),
+            spacing=float(args.worker_density),
+            seed=int(args.worker_seed),
+            clear_radius=float(args.tree_clear_radius),
+        )
+
+        scale_min = float(args.tree_scale_min)
+        scale_max = float(args.tree_scale_max)
+        if scale_max < scale_min:
+            scale_min, scale_max = scale_max, scale_min
+        max_tilt_rad = math.radians(float(args.tree_tilt_deg))
+
+        parent_path = "/World/ground/realtree_forest_mesh"
+        parent = UsdGeom.Xform.Define(stage, parent_path)
+
+        for i, (px, py) in enumerate(positions):
+            scale = float(rng.uniform(scale_min, scale_max))
+            roll = float(rng.uniform(-max_tilt_rad, max_tilt_rad))
+            pitch = float(rng.uniform(-max_tilt_rad, max_tilt_rad))
+            yaw = float(rng.uniform(-math.pi, math.pi))
+
+            child_path = f"{parent_path}/tree_{i}"
+            child = UsdGeom.Xform.Define(stage, child_path)
+            child.AddTranslateOp().Set((float(px), float(py), 0.0))
+            child.AddRotateXYZOp().Set((math.degrees(roll), math.degrees(pitch), math.degrees(yaw)))
+            child.AddScaleOp().Set((scale, scale, scale))
+            child.GetPrim().GetReferences().AddReference(str(tree_obj_path))
+            UsdPhysics.CollisionAPI.Apply(child.GetPrim())
+
+        prim = parent.GetPrim()
+        prim.CreateAttribute("realtree:tree_count", Sdf.ValueTypeNames.Int).Set(int(positions.shape[0]))
+        prim.CreateAttribute("realtree:spacing_m", Sdf.ValueTypeNames.Double).Set(float(args.worker_density))
+        return int(positions.shape[0]), 0, int(positions.shape[0]), 0
+
+    def terrain_init_wrapper(self, cfg):
+        original_terrain_init(self, cfg)
+        counts = install_realtree_mesh()
+        print(
+            "[realtree] installed YOPO tree_mesh.obj forest: "
+            f"spacing={float(args.worker_density):.3f}m trees={counts[0]} "
+            f"instanced_meshes={counts[2]}"
+        )
+
+    def ray_initialize_all_meshes(self):
+        import omni.usd  # type: ignore
+        import warp as wp
+        from pxr import UsdGeom
+        import isaaclab.sim as sim_utils
+        from isaaclab.terrains.trimesh.utils import make_plane
+        from isaaclab.utils.warp import convert_to_warp_mesh
+
+        if len(self.cfg.mesh_prim_paths) != 1:
+            return original_ray_init_meshes(self)
+
+        for mesh_prim_path in self.cfg.mesh_prim_paths:
+            plane_prim = sim_utils.get_first_matching_child_prim(
+                mesh_prim_path, lambda prim: prim.GetTypeName() == "Plane"
+            )
+            if plane_prim is not None:
+                mesh = make_plane(size=(2e6, 2e6), height=0.0, center_zero=True)
+                self.meshes[mesh_prim_path] = convert_to_warp_mesh(mesh.vertices, mesh.faces, device=self.device)
+                continue
+
+            root = sim_utils.find_first_matching_prim(mesh_prim_path)
+            if root is None or not root.IsValid():
+                raise RuntimeError(f"Invalid mesh prim path: {mesh_prim_path}")
+
+            all_points = []
+            all_faces = []
+            vert_offset = 0
+            for prim in root.GetAllChildren():
+                stack = [prim]
+                while stack:
+                    curr = stack.pop()
+                    stack.extend(list(curr.GetChildren()))
+                    if curr.GetTypeName() != "Mesh":
+                        continue
+                    mesh = UsdGeom.Mesh(curr)
+                    pts_attr = mesh.GetPointsAttr().Get()
+                    idx_attr = mesh.GetFaceVertexIndicesAttr().Get()
+                    counts_attr = mesh.GetFaceVertexCountsAttr().Get()
+                    if pts_attr is None or idx_attr is None or counts_attr is None:
+                        continue
+                    pts = np.asarray(pts_attr, dtype=np.float32)
+                    if pts.size == 0:
+                        continue
+                    transform_matrix = np.array(omni.usd.get_world_transform_matrix(mesh)).T
+                    pts = np.matmul(pts, transform_matrix[:3, :3].T)
+                    pts += transform_matrix[:3, 3]
+                    idx = np.asarray(idx_attr, dtype=np.int32)
+                    counts = np.asarray(counts_attr, dtype=np.int32)
+                    cursor = 0
+                    tris = []
+                    for count in counts:
+                        poly = idx[cursor:cursor + count]
+                        cursor += count
+                        if count < 3:
+                            continue
+                        for j in range(1, count - 1):
+                            tris.append([poly[0], poly[j], poly[j + 1]])
+                    if not tris:
+                        continue
+                    all_points.append(pts)
+                    all_faces.append(np.asarray(tris, dtype=np.int32) + vert_offset)
+                    vert_offset += pts.shape[0]
+
+            if not all_points:
+                raise RuntimeError(f"No Mesh children found under raycast path: {mesh_prim_path}")
+            points = np.concatenate(all_points, axis=0).astype(np.float32)
+            faces = np.concatenate(all_faces, axis=0).astype(np.int32)
+            self.meshes[mesh_prim_path] = convert_to_warp_mesh(points, faces, device=self.device)
+            wp.synchronize()
+            print(
+                f"[realtree] RayCaster combined {len(all_points)} meshes under {mesh_prim_path}: "
+                f"vertices={points.shape[0]} faces={faces.shape[0]}"
+            )
 
     terrains.HfDiscreteObstaclesTerrainCfg = obstacle_cfg_wrapper
-    terrains.TerrainGeneratorCfg = generator_cfg_wrapper
+    terrains.TerrainImporter.__init__ = terrain_init_wrapper
+    ray_caster_mod.RayCaster._initialize_warp_meshes = ray_initialize_all_meshes
     try:
         yield
     finally:
         terrains.HfDiscreteObstaclesTerrainCfg = original_obstacle_cfg
-        terrains.TerrainGeneratorCfg = original_generator_cfg
+        terrains.TerrainImporter.__init__ = original_terrain_init
+        ray_caster_mod.RayCaster._initialize_warp_meshes = original_ray_init_meshes
 
 
 def _sample_first_env_lidar_points(base_env, max_points=800):
@@ -477,44 +837,25 @@ def _sample_first_env_lidar_points(base_env, max_points=800):
         return []
 
 
-def make_preview_obstacles(obstacles_per_tile, seed, rows=5, cols=5, tile_size=8.0, max_boxes=1200):
-    """Approximate the forest_lc heightfield obstacle layout for the web top-down preview."""
-    count = int(obstacles_per_tile)
-    if count <= 0:
-        return []
-    rng = np.random.default_rng(int(seed))
+def make_preview_obstacles(tree_spacing_m, seed, map_size=60.0, max_boxes=1200):
+    """Preview real-tree instance positions as small top-down canopy boxes."""
+    positions = tree_positions_jittered_grid(map_size=map_size, spacing=float(tree_spacing_m), seed=seed)
     boxes = []
-    x0 = -0.5 * rows * tile_size
-    y0 = -0.5 * cols * tile_size
-    platform_half = 0.75
-    for row in range(rows):
-        for col in range(cols):
-            tile_min_x = x0 + row * tile_size
-            tile_min_y = y0 + col * tile_size
-            tile_cx = tile_min_x + 0.5 * tile_size
-            tile_cy = tile_min_y + 0.5 * tile_size
-            for _ in range(count):
-                width = float(rng.choice(np.arange(0.4, 0.8, 0.4)))
-                height = float(rng.choice(np.arange(0.4, 0.8, 0.4)))
-                cx = float(rng.uniform(tile_min_x + width * 0.5, tile_min_x + tile_size - width * 0.5))
-                cy = float(rng.uniform(tile_min_y + height * 0.5, tile_min_y + tile_size - height * 0.5))
-                if abs(cx - tile_cx) < platform_half + width * 0.5 and abs(cy - tile_cy) < platform_half + height * 0.5:
-                    continue
-                boxes.append(
-                    {
-                        "x": round(cx, 3),
-                        "y": round(cy, 3),
-                        "width": round(width, 3),
-                        "height": round(height, 3),
-                    }
-                )
-                if len(boxes) >= max_boxes:
-                    return boxes
+    for px, py in positions[:max_boxes]:
+        boxes.append(
+            {
+                "x": round(float(px), 3),
+                "y": round(float(py), 3),
+                "width": 0.8,
+                "height": 0.8,
+            }
+        )
     return boxes
 
 
 def run_worker(args, hydra_overrides):
     sys.path.insert(0, str(ZK_DIR))
+    sys.path.insert(0, str(OMNIDRONES_DIR))
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
@@ -529,12 +870,19 @@ def run_worker(args, hydra_overrides):
 
     isaacsim_view = str(getattr(args, "view_mode", "web")).lower() == "isaacsim"
     overrides = [f"hydra.searchpath=[file://{OMNIDRONES_DIR / 'cfg'}]"]
+    if args.policy_task and not _has_override(hydra_overrides, "task"):
+        overrides.append(f"task={args.policy_task}")
     overrides += list(hydra_overrides)
     overrides += [
         f"seed={int(args.worker_seed)}",
         f"eval_num_envs={int(args.eval_num_envs)}",
         f"num_episodes={int(args.num_episodes)}",
         f"max_steps={int(args.max_steps)}",
+        f"++task.vlim={float(args.worker_speed)}",
+        f"++task.vlim_train_min={float(args.vlim_train_min)}",
+        f"++task.vlim_train_max={float(args.vlim_train_max)}",
+        f"++task.observe_vlim={'true' if bool(args.observe_vlim) else 'false'}",
+        f"++task.vlim_randomize={'true' if bool(args.vlim_randomize_eval) else 'false'}",
         "final_eval_rounds=1",
         f"headless={'false' if isaacsim_view else 'true'}",
         f"enable_viewport={'true' if isaacsim_view else 'false'}",
@@ -550,6 +898,7 @@ def run_worker(args, hydra_overrides):
     OmegaConf.set_struct(cfg, False)
 
     requested_visible = _resolve_requested_cuda_visible(cfg, hydra_overrides)
+
     visible_physical_gpu = _first_visible_cuda_device(requested_visible)
     sim_gpu_index = int(cfg.get("sim_gpu_index", 0))
     logical_cuda_gpu = 0 if requested_visible else sim_gpu_index
@@ -572,7 +921,7 @@ def run_worker(args, hydra_overrides):
         _select_first_env_value,
     )
 
-    cfg.task.obstacles_per_tile = int(args.worker_density)
+    cfg.task.obstacles_per_tile = 0
     if "env" in cfg:
         cfg.env.num_envs = int(args.eval_num_envs)
     if "task" in cfg and "env" in cfg.task:
@@ -582,6 +931,14 @@ def run_worker(args, hydra_overrides):
     cfg.sim.device = f"cuda:{logical_cuda_gpu}"
     cfg.sim.active_gpu = physical_vulkan_gpu
     cfg.sim.physics_gpu = logical_cuda_gpu
+    cfg.task.vlim = float(args.worker_speed)
+    cfg.task.vlim_train_min = float(args.vlim_train_min)
+    cfg.task.vlim_train_max = float(args.vlim_train_max)
+    cfg.task.observe_vlim = bool(args.observe_vlim)
+    cfg.task.vlim_randomize = bool(args.vlim_randomize_eval)
+    action_dim = int(cfg.task.get("velocity_action_dim", 4 if str(cfg.task.get("control_mode", "")).lower() == "velocity" else 4))
+    if str(cfg.task.get("control_mode", "rotor")).lower() == "velocity":
+        cfg.task.state_dim = 10 + action_dim + (1 if bool(cfg.task.get("observe_vlim", False)) else 0)
     cfg.headless = not isaacsim_view
     cfg.enable_viewport = isaacsim_view
     cfg.sim.enable_viewport = isaacsim_view
@@ -590,13 +947,21 @@ def run_worker(args, hydra_overrides):
     live_state_path = Path(args.live_state)
     result_path = Path(args.worker_result)
     trajectory = []
-    preview_obstacles = make_preview_obstacles(int(args.worker_density), int(args.worker_seed))
+    preview_obstacles = make_preview_obstacles(
+        float(args.worker_density),
+        int(args.worker_seed),
+        map_size=float(args.tree_map_size),
+    )
+    tree_count = len(preview_obstacles)
     start_time = time.time()
     write_json(
         live_state_path,
         {
             "phase": "starting",
             "obstacles_per_tile": int(args.worker_density),
+            "tree_spacing_m": float(args.worker_density),
+            "target_speed_mps": float(args.worker_speed),
+            "tree_count": int(tree_count),
             "trial": int(args.worker_trial),
             "trials": int(args.trials),
             "seed": int(args.worker_seed),
@@ -609,7 +974,7 @@ def run_worker(args, hydra_overrides):
     simulation_app = None
     try:
         simulation_app = init_simulation_app(cfg)
-        with patched_obstacle_density(int(args.worker_density), int(args.worker_seed), obstacle_height_mode=args.obstacle_height_mode):
+        with patched_realtree_forest(args):
             from omni_drones.envs.isaac_env import IsaacEnv
             import importlib
 
@@ -746,6 +1111,9 @@ def run_worker(args, hydra_overrides):
                                     {
                                         "phase": "running",
                                         "obstacles_per_tile": int(args.worker_density),
+                                        "tree_spacing_m": float(args.worker_density),
+                                        "target_speed_mps": float(args.worker_speed),
+                                        "tree_count": int(tree_count),
                                         "trial": trial_idx,
                                         "trials": int(args.trials),
                                         "seed": int(args.worker_seed),
@@ -802,6 +1170,9 @@ def run_worker(args, hydra_overrides):
             mean_completion = float(np.mean(episode_completion_pct)) if episode_completion_pct else 0.0
             return {
                 "obstacles_per_tile": int(args.worker_density),
+                "tree_spacing_m": float(args.worker_density),
+                "target_speed_mps": float(args.worker_speed),
+                "tree_count": int(tree_count),
                 "trial": trial_idx,
                 "seed": int(args.worker_seed),
                 "success_rate": success_count / max(1, episode_count),
@@ -829,6 +1200,9 @@ def run_worker(args, hydra_overrides):
             except Exception as exc:
                 row = {
                     "obstacles_per_tile": int(args.worker_density),
+                    "tree_spacing_m": float(args.worker_density),
+                    "target_speed_mps": float(args.worker_speed),
+                    "tree_count": int(tree_count),
                     "trial": trial_idx,
                     "seed": int(args.worker_seed),
                     "success_rate": 0.0,
@@ -849,9 +1223,9 @@ def run_worker(args, hydra_overrides):
                 write_json(live_state_path, {**row, "phase": "error", "obstacles": preview_obstacles})
                 print(f"[worker] trial {trial_idx} failed: {exc}")
 
-        # Write the last trial result to the main result_path for compatibility
-        if all_rows:
-            write_json(result_path, all_rows[-1])
+        # Each trial is written to its own worker_density_*_trial_N.json file above.
+        # Do not overwrite trial_1 with the last trial; the controller reads these
+        # per-trial files back after this worker exits.
         state = read_json(live_state_path, {})
         last_row = all_rows[-1] if all_rows else {}
         state.update({"phase": "done", "result": "success" if last_row.get("success_rate", 0) > 0 else "no_success",
@@ -863,6 +1237,9 @@ def run_worker(args, hydra_overrides):
     except Exception as exc:
         row = {
             "obstacles_per_tile": int(args.worker_density),
+            "tree_spacing_m": float(args.worker_density),
+            "target_speed_mps": float(args.worker_speed),
+            "tree_count": int(tree_count),
             "trial": int(args.worker_trial),
             "seed": int(args.worker_seed),
             "success_rate": 0.0,
@@ -891,7 +1268,8 @@ def controller(args, hydra_overrides):
     live_state = output_dir / "live_state.json"
     summary_path = output_dir / "density_sweep_summary.json"
     densities = make_int_range(args.obstacles_per_tile_min, args.obstacles_per_tile_max, args.obstacles_per_tile_step)
-    total_trials = len(densities) * int(args.trials)
+    speeds = make_speed_values(args)
+    total_trials = len(densities) * len(speeds) * int(args.trials)
     rows = []
     write_results(output_dir, rows)
     write_json(live_state, {"phase": "idle", "trajectory": [], "lidar_points": [], "obstacles": []})
@@ -900,25 +1278,34 @@ def controller(args, hydra_overrides):
     use_web_view = str(args.view_mode).lower() == "web"
     if use_web_view and not args.no_web:
         server = start_web_server(args.host, args.port, live_state, summary_path)
-        print(f"[density sweep] web: http://127.0.0.1:{args.port}")
+        print(f"[realtree sweep] web: http://127.0.0.1:{args.port}")
     elif str(args.view_mode).lower() == "isaacsim":
         if not os.environ.get("DISPLAY", "").strip():
-            print("[density sweep] warning: DISPLAY is not set; IsaacSim viewport mode needs a display server.")
-        print("[density sweep] view mode: IsaacSim viewport window")
+            print("[realtree sweep] warning: DISPLAY is not set; IsaacSim viewport mode needs a display server.")
+        print("[realtree sweep] view mode: IsaacSim viewport window")
 
     print(
-        f"[density sweep] plan: obstacles/tile={densities[0]}..{densities[-1]} "
-        f"step={args.obstacles_per_tile_step} trials={args.trials} total={total_trials} "
+        f"[realtree sweep] plan: tree_spacing={densities[0]}..{densities[-1]}m "
+        f"step={args.obstacles_per_tile_step}m speeds={speeds}m/s trials={args.trials} total={total_trials} "
         f"seed_mode=density base_seed={args.seed}"
     )
     if run_label:
-        print(f"[density sweep] run label: {run_label}")
-    print(f"[density sweep] output: {output_dir}")
+        print(f"[realtree sweep] run label: {run_label}")
+    print(f"[realtree sweep] tree obj: {Path(args.tree_ply).expanduser().resolve()}")
+    print(f"[realtree sweep] output: {output_dir}")
     if args.dry_run:
-        dry_obstacles = make_preview_obstacles(densities[0], int(args.seed)) if densities else []
+        dry_obstacles = make_preview_obstacles(densities[0], int(args.seed), map_size=float(args.tree_map_size)) if densities else []
         write_json(
             live_state,
-            {"phase": "dry_run", "densities": densities, "trajectory": [], "lidar_points": [], "obstacles": dry_obstacles},
+            {
+                "phase": "dry_run",
+                "tree_spacings_m": densities,
+                "target_speeds_mps": speeds,
+                "tree_count": len(dry_obstacles),
+                "trajectory": [],
+                "lidar_points": [],
+                "obstacles": dry_obstacles,
+            },
         )
         if server is not None:
             server.shutdown()
@@ -928,120 +1315,176 @@ def controller(args, hydra_overrides):
     try:
         for density_index, density in enumerate(densities):
             seed = int(args.seed) + density_index
-            # Launch ONE worker per density – it runs all trials internally without restarting IsaacLab
-            result_path = output_dir / f"worker_density_{density}_trial_1.json"
-            cmd = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--worker",
-                "--worker-density",
-                str(density),
-                "--worker-trial",
-                str(1),
-                "--worker-seed",
-                str(seed),
-                "--trials",
-                str(args.trials),
-                "--eval-num-envs",
-                str(args.eval_num_envs),
-                "--num-episodes",
-                str(args.num_episodes),
-                "--max-steps",
-                str(args.max_steps),
-                "--web-update-interval",
-                str(args.web_update_interval),
-                "--view-mode",
-                str(args.view_mode),
-                "--obstacle-height-mode",
-                args.obstacle_height_mode,
-                "--live-state",
-                str(live_state),
-                "--worker-result",
-                str(result_path),
-            ]
-            if args.checkpoint_path:
-                cmd += ["--checkpoint-path", args.checkpoint_path]
-            cmd += hydra_overrides
-            print(
-                f"[density sweep] density={density} ({density_index+1}/{len(densities)}) "
-                f"seed={seed} trials={args.trials}"
-            )
-            proc = subprocess.run(cmd, cwd=str(OMNIDRONES_DIR))
-
-            # Read back all trial results written by the worker
-            for trial in range(1, int(args.trials) + 1):
-                completed += 1
-                trial_result_path = output_dir / f"worker_density_{density}_trial_{trial}.json"
-                row = read_json(
-                    trial_result_path,
-                    {
-                        "obstacles_per_tile": density,
-                        "trial": trial,
-                        "seed": seed,
-                        "success_rate": 0.0,
-                        "success_count": 0,
-                        "episode_count": 0,
-                        "mean_return": 0.0,
-                        "mean_episode_len": 0.0,
-                        "mean_completion_pct": 0.0,
-                        "mean_arrival_time_s": float("nan"),
-                        "mean_path_length_m": float("nan"),
-                        "mean_speed_mps": float("nan"),
-                        "result": f"worker_exit_{proc.returncode}",
-                        "duration_s": 0.0,
-                    },
-                )
-                if proc.returncode != 0 and str(row.get("result", "ok")) == "ok":
-                    row["result"] = f"worker_exit_{proc.returncode}"
-                rows.append(row)
-                csv_path = write_results(output_dir, rows)
+            for speed_index, speed in enumerate(speeds):
+                speed_tag = _speed_tag(speed)
+                # Launch ONE worker per density/speed – it runs all trials internally without restarting IsaacLab
+                result_path = output_dir / f"worker_density_{density}_speed_{speed_tag}_trial_1.json"
+                cmd = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--worker",
+                    "--worker-density",
+                    str(density),
+                    "--worker-speed",
+                    str(speed),
+                    "--worker-trial",
+                    str(1),
+                    "--worker-seed",
+                    str(seed),
+                    "--trials",
+                    str(args.trials),
+                    "--eval-num-envs",
+                    str(args.eval_num_envs),
+                    "--num-episodes",
+                    str(args.num_episodes),
+                    "--max-steps",
+                    str(args.max_steps),
+                    "--web-update-interval",
+                    str(args.web_update_interval),
+                    "--view-mode",
+                    str(args.view_mode),
+                    "--obstacle-height-mode",
+                    args.obstacle_height_mode,
+                    "--tree-ply",
+                    str(args.tree_ply),
+                    "--tree-map-size",
+                    str(args.tree_map_size),
+                    "--tree-points-per-instance",
+                    str(args.tree_points_per_instance),
+                    "--tree-surfel-size",
+                    str(args.tree_surfel_size),
+                    "--tree-scale-min",
+                    str(args.tree_scale_min),
+                    "--tree-scale-max",
+                    str(args.tree_scale_max),
+                    "--tree-tilt-deg",
+                    str(args.tree_tilt_deg),
+                    "--tree-clear-radius",
+                    str(args.tree_clear_radius),
+                    "--vlim-train-min",
+                    str(args.vlim_train_min),
+                    "--vlim-train-max",
+                    str(args.vlim_train_max),
+                    "--policy-task",
+                    str(args.policy_task),
+                    "--live-state",
+                    str(live_state),
+                    "--worker-result",
+                    str(result_path),
+                ]
+                if not args.observe_vlim:
+                    cmd += ["--no-observe-vlim"]
+                if args.vlim_randomize_eval:
+                    cmd += ["--vlim-randomize-eval"]
+                if args.checkpoint_path:
+                    cmd += ["--checkpoint-path", args.checkpoint_path]
+                cmd += hydra_overrides
                 print(
-                    f"[density sweep] {completed}/{total_trials}: "
-                    f"density={density} trial={trial}/{args.trials} "
-                    f"success={float(row['success_rate']) * 100.0:.1f}% "
-                    f"arrival={_finite_float(row.get('mean_arrival_time_s')):.2f}s "
-                    f"path={_finite_float(row.get('mean_path_length_m')):.2f}m "
-                    f"speed={_finite_float(row.get('mean_speed_mps')):.2f}m/s "
-                    f"result={row['result']}"
+                    f"[realtree sweep] spacing={density}m ({density_index+1}/{len(densities)}) "
+                    f"speed={speed}m/s ({speed_index+1}/{len(speeds)}) seed={seed} trials={args.trials}"
                 )
-            if proc.returncode != 0 and bool(args.stop_on_error):
-                write_json(
-                    live_state,
-                    {
-                        "phase": "stopped_on_error",
-                        "obstacles_per_tile": density,
-                        "trial": 1,
-                        "trials": int(args.trials),
-                        "seed": seed,
-                        "result": f"worker_exit_{proc.returncode}",
-                        "trajectory": [],
-                        "lidar_points": [],
-                        "obstacles": make_preview_obstacles(density, seed),
-                    },
-                )
-                print("[density sweep] stopped because worker failed; use --keep-going to continue after errors")
-                return proc.returncode
+                proc = subprocess.run(cmd, cwd=str(OMNIDRONES_DIR))
+
+                # Read back all trial results written by the worker
+                for trial in range(1, int(args.trials) + 1):
+                    completed += 1
+                    trial_result_path = output_dir / f"worker_density_{density}_speed_{speed_tag}_trial_{trial}.json"
+                    row = read_json(
+                        trial_result_path,
+                        {
+                            "obstacles_per_tile": density,
+                            "tree_spacing_m": float(density),
+                            "target_speed_mps": float(speed),
+                            "tree_count": len(make_preview_obstacles(density, seed, map_size=float(args.tree_map_size))),
+                            "trial": trial,
+                            "seed": seed,
+                            "success_rate": 0.0,
+                            "success_count": 0,
+                            "episode_count": 0,
+                            "mean_return": 0.0,
+                            "mean_episode_len": 0.0,
+                            "mean_completion_pct": 0.0,
+                            "mean_arrival_time_s": float("nan"),
+                            "mean_path_length_m": float("nan"),
+                            "mean_speed_mps": float("nan"),
+                            "result": f"worker_exit_{proc.returncode}",
+                            "duration_s": 0.0,
+                        },
+                    )
+                    if proc.returncode != 0 and str(row.get("result", "ok")) == "ok":
+                        row["result"] = f"worker_exit_{proc.returncode}"
+                    rows.append(row)
+                    csv_path = write_results(output_dir, rows)
+                    print(
+                        f"[realtree sweep] {completed}/{total_trials}: "
+                        f"spacing={density}m speed={speed}m/s trial={trial}/{args.trials} "
+                        f"success={float(row['success_rate']) * 100.0:.1f}% "
+                        f"arrival={_finite_float(row.get('mean_arrival_time_s')):.2f}s "
+                        f"path={_finite_float(row.get('mean_path_length_m')):.2f}m "
+                        f"avg_speed={_finite_float(row.get('mean_speed_mps')):.2f}m/s "
+                        f"result={row['result']}"
+                    )
+                if proc.returncode != 0 and bool(args.stop_on_error):
+                    write_json(
+                        live_state,
+                        {
+                            "phase": "stopped_on_error",
+                            "obstacles_per_tile": density,
+                            "tree_spacing_m": float(density),
+                            "target_speed_mps": float(speed),
+                            "tree_count": len(make_preview_obstacles(density, seed, map_size=float(args.tree_map_size))),
+                            "trial": 1,
+                            "trials": int(args.trials),
+                            "seed": seed,
+                            "result": f"worker_exit_{proc.returncode}",
+                            "trajectory": [],
+                            "lidar_points": [],
+                            "obstacles": make_preview_obstacles(density, seed, map_size=float(args.tree_map_size)),
+                        },
+                    )
+                    print("[realtree sweep] stopped because worker failed; use --keep-going to continue after errors")
+                    return proc.returncode
     finally:
         if server is not None:
             server.shutdown()
-    print(f"[density sweep] done: {output_dir}")
+    print(f"[realtree sweep] done: {output_dir}")
     return 0
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="Evaluate an existing OmniDrones camera+LiDAR policy while sweeping only obstacle density.",
+        description="Evaluate an existing OmniDrones camera+LiDAR policy in a YOPO tree.ply real-tree forest.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--obstacles-per-tile-min", type=int, default=0)
-    parser.add_argument("--obstacles-per-tile-max", type=int, default=40)
-    parser.add_argument("--obstacles-per-tile-step", type=int, default=4)
+    parser.add_argument("--tree-spacing-min", "--obstacles-per-tile-min", dest="obstacles_per_tile_min", type=int, default=4,
+                        help="Compatibility name: minimum tree spacing in meters")
+    parser.add_argument("--tree-spacing-max", "--obstacles-per-tile-max", dest="obstacles_per_tile_max", type=int, default=4,
+                        help="Compatibility name: maximum tree spacing in meters")
+    parser.add_argument("--tree-spacing-step", "--obstacles-per-tile-step", dest="obstacles_per_tile_step", type=int, default=1,
+                        help="Compatibility name: tree spacing step in meters")
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-num-envs", type=int, default=10)
     parser.add_argument("--num-episodes", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=1500)
-    parser.add_argument("--checkpoint-path", default="")
+    parser.add_argument("--checkpoint-path", default=DEFAULT_VLIM_CHECKPOINT)
+    parser.add_argument(
+        "--policy-task",
+        default=DEFAULT_POLICY_TASK,
+        help="Hydra task config used by the checkpoint; latest vlim checkpoint uses forest_lc.",
+    )
+    parser.add_argument("--speed", type=float, default=3.0, help="Fixed eval vlim / target speed value in m/s")
+    parser.add_argument("--speed-min", type=float, default=None, help="Minimum eval vlim for a speed sweep")
+    parser.add_argument("--speed-max", type=float, default=None, help="Maximum eval vlim for a speed sweep")
+    parser.add_argument("--speed-step", type=float, default=1.0, help="Eval vlim sweep step")
+    parser.add_argument("--vlim-train-min", type=float, default=1.0,
+                        help="Training-time vlim min used to normalize observed vlim")
+    parser.add_argument("--vlim-train-max", type=float, default=9.0,
+                        help="Training-time vlim max used to normalize observed vlim")
+    parser.add_argument("--no-observe-vlim", dest="observe_vlim", action="store_false",
+                        help="Disable vlim in observation; keep enabled for latest vlim checkpoints")
+    parser.add_argument("--vlim-randomize-eval", action="store_true",
+                        help="Randomize vlim during evaluation resets instead of using --speed")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument(
         "--no-run-subdir",
@@ -1055,7 +1498,7 @@ def parse_args(argv):
         "--view-mode",
         choices=["web", "isaacsim"],
         default="web",
-        help="web keeps the browser top-down monitor; isaacsim opens the real IsaacSim viewport window",
+        help="web keeps the current browser monitor; isaacsim opens the real IsaacSim viewport window",
     )
     parser.add_argument("--no-web", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1063,14 +1506,25 @@ def parse_args(argv):
                         help="Continue the sweep after a worker error")
     parser.add_argument("--web-update-interval", type=int, default=10)
     parser.add_argument("--obstacle-height-mode", default="fixed", choices=["choice", "fixed"],
-                        help="Obstacle height mode: choice (pillars+holes) or fixed (all pillars)")
+                        help="Ignored in realtree mode; kept for CLI compatibility")
+    parser.add_argument("--tree-ply", default=str(DEFAULT_TREE_OBJ),
+                        help="Path to tree OBJ mesh file (default: YOPO tree_mesh.obj)")
+    parser.add_argument("--tree-map-size", type=float, default=60.0)
+    parser.add_argument("--tree-points-per-instance", type=int, default=320)
+    parser.add_argument("--tree-surfel-size", type=float, default=0.08)
+    parser.add_argument("--tree-scale-min", type=float, default=0.5)
+    parser.add_argument("--tree-scale-max", type=float, default=1.0)
+    parser.add_argument("--tree-tilt-deg", type=float, default=10.0)
+    parser.add_argument("--tree-clear-radius", type=float, default=2.0)
     parser.set_defaults(stop_on_error=True, run_subdir=True)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-density", type=int, default=40, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-speed", type=float, default=3.0, help=argparse.SUPPRESS)
     parser.add_argument("--worker-trial", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--worker-seed", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--live-state", default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-result", default="", help=argparse.SUPPRESS)
+    parser.set_defaults(observe_vlim=True)
     args, hydra_overrides = parser.parse_known_args(argv)
     return args, hydra_overrides
 
