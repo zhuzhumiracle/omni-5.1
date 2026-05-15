@@ -25,10 +25,10 @@ from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
 from omni_drones.robots.drone import MultirotorBase
 from omni_drones.sensors.camera_official import DepthSensorOfficial, DepthSensorOfficialCfg
 from omni_drones.sensors.config import PinholeCameraCfg
-from omni_drones.utils.torch import euler_to_quaternion, quat_rotate_inverse
+from omni_drones.utils.torch import euler_to_quaternion, quat_rotate, quat_rotate_inverse
 
 from tensordict.tensordict import TensorDict, TensorDictBase
-from torchrl.data import Unbounded, Composite
+from torchrl.data import Bounded, Unbounded, Composite
 
 try:
     from isaacsim.core.utils.viewports import set_camera_view
@@ -139,7 +139,40 @@ class forest_lc_gate(IsaacEnv):
         self.randomization = cfg.task.get("randomization", {})
         self.has_payload = "payload" in self.randomization.keys()
 
-        self.v_max = float(cfg.task.get("v_max", 3.0))
+        self.control_mode = str(cfg.task.get("control_mode", "rotor")).lower()
+        if self.control_mode not in {"rotor", "velocity"}:
+            raise ValueError(f"Unsupported control_mode={self.control_mode}. Expected 'rotor' or 'velocity'.")
+        self.velocity_action_dim = int(cfg.task.get("velocity_action_dim", 4))
+        if self.velocity_action_dim not in {3, 4}:
+            raise ValueError(
+                f"velocity_action_dim={self.velocity_action_dim} is not supported yet. "
+                "Use 3D [vx, vy, vz] or 4D [vx, vy, vz, yaw] normalized velocity actions."
+            )
+        self.velocity_frame = str(cfg.task.get("velocity_frame", "world")).lower()
+        if self.velocity_frame not in {"world", "body", "goal"}:
+            raise ValueError(
+                f"Unsupported velocity_frame={self.velocity_frame}. Expected 'world', 'body', or 'goal'."
+            )
+        self.target_yaw_mode = str(cfg.task.get("target_yaw_mode", "action")).lower()
+        if self.target_yaw_mode not in {"goal", "velocity", "current", "action"}:
+            raise ValueError(
+                f"Unsupported target_yaw_mode={self.target_yaw_mode}. "
+                "Expected 'goal', 'velocity', 'current', or 'action'."
+            )
+        if self.target_yaw_mode == "action" and self.velocity_action_dim < 4:
+            raise ValueError("target_yaw_mode=action requires velocity_action_dim=4.")
+        self.velocity_yaw_speed_threshold = float(cfg.task.get("velocity_yaw_speed_threshold", 0.2))
+
+        self.vlim = float(cfg.task.get("vlim", cfg.task.get("v_max", 3.0)))
+        self.vlim_randomize = bool(cfg.task.get("vlim_randomize", False))
+        self.vlim_train_min = float(cfg.task.get("vlim_train_min", self.vlim))
+        self.vlim_train_max = float(cfg.task.get("vlim_train_max", self.vlim))
+        if self.vlim_train_max < self.vlim_train_min:
+            raise ValueError(
+                f"vlim_train_max ({self.vlim_train_max}) must be >= vlim_train_min ({self.vlim_train_min})."
+            )
+        self.observe_vlim = bool(cfg.task.get("observe_vlim", False))
+        self.v_max = float(cfg.task.get("v_max", self.vlim))
         self.z_min = float(cfg.task.get("z_min", 0.5))
         self.z_max = float(cfg.task.get("z_max", 3.5))
         self.lambda_esdf = float(cfg.task.get("lambda_esdf", 1.0))
@@ -220,7 +253,10 @@ class forest_lc_gate(IsaacEnv):
         self.global_step = 0
 
         super().__init__(cfg, headless)
+        if self.controller is not None:
+            self.controller = self.controller.to(self.device)
 
+        self.vlim_episode = torch.full((self.num_envs, 1, 1), self.vlim, device=self.device)
         self.prev_pos = torch.zeros((self.num_envs, 1, 3), device=self.device)
         self.steps_since_reset = torch.zeros((self.num_envs, 1, 1), dtype=torch.int32, device=self.device)
         self.flip_counter = torch.zeros((self.num_envs, 1), dtype=torch.int32, device=self.device)
@@ -247,6 +283,8 @@ class forest_lc_gate(IsaacEnv):
 
         self.last_actions = torch.zeros(self.num_envs, 1, self.action_dim, device=self.device)
         self.current_actions = torch.zeros_like(self.last_actions)
+        self.last_target_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.current_target_vel = torch.zeros_like(self.last_target_vel)
 
         self.init_rpy_dist = D.Uniform(
             torch.tensor([-.2, -.2, 0.], device=self.device) * torch.pi,
@@ -258,6 +296,7 @@ class forest_lc_gate(IsaacEnv):
             self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             self.target_pos[:, 0, 1] = 24.
             self.target_pos[:, 0, 2] = 2.
+            self.start_pos = torch.zeros_like(self.target_pos)
 
         # pitch_bin_centers = torch.linspace(-90.0, 90.0, self.num_pitch_bins, device=self.device)
         # self.fov_mask = (pitch_bin_centers >= -7.0) & (pitch_bin_centers <= 52.0)
@@ -1008,14 +1047,21 @@ class forest_lc_gate(IsaacEnv):
 
     # --------------------------------------------------------------------- #
     def _set_specs(self):
-        self.action_dim = self.drone.action_spec.shape[-1]
+        self.motor_action_dim = self.drone.action_spec.shape[-1]
+        if self.control_mode == "velocity":
+            self.action_dim = self.velocity_action_dim
+            policy_action_spec = Bounded(-1, 1, self.action_dim, device=self.device)
+        else:
+            self.action_dim = self.motor_action_dim
+            policy_action_spec = self.drone.action_spec
         
 
         lidar_dim = self.downsampled_dim
+        state_dim = 10 + self.action_dim + (1 if self.observe_vlim else 0)
         if self.use_camera_risk_observation:
-            obs_dim = 14 + lidar_dim + self.camera_risk_dim  # 14 + 3200 + 13
+            obs_dim = state_dim + lidar_dim + self.camera_risk_dim
         else:
-            obs_dim = 14 + lidar_dim + self.depth_dim  # 14 + 3200 + depth_flat
+            obs_dim = state_dim + lidar_dim + self.depth_dim
 
         self.observation_spec = Composite({
             "agents": Composite({
@@ -1026,7 +1072,7 @@ class forest_lc_gate(IsaacEnv):
 
         self.action_spec = Composite({
             "agents": Composite({
-                "action": self.drone.action_spec.unsqueeze(0),
+                "action": policy_action_spec.unsqueeze(0),
             })
         }).expand(self.num_envs).to(self.device)
 
@@ -1099,6 +1145,15 @@ class forest_lc_gate(IsaacEnv):
         self.stats[env_ids] = 0.
         self.last_actions[env_ids] = 0.0
         self.current_actions[env_ids] = 0.0
+        self.last_target_vel[env_ids] = 0.0
+        self.current_target_vel[env_ids] = 0.0
+        if self.vlim_randomize and self.training:
+            self.vlim_episode[env_ids] = torch.empty(len(env_ids), 1, 1, device=self.device).uniform_(
+                self.vlim_train_min,
+                self.vlim_train_max,
+            )
+        else:
+            self.vlim_episode[env_ids] = self.vlim
         self.steps_since_reset[env_ids] = 0
         self.flip_counter[env_ids] = 0
         # self.hist_seen_mask[:, env_ids] = False
@@ -1114,6 +1169,7 @@ class forest_lc_gate(IsaacEnv):
         self.init_goal_dist[env_ids] = (
             (self.target_pos[env_ids] - pos).norm(dim=-1).clamp_min(1e-6)
         )
+        self.start_pos[env_ids] = pos
 
         # reset 缓存，避免用到旧 episode 数据
         self.encoded_lidar_cache[env_ids] = self.max_obs_dist
@@ -1124,9 +1180,90 @@ class forest_lc_gate(IsaacEnv):
         self.lidar_dirty = True
         self.depth_dirty = True
 
+    def _map_velocity_action_to_world(self, action_norm: torch.Tensor, root_state: torch.Tensor) -> torch.Tensor:
+        vel_action = action_norm[..., :3]
+        vel_norm = vel_action.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        vel_action = torch.where(vel_norm > 1.0, vel_action / vel_norm, vel_action)
+        target_vel_local = vel_action * self.vlim_episode
+        if self.velocity_frame == "world":
+            return target_vel_local
+        if self.velocity_frame == "body":
+            return quat_rotate(root_state[..., 3:7], target_vel_local)
+
+        goal_vec = self.target_pos - self.start_pos
+        goal_vec_xy = goal_vec.clone()
+        goal_vec_xy[..., 2] = 0.0
+        x_axis = goal_vec_xy / goal_vec_xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        z_axis = torch.zeros_like(x_axis)
+        z_axis[..., 2] = 1.0
+        y_axis = torch.cross(z_axis, x_axis, dim=-1)
+        y_axis = y_axis / y_axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return (
+            target_vel_local[..., 0:1] * x_axis
+            + target_vel_local[..., 1:2] * y_axis
+            + target_vel_local[..., 2:3] * z_axis
+        )
+
+    def _compute_target_yaw(
+        self,
+        root_state: torch.Tensor,
+        target_vel_world: torch.Tensor,
+        action_norm: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.target_yaw_mode == "action":
+            if action_norm is None or action_norm.shape[-1] < 4:
+                raise RuntimeError("target_yaw_mode=action requires a 4D normalized action.")
+            return action_norm[..., 3:4] * math.pi
+
+        goal_vec = self.target_pos - root_state[..., :3]
+        goal_yaw = torch.atan2(goal_vec[..., 1:2], goal_vec[..., 0:1])
+        if self.target_yaw_mode == "goal":
+            return goal_yaw
+
+        heading = self.drone.heading[..., :3]
+        current_yaw = torch.atan2(heading[..., 1:2], heading[..., 0:1])
+        if self.target_yaw_mode == "current":
+            return current_yaw
+
+        vel_yaw = torch.atan2(target_vel_world[..., 1:2], target_vel_world[..., 0:1])
+        vel_xy_norm = target_vel_world[..., :2].norm(dim=-1, keepdim=True)
+        return torch.where(vel_xy_norm > self.velocity_yaw_speed_threshold, vel_yaw, goal_yaw)
+
     # --------------------------------------------------------------------- #
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")]
+        if self.control_mode == "velocity":
+            if self.controller is None:
+                raise RuntimeError("control_mode=velocity requires a configured LeePositionController.")
+
+            action_norm = torch.tanh(actions)
+            action_norm = torch.clamp(action_norm, min=-1.0, max=1.0)
+            if torch.isnan(action_norm).any():
+                action_norm = torch.nan_to_num(action_norm, nan=0.0)
+
+            root_state = self.drone.get_state(env_frame=False)[..., :13]
+            target_vel_world = self._map_velocity_action_to_world(action_norm, root_state)
+            target_yaw = self._compute_target_yaw(root_state, target_vel_world, action_norm)
+            target_pos = root_state[..., :3]
+            target_acc = torch.zeros_like(target_vel_world)
+
+            rotor_cmds = self.controller.compute(
+                root_state,
+                target_pos=target_pos,
+                target_vel=target_vel_world,
+                target_acc=target_acc,
+                target_yaw=target_yaw,
+            )
+            rotor_cmds = torch.nan_to_num(rotor_cmds, nan=0.0, posinf=1.0, neginf=-1.0)
+            rotor_cmds = torch.clamp(rotor_cmds, min=-1.0, max=1.0)
+
+            self.last_actions.copy_(self.current_actions)
+            self.last_target_vel.copy_(self.current_target_vel)
+            self.effort = self.drone.apply_action(rotor_cmds)
+            self.current_actions = action_norm.clone()
+            self.current_target_vel = target_vel_world.clone()
+            return
+
         # 先用 tanh 平滑限幅，避免策略原始输出过大导致控制突变
         actions_exec = torch.tanh(actions)
         # ================= 🛡️ 核心防线 1：动作截断 =================
@@ -1141,9 +1278,11 @@ class forest_lc_gate(IsaacEnv):
         actions = actions_exec
         # 先保存上一时刻动作，再写当前动作
         self.last_actions.copy_(self.current_actions)
+        self.last_target_vel.copy_(self.current_target_vel)
 
         self.effort = self.drone.apply_action(actions)
         self.current_actions = actions.clone()
+        self.current_target_vel.zero_()
 
     # --------------------------------------------------------------------- #
     def _post_sim_step(self, tensordict: TensorDictBase):
@@ -1641,6 +1780,10 @@ class forest_lc_gate(IsaacEnv):
             attitude,         # [4]
             last_act          # [4]
         ], dim=-1)
+        if self.observe_vlim:
+            denom = max(self.vlim_train_max - self.vlim_train_min, 1e-6)
+            vlim_norm = ((self.vlim_episode - self.vlim_train_min) / denom).clamp(0.0, 1.0)
+            state = torch.cat([state, vlim_norm], dim=-1)
 
         lidar_flat = encoded_lidar.flatten(start_dim=2)
         if self.use_camera_risk_observation:
@@ -1772,14 +1915,20 @@ class forest_lc_gate(IsaacEnv):
         # action_diff = self.current_actions - self.last_actions
         # r_smoothness = torch.sum(torch.square(action_diff), dim=-1)
         omega = self.drone.vel_w[..., 3:]                  # [ωx, ωy, ωz]
-        action_diff = self.current_actions - self.last_actions
-        r_smoothness = omega.norm(dim=-1) + action_diff.norm(dim=-1)
+        if self.control_mode == "velocity":
+            speed_ref = self.vlim_episode.squeeze(-1).clamp_min(1e-6)
+            target_vel_diff = (self.current_target_vel - self.last_target_vel).norm(dim=-1) / speed_ref
+            r_smoothness = omega.norm(dim=-1) + target_vel_diff
+        else:
+            action_diff = self.current_actions - self.last_actions
+            r_smoothness = omega.norm(dim=-1) + action_diff.norm(dim=-1)
        
         # # r_max_speed = torch.exp(torch.relu(v_norm - self.v_max)) - 1.0
         # speed_excess = torch.relu(v_norm - self.v_max)
         # # r_max_speed = torch.exp(torch.clamp(speed_excess, max=5.0)) - 1.0
         # # 3. 修改超速惩罚：【绝对不要用 exp】！改用二次方(平方)，温柔且有效
-        speed_excess = torch.relu(v_norm - self.v_max)
+        speed_limit = self.vlim_episode.squeeze(-1).clamp_min(1e-6)
+        speed_excess = torch.relu(v_norm - speed_limit)
         r_max_speed = torch.square(speed_excess)
         # speed_excess = torch.relu(v_norm - self.v_max)
         # r_max_speed = 1.0 - torch.exp(speed_excess)

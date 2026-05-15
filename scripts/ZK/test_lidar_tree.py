@@ -2,8 +2,7 @@ import logging
 import os
 # 🌟 必须放在 import torch 和其他库的最前面！
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# 固定当前脚本只使用物理 0 号 GPU，避免继承到外部的多卡/错卡配置。
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import sys
 import time
 import importlib
 import math
@@ -36,529 +35,163 @@ from omni_drones.learning import ALGOS
 from setproctitle import setproctitle
 from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 
+from train_camlidar_trees import (
+    DEFAULT_TREE_OBJ,
+    _load_policy_checkpoint_compatible,
+    patched_realtree_forest,
+)
+
+
+# class DualStreamBackbone(torch.nn.Module):
+#     # 将默认的 output_dim 改为 128，严格对齐论文 Fusion 模块的最后一层
+#     def __init__(self, state_dim, lidar_dim=3200, output_dim=128):
+#         super().__init__()
+#         self.state_dim = state_dim
+#         self.lidar_dim = lidar_dim
+
+#         # ================= 1. 雷达特征降维编码器 (MLP Encoder) =================
+#         # 📝 论文设定：[128, 64, 64]
+#         # 🎯 物理意义：将 3200 维的庞大雷达点云，极致压缩提炼成 64 维的核心避障特征
+#         self.lidar_encoder = torch.nn.Sequential(
+#             torch.nn.Linear(lidar_dim, 128),
+#             torch.nn.ELU(),
+#             torch.nn.Linear(128, 64),
+#             torch.nn.ELU(),
+#             torch.nn.Linear(64, 64),  # 🌟 修复点：降维到 64，绝不反弹！
+#             torch.nn.ELU()
+#         )
+
+#         # ================= 2. 状态融合模块 (MLP Fusion) =================
+#         # 📝 论文设定：[128, 256, 256, 128]
+#         # 🎯 拼接维度：64 (雷达压缩特征) + 14 (精简的自身状态) = 78 维
+#         fusion_input_dim = 64 + state_dim 
+        
+#         self.fusion_mlp = torch.nn.Sequential(
+#             torch.nn.Linear(fusion_input_dim, 128),
+#             torch.nn.ELU(),
+#             torch.nn.Linear(128, 256),
+#             torch.nn.ELU(),
+#             torch.nn.Linear(256, 256),
+#             torch.nn.ELU(),
+#             torch.nn.Linear(256, output_dim), # 🌟 最终输出论文要求的 128 维特征
+#             torch.nn.ELU()
+#         )
+
+#     def forward(self, obs):
+#         # 按照拼接顺序切分输入
+#         state = obs[..., :self.state_dim]
+#         lidar = obs[..., self.state_dim:]
+
+#         # 提炼雷达特征并与自身状态融合
+#         lidar_features = self.lidar_encoder(lidar)
+#         fused_input = torch.cat([state, lidar_features], dim=-1)
+
+#         return self.fusion_mlp(fused_input)
+
+ #雷达没有被归一化修改一版
 class DualStreamBackbone(torch.nn.Module):
-    """
-    三输入 backbone：state + LiDAR-KU + camera risk。
-    LiDAR 是主导航模态，camera risk 通过空间 Gate 在像素级调制 LiDAR KU 图。
-    相机的 3 个前方扇区（左/中/右）各自独立计算 gate，只作用于对应空间区域。
-    FoV 外的 LiDAR 区域 gate=1，不受相机影响。
-    """
-
-    def __init__(
-        self,
-        state_dim,
-        lidar_dim=3200,
-        camera_risk_dim=13,
-        ku_value_max=20.0,
-        output_dim=128,
-        camera_h_fov_rad=None,
-    ):
+    def __init__(self, state_dim, lidar_dim=3200, output_dim=128):
         super().__init__()
-        if lidar_dim != 3200:
-            raise ValueError(f"This backbone expects lidar_dim=3200, got {lidar_dim}.")
-        if camera_risk_dim <= 0:
-            raise ValueError(f"camera_risk_dim must be positive, got {camera_risk_dim}.")
+        self.state_dim = state_dim
+        self.lidar_dim = lidar_dim
 
-        self.state_dim = int(state_dim)
-        self.lidar_dim = int(lidar_dim)
-        self.camera_risk_dim = int(camera_risk_dim)
-        self.ku_value_max = float(ku_value_max)
-        if self.ku_value_max <= 0.0:
-            raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
-        self.ku_unknown_value = self.ku_value_max
-
-        self.ku_h = 40
-        self.ku_w = 80
-
-        # 相机水平 FoV（从环境配置传入）
-        if camera_h_fov_rad is None:
-            # 默认：深度相机 ~96° 水平 FoV（160px / fx≈320px 的典型值）
-            camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
-        self.camera_h_fov_rad = float(camera_h_fov_rad)
-
-        # 预计算 3 前方扇区的列掩码
-        self._build_sector_column_masks()
-
-        # ================= 1. LiDAR-KU 编码分支 =================
-        self.ku_encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
-            torch.nn.GroupNorm(4, 16),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
-            torch.nn.GroupNorm(8, 32),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
-            torch.nn.GroupNorm(8, 64),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-        )
-        self.ku_global_head = torch.nn.Sequential(
-            torch.nn.AdaptiveAvgPool2d(1),
-            torch.nn.Flatten(),
-            torch.nn.Linear(64, 128),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-        )
-
-        # ================= 2. 自身状态编码 =================
-        self.state_encoder = torch.nn.Sequential(
-            torch.nn.Linear(self.state_dim, 64),
-            torch.nn.ELU(),
+        # ================= 1. 雷达特征降维编码器 =================
+        # 🌟 修复 1：把 ELU 换成 LeakyReLU。
+        # LeakyReLU 在负数区有一条微小的斜率(默认0.01)，绝不会产生 0 梯度，是防脑死的终极神器！
+        self.lidar_encoder = torch.nn.Sequential(
+            torch.nn.Linear(lidar_dim, 128),
+            torch.nn.LeakyReLU(0.1),
+            torch.nn.Linear(128, 64),
+            torch.nn.LeakyReLU(0.1),
             torch.nn.Linear(64, 64),
-            torch.nn.ELU(),
+            torch.nn.LeakyReLU(0.1)
         )
 
-        # ================= 3. 逐扇区空间 Gate 头 =================
-        # 3 个独立轻量门控头，每个将 4 维扇区风险映射为一个标量 gate ∈ [0,1]
-        self.gate_head_L = torch.nn.Sequential(
-            torch.nn.Linear(4, 1),
-            torch.nn.Sigmoid(),
-        )
-        self.gate_head_C = torch.nn.Sequential(
-            torch.nn.Linear(4, 1),
-            torch.nn.Sigmoid(),
-        )
-        self.gate_head_R = torch.nn.Sequential(
-            torch.nn.Linear(4, 1),
-            torch.nn.Sigmoid(),
-        )
-
-        # ================= 4. 最终融合 MLP =================
-        # state_z(64) + lidar_z(128) = 192
+        fusion_input_dim = 64 + state_dim 
+        
+        # ================= 2. 状态融合模块 =================
+        # 这里维持 ELU 没问题，因为融合层的输入已经是被压缩过的安全数据了
         self.fusion_mlp = torch.nn.Sequential(
-            torch.nn.Linear(64 + 128, 256),
+            torch.nn.Linear(fusion_input_dim, 128),
+            torch.nn.ELU(),
+            torch.nn.Linear(128, 256),
             torch.nn.ELU(),
             torch.nn.Linear(256, 256),
             torch.nn.ELU(),
             torch.nn.Linear(256, output_dim),
-            torch.nn.ELU(),
+            torch.nn.ELU()
         )
-
-    def _build_sector_column_masks(self):
-        """预计算 [40,80] LiDAR KU 网格中属于前方左/中/右扇区的列索引。"""
-        h_fov = self.camera_h_fov_rad
-
-        # 80 列覆盖 360°: [-π, π]，列中心方位角
-        col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
-        col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
-
-        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
-        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
-        self.register_buffer(
-            "_mask_C",
-            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
-            persistent=False,
-        )
-        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
-
-    def get_probe_params(self):
-        """Expose representative parameters for optimizer/gradient debug checks."""
-        return {
-            "ku_encoder": self.ku_encoder[0].weight,
-            "fusion": self.fusion_mlp[0].weight,
-        }
 
     def forward(self, obs):
-        # obs: [*, state_dim + lidar_ku(3200) + camera_risk(camera_risk_dim)]
+        # 按照拼接顺序切分输入
         state = obs[..., :self.state_dim]
-        x_ku_flat = obs[..., self.state_dim:self.state_dim + self.lidar_dim]
-        camera_risk_start = self.state_dim + self.lidar_dim
-        camera_risk_end = camera_risk_start + self.camera_risk_dim
-        camera_risk = obs[..., camera_risk_start:camera_risk_end]
+        lidar = obs[..., self.state_dim:]
 
-        batch_shape = state.shape[:-1]
-        b = int(math.prod(batch_shape)) if len(batch_shape) > 0 else 1
+        # ================= 🌟 修复 2：雷达点云“解毒”与归一化 =================
+        # 1. 干掉物理引擎传回来的 inf 和 nan（假设没有击中障碍物时返回最大距离）
+        lidar = torch.nan_to_num(lidar, posinf=20.0, neginf=0.0, nan=20.0) 
+        
+        # 2. 强行截断在合理物理范围内（假设你的雷达最远探测 20 米）
+        # 如果你的 OmniDrones 配置雷达最远看 50 米，就把这里的 20.0 改成 50.0
+        lidar = torch.clamp(lidar, min=0.0, max=20.0)
+        
+        # 3. 归一化到 [0, 1]！神经网络最喜欢的数据尺度！
+        lidar_normalized = lidar / 20.0 
+        # =================================================================
 
-        # ---------- LiDAR-KU 预处理 ----------
-        x_ku_raw = x_ku_flat.reshape(b, 1, self.ku_h, self.ku_w)
-        x_ku_raw = torch.nan_to_num(
-            x_ku_raw,
-            posinf=self.ku_unknown_value,
-            neginf=0.0,
-            nan=self.ku_unknown_value,
-        )
-        x_ku_raw = torch.clamp(x_ku_raw, 0.0, self.ku_unknown_value)
+        # 提炼雷达特征并与自身状态融合
+        lidar_features = self.lidar_encoder(lidar_normalized)
+        fused_input = torch.cat([state, lidar_features], dim=-1)
 
-        # ---------- 空间 Gate：相机风险逐扇区调制 LiDAR KU ----------
-        camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
-        camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-
-        # 取前 12 维 = 3 扇区 × 4 特征，环境输出顺序为 right / center / left。
-        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)  # [B, 3, 4]
-
-        gate_R = self.gate_head_R(sector_features[:, 0, :])  # [B, 1]
-        gate_C = self.gate_head_C(sector_features[:, 1, :])  # [B, 1]
-        gate_L = self.gate_head_L(sector_features[:, 2, :])  # [B, 1]
-
-        # 构建空间 gate 图：FoV 外 = 1.0（不调制），FoV 内各扇区用对应的 gate 值
-        spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
-        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
-
-        # LiDAR KU × 空间 gate（逐像素乘法）
-        x_ku_gated = x_ku_raw * spatial_gate
-
-        # ---------- LiDAR-KU 编码 ----------
-        lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
-        lidar_z = self.ku_global_head(lidar_feat)
-
-        # ---------- 自身状态编码 ----------
-        state_2d = state.reshape(b, self.state_dim)
-        state_z = self.state_encoder(state_2d)
-
-        # ---------- 最终融合 ----------
-        fused = torch.cat([state_z, lidar_z], dim=-1)
-        out = self.fusion_mlp(fused)
-        return out.reshape(*batch_shape, -1)
-
-
-def _normalize_np(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    norm = float(np.linalg.norm(vec))
-    if norm <= eps:
-        raise ValueError(f"Cannot normalize near-zero vector: {vec}")
-    return vec / norm
-
-
-def _expected_row_camera_rotation_from_view(
-    camera_pos: np.ndarray,
-    target_pos: np.ndarray,
-    up_axis: np.ndarray | None = None,
-) -> np.ndarray:
-    if up_axis is None:
-        up_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-
-    forward = _normalize_np(target_pos - camera_pos)
-    up_axis = _normalize_np(up_axis)
-
-    right = np.cross(forward, up_axis)
-    if np.linalg.norm(right) <= 1e-9:
-        fallback_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        right = np.cross(forward, fallback_up)
-        if np.linalg.norm(right) <= 1e-9:
-            raise ValueError(
-                "Depth camera forward axis is degenerate with both default and fallback up axes."
-            )
-    right = _normalize_np(right)
-    up = _normalize_np(np.cross(right, forward))
-    return np.stack([right, up, -forward], axis=0)
-
-
-def _rotation_error_deg(candidate: np.ndarray, reference: np.ndarray) -> float:
-    relative_rot = candidate.T @ reference
-    trace_val = float(np.trace(relative_rot))
-    cos_angle = max(-1.0, min(1.0, 0.5 * (trace_val - 1.0)))
-    return float(np.degrees(np.arccos(cos_angle)))
-
-
-def _select_camera_rotation_convention(
-    rot_raw: np.ndarray,
-    expected_row_rot: np.ndarray,
-) -> tuple[np.ndarray, str, float, float]:
-    row_err_deg = _rotation_error_deg(rot_raw, expected_row_rot)
-    col_err_deg = _rotation_error_deg(rot_raw.T, expected_row_rot)
-    if col_err_deg + 1e-9 < row_err_deg:
-        return rot_raw.T.copy(), "column-vector-transposed", row_err_deg, col_err_deg
-    return rot_raw.copy(), "row-vector", row_err_deg, col_err_deg
-
-
-def _read_depth_camera_geometry_from_stage(base_env):
-    try:
-        import omni.usd  # type: ignore
-        from pxr import Gf, UsdGeom
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to import Omniverse USD modules while reading depth camera geometry."
-        ) from exc
-
-    stage = omni.usd.get_context().get_stage()
-    if stage is None:
-        raise RuntimeError("USD stage is not available; cannot read depth camera geometry.")
-
-    depth_prim_path = f"/World/envs/env_0/{base_env.drone.name}_0/base_link/{base_env.depth_prim_name}"
-    base_prim_path = f"/World/envs/env_0/{base_env.drone.name}_0/base_link"
-    prim = stage.GetPrimAtPath(depth_prim_path)
-    base_prim = stage.GetPrimAtPath(base_prim_path)
-    if not prim or not prim.IsValid():
-        raise RuntimeError(f"Depth camera prim not found or invalid: {depth_prim_path}")
-    if not base_prim or not base_prim.IsValid():
-        raise RuntimeError(f"Base link prim not found or invalid: {base_prim_path}")
-
-    camera = UsdGeom.Camera(prim)
-    focal_length = camera.GetFocalLengthAttr().Get()
-    horizontal_aperture = camera.GetHorizontalApertureAttr().Get()
-    vertical_aperture = camera.GetVerticalApertureAttr().Get()
-    horizontal_aperture_offset = camera.GetHorizontalApertureOffsetAttr().Get()
-    vertical_aperture_offset = camera.GetVerticalApertureOffsetAttr().Get()
-    clipping_range = camera.GetClippingRangeAttr().Get()
-
-    if focal_length is None or horizontal_aperture is None:
-        raise RuntimeError(
-            f"Depth camera prim {depth_prim_path} is missing focalLength/horizontalAperture attributes: "
-            f"focal={focal_length}, horizontal_aperture={horizontal_aperture}"
-        )
-
-    if vertical_aperture is None:
-        vertical_aperture = float(horizontal_aperture) * float(base_env.depth_h) / float(max(1, base_env.depth_w))
-        logging.warning(
-            "Depth camera prim %s has no verticalAperture; inferred %.6f mm from aspect ratio.",
-            depth_prim_path,
-            float(vertical_aperture),
-        )
-    if horizontal_aperture_offset is None:
-        horizontal_aperture_offset = 0.0
-    if vertical_aperture_offset is None:
-        vertical_aperture_offset = 0.0
-
-    def _extract_pose_from_matrix(matrix_gf: "Gf.Matrix4d"):
-        translation = matrix_gf.ExtractTranslation()
-        quat = matrix_gf.ExtractRotationQuat()
-        rot = np.array(Gf.Matrix3d(quat), dtype=np.float64)
-        pos = np.array([translation[0], translation[1], translation[2]], dtype=np.float64)
-        return pos, rot
-
-    def _orthonormalize_rotation(rot: np.ndarray) -> np.ndarray:
-        u, _, vh = np.linalg.svd(rot)
-        rot_ortho = u @ vh
-        if np.linalg.det(rot_ortho) < 0.0:
-            u[:, -1] *= -1.0
-            rot_ortho = u @ vh
-        return rot_ortho
-
-    fallback_cam_in_base_gf = omni.usd.get_local_transform_matrix(prim)
-    if not isinstance(fallback_cam_in_base_gf, Gf.Matrix4d):
-        fallback_cam_in_base_gf = Gf.Matrix4d(fallback_cam_in_base_gf)
-    fallback_cam_pos_lidar_np, fallback_cam_rot_lidar_from_camera_np = _extract_pose_from_matrix(
-        fallback_cam_in_base_gf
-    )
-    fallback_cam_rot_lidar_from_camera_np = _orthonormalize_rotation(fallback_cam_rot_lidar_from_camera_np)
-
-    cam_pos_lidar_np = fallback_cam_pos_lidar_np
-    cam_rot_lidar_from_camera_np = fallback_cam_rot_lidar_from_camera_np
-    relative_transform_source = "omni.usd.get_local_transform_matrix"
-    transform_consistency_pos_err = 0.0
-    transform_consistency_rot_deg = 0.0
-    try:
-        from isaacsim.core.includes.pose import getRelativeTransform  # type: ignore
-
-        cam_in_base_gf = getRelativeTransform(
-            stage,
-            None,
-            prim.GetPath(),
-            base_prim.GetPath(),
-        )
-        if not isinstance(cam_in_base_gf, Gf.Matrix4d):
-            cam_in_base_gf = Gf.Matrix4d(cam_in_base_gf)
-        official_cam_pos_lidar_np, official_cam_rot_lidar_from_camera_np = _extract_pose_from_matrix(cam_in_base_gf)
-        official_cam_rot_lidar_from_camera_np = _orthonormalize_rotation(official_cam_rot_lidar_from_camera_np)
-        transform_consistency_pos_err = float(
-            np.linalg.norm(official_cam_pos_lidar_np - fallback_cam_pos_lidar_np)
-        )
-        relative_rot = official_cam_rot_lidar_from_camera_np.T @ fallback_cam_rot_lidar_from_camera_np
-        trace_val = float(np.trace(relative_rot))
-        cos_angle = max(-1.0, min(1.0, 0.5 * (trace_val - 1.0)))
-        transform_consistency_rot_deg = float(np.degrees(np.arccos(cos_angle)))
-        if transform_consistency_pos_err > 1e-5 or transform_consistency_rot_deg > 1e-3:
-            raise RuntimeError(
-                "Depth camera relative transform mismatch between getRelativeTransform and "
-                "omni.usd.get_local_transform_matrix fallback. "
-                f"prim={depth_prim_path}, pos_err={transform_consistency_pos_err:.6e} m, "
-                f"rot_err_deg={transform_consistency_rot_deg:.6e}. "
-                "This indicates an inconsistent transform interpretation and training is aborted to avoid "
-                "using incorrect camera extrinsics."
-            )
-        cam_pos_lidar_np = official_cam_pos_lidar_np
-        cam_rot_lidar_from_camera_np = official_cam_rot_lidar_from_camera_np
-        relative_transform_source = "isaacsim.core.includes.pose.getRelativeTransform"
-    except ImportError:
-        pass
-
-    fx_px = float(base_env.depth_w) * float(focal_length) / float(horizontal_aperture)
-    fy_px = float(base_env.depth_h) * float(focal_length) / float(vertical_aperture)
-    cx_px = 0.5 * float(base_env.depth_w) + float(horizontal_aperture_offset) * fx_px
-    cy_px = 0.5 * float(base_env.depth_h) + float(vertical_aperture_offset) * fy_px
-    intrinsic_matrix = [
-        [fx_px, 0.0, cx_px],
-        [0.0, fy_px, cy_px],
-        [0.0, 0.0, 1.0],
-    ]
-
-    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18])
-    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18])
-    expected_cam_pos = np.array(depth_cam_pos_cfg, dtype=np.float64)
-    cam_pos_error = float(np.linalg.norm(cam_pos_lidar_np.astype(np.float64) - expected_cam_pos))
-    if cam_pos_error > 1e-4:
-        logging.warning(
-            "Depth camera position differs from YAML config — using stage-derived position. "
-            f"prim={depth_prim_path}, position_error={cam_pos_error:.6e}, "
-            f"camera_pos_lidar={tuple(float(v) for v in cam_pos_lidar_np.tolist())}, "
-            f"expected_pos_lidar={tuple(float(v) for v in expected_cam_pos.tolist())}. "
-            "This suggests depth_camera_pos in the YAML is not applied when spawning cameras; "
-            "the actual stage geometry will be used."
-        )
-    expected_optical_axis = np.array(depth_cam_target_cfg, dtype=np.float64) - np.array(depth_cam_pos_cfg, dtype=np.float64)
-    expected_axis_norm = np.linalg.norm(expected_optical_axis)
-    if expected_axis_norm <= 1e-9:
-        raise RuntimeError(
-            f"Invalid depth camera config: target and position coincide for prim {depth_prim_path}."
-        )
-    expected_optical_axis = expected_optical_axis / expected_axis_norm
-    expected_rot_lidar_from_camera_np = _expected_row_camera_rotation_from_view(
-        np.array(depth_cam_pos_cfg, dtype=np.float64),
-        np.array(depth_cam_target_cfg, dtype=np.float64),
-    )
-    (
-        cam_rot_lidar_from_camera_np,
-        rotation_convention,
-        row_err_deg,
-        col_err_deg,
-    ) = _select_camera_rotation_convention(
-        cam_rot_lidar_from_camera_np.astype(np.float64),
-        expected_rot_lidar_from_camera_np,
-    )
-
-    optical_axis_camera = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-    optical_axis_row = optical_axis_camera @ cam_rot_lidar_from_camera_np
-    optical_axis_row = optical_axis_row / max(np.linalg.norm(optical_axis_row), 1e-12)
-    optical_axis_col = cam_rot_lidar_from_camera_np @ optical_axis_camera
-    optical_axis_col = optical_axis_col / max(np.linalg.norm(optical_axis_col), 1e-12)
-    row_axis_alignment = float(np.dot(optical_axis_row, expected_optical_axis))
-    col_axis_alignment = float(np.dot(optical_axis_col, expected_optical_axis))
-    optical_axis_lidar = optical_axis_row
-
-    cam_pos_lidar = torch.tensor(cam_pos_lidar_np, dtype=torch.float32)
-    cam_rot_lidar_from_camera = torch.tensor(cam_rot_lidar_from_camera_np, dtype=torch.float32)
-    axis_alignment = float(np.dot(optical_axis_lidar, expected_optical_axis))
-
-    if axis_alignment < 0.99:
-        logging.warning(
-            "Depth camera optical axis differs from YAML config — using stage-derived axis. "
-            f"prim={depth_prim_path}, alignment={axis_alignment:.6f}, "
-            f"row_alignment={row_axis_alignment:.6f}, column_alignment={col_axis_alignment:.6f}, "
-            f"row_err_deg={row_err_deg:.6f}, col_err_deg={col_err_deg:.6f}, "
-            f"rotation_convention={rotation_convention}, "
-            f"optical_axis_lidar={tuple(float(v) for v in optical_axis_lidar.tolist())}, "
-            f"expected_axis_lidar={tuple(float(v) for v in expected_optical_axis.tolist())}. "
-            "This may indicate depth_camera_target is not applied as expected, "
-            "or a camera-axis convention mismatch."
-        )
-
-    near_clip = None
-    far_clip = None
-    if clipping_range is not None and len(clipping_range) >= 2:
-        near_clip = float(clipping_range[0])
-        far_clip = float(clipping_range[1])
-
-    logging.info(
-        "Depth camera geometry from prim %s relative to %s via %s | pos=(%.6f, %.6f, %.6f)m "
-        "optical_axis_lidar=(%.6f, %.6f, %.6f) align=%.6f "
-        "row_align=%.6f column_align=%.6f rotation_convention=%s row_err_deg=%.6f col_err_deg=%.6f pos_err=%.6e "
-        "xform_consistency_pos_err=%.6e xform_consistency_rot_deg=%.6e "
-        "focal=%.6fmm, h_ap=%.6fmm, v_ap=%.6fmm, h_off=%.6f, v_off=%.6f, "
-        "fx=%.6fpx, fy=%.6fpx, cx=%.6fpx, cy=%.6fpx, clip=(%s, %s)",
-        depth_prim_path,
-        base_prim_path,
-        relative_transform_source,
-        float(cam_pos_lidar[0].item()),
-        float(cam_pos_lidar[1].item()),
-        float(cam_pos_lidar[2].item()),
-        float(optical_axis_lidar[0]),
-        float(optical_axis_lidar[1]),
-        float(optical_axis_lidar[2]),
-        axis_alignment,
-        row_axis_alignment,
-        col_axis_alignment,
-        rotation_convention,
-        row_err_deg,
-        col_err_deg,
-        cam_pos_error,
-        transform_consistency_pos_err,
-        transform_consistency_rot_deg,
-        float(focal_length),
-        float(horizontal_aperture),
-        float(vertical_aperture),
-        float(horizontal_aperture_offset),
-        float(vertical_aperture_offset),
-        fx_px,
-        fy_px,
-        cx_px,
-        cy_px,
-        "None" if near_clip is None else f"{near_clip:.6f}",
-        "None" if far_clip is None else f"{far_clip:.6f}",
-    )
-
-    return {
-        "prim_path": depth_prim_path,
-        "relative_transform_source": relative_transform_source,
-        "focal_length_mm": float(focal_length),
-        "horizontal_aperture_mm": float(horizontal_aperture),
-        "vertical_aperture_mm": float(vertical_aperture),
-        "horizontal_aperture_offset": float(horizontal_aperture_offset),
-        "vertical_aperture_offset": float(vertical_aperture_offset),
-        "intrinsic_matrix": intrinsic_matrix,
-        "position_lidar_m": tuple(float(v.item()) for v in cam_pos_lidar),
-        "rot_lidar_from_camera": cam_rot_lidar_from_camera.tolist(),
-        "optical_axis_lidar": tuple(float(v) for v in optical_axis_lidar.tolist()),
-        "rotation_convention": rotation_convention,
-        "row_axis_alignment": row_axis_alignment,
-        "column_axis_alignment": col_axis_alignment,
-        "near_clip": near_clip,
-        "far_clip": far_clip,
-    }
-
-
+        return self.fusion_mlp(fused_input)
 @hydra.main(version_base=None, config_path="", config_name="train")
 def main(cfg):
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
-    # 双保险：脚本内统一固定到 0 号卡。
-    cfg.sim.device = "cuda:0"
-    cfg.sim.active_gpu = 0
-    cfg.sim.physics_gpu = 0
+    if str(cfg.task.name) != "forest_singal":
+        logging.warning(
+            "test_lidar_tree.py is intended for forest_singal/forest_signal, got task=%s.",
+            cfg.task.name,
+        )
+
+    vlim_override = cfg.get("vlim", None)
+    if vlim_override is not None:
+        cfg.task.vlim = float(vlim_override)
+    cfg.task.vlim = float(cfg.task.get("vlim", cfg.task.get("v_max", 8.0)))
+    if bool(cfg.get("sync_vlim_to_v_max", True)):
+        cfg.task.v_max = float(cfg.task.vlim)
+    if bool(cfg.task.get("observe_vlim", False)) and not bool(cfg.task.get("vlim_randomize", False)):
+        cfg.task.vlim_train_min = float(cfg.task.vlim)
+        cfg.task.vlim_train_max = float(cfg.task.vlim)
+
+    tree_cfg = cfg.get("tree", {})
+    tree_obj_path = str(tree_cfg.get("obj_path", str(DEFAULT_TREE_OBJ)))
+    tree_map_size = float(tree_cfg.get("map_size", 60.0))
+    tree_spacing = float(tree_cfg.get("spacing", 6.0))
+    tree_scale_min = float(tree_cfg.get("scale_min", 0.35))
+    tree_scale_max = float(tree_cfg.get("scale_max", 0.55))
+    tree_tilt_deg = float(tree_cfg.get("tilt_deg", 5.0))
+    tree_clear_radius = float(tree_cfg.get("clear_radius", 6.0))
+    tree_seed = int(tree_cfg.get("seed", cfg.seed))
+    tree_max_faces_per_tree = int(tree_cfg.get("max_faces_per_tree", 20000))
+    tree_auto_upright = bool(tree_cfg.get("auto_upright", True))
 
     # 按规模自动控制渲染，避免大批量并行时触发 syntheticdata 崩溃（exit 139）
     num_envs = int(cfg.env.num_envs)
     user_viewport = bool(cfg.sim.get("enable_viewport", False))
     user_replicator = bool(cfg.sim.get("enable_replicator", True))
-    needs_depth_camera = bool(
-        cfg.task.get("use_depth_ku_observation", False)
-        or cfg.task.get("use_camera_risk_observation", False)
-    )
-    max_replicator_envs = int(cfg.get("max_camera_replicator_envs", 64))
-
-    # 无显示设备时强制 headless，避免 Vulkan swapchain / present 初始化失败导致崩溃。
-    display_env = os.environ.get("DISPLAY", "").strip()
-    has_display = len(display_env) > 0
-    force_headless_no_display = bool(cfg.get("force_headless_no_display", True))
-    if force_headless_no_display and (not has_display):
-        logging.warning(
-            "DISPLAY is not set; forcing headless mode and disabling viewport. "
-            "Replicator remains enabled when depth camera observations are requested."
-        )
-        cfg.headless = True
-        cfg.sim.enable_viewport = False
-        if "task" in cfg and cfg.task.get("show_depth_preview_window", False):
-            cfg.task.show_depth_preview_window = False
 
     # 仅在需要评估可视化且并行规模可控时开启
     allow_render = (not cfg.headless) and (num_envs <= 200)
-    allow_replicator = num_envs <= max_replicator_envs if needs_depth_camera else (
-        (cfg.get("eval_interval", -1) > 0) and (num_envs <= 200)
-    )
+    allow_replicator = (cfg.get("eval_interval", -1) > 0) and (num_envs <= 200)
 
-    # cfg.sim.enable_viewport = user_viewport or allow_render
-    cfg.sim.enable_viewport = (not cfg.headless) and (user_viewport or allow_render) and has_display
-
+    cfg.sim.enable_viewport = user_viewport or allow_render
     cfg.sim.enable_replicator = user_replicator and allow_replicator
-    if needs_depth_camera and not cfg.sim.enable_replicator:
-        raise RuntimeError(
-            "Camera/depth observations are enabled, but cfg.sim.enable_replicator is false. "
-            f"num_envs={num_envs}, max_camera_replicator_envs={max_replicator_envs}. "
-            "Lower env.num_envs or increase max_camera_replicator_envs after confirming GPU memory."
-        )
 
     # 安全阈值：高并行下强制关闭复制器与视口
-    if num_envs > 200 and not needs_depth_camera:
+    if num_envs > 200:
         cfg.sim.enable_viewport = False
         cfg.sim.enable_replicator = False
 
@@ -575,8 +208,20 @@ def main(cfg):
     except ModuleNotFoundError:
         pass
 
-    env_class = IsaacEnv.REGISTRY[cfg.task.name]
-    base_env = env_class(cfg, headless=cfg.headless)
+    with patched_realtree_forest(
+        tree_obj_path=tree_obj_path,
+        map_size=tree_map_size,
+        spacing=tree_spacing,
+        seed=tree_seed,
+        scale_min=tree_scale_min,
+        scale_max=tree_scale_max,
+        tilt_deg=tree_tilt_deg,
+        clear_radius=tree_clear_radius,
+        max_faces_per_tree=tree_max_faces_per_tree,
+        auto_upright=tree_auto_upright,
+    ):
+        env_class = IsaacEnv.REGISTRY[cfg.task.name]
+        base_env = env_class(cfg, headless=cfg.headless)
 
     transforms = [InitTracker()]
     #将任务观测中的雷达数据和状态数据进行拼接，并且可以选择性地将它们展平为一维向量，适配不同算法的输入需求。
@@ -622,102 +267,57 @@ def main(cfg):
     except KeyError:
         raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}")
 
-    def _load_policy_checkpoint_compatible(model, ckpt_path, map_location):
-        raw_state = torch.load(ckpt_path, map_location=map_location)
-        if isinstance(raw_state, dict) and "state_dict" in raw_state and isinstance(raw_state["state_dict"], dict):
-            raw_state = raw_state["state_dict"]
-        if not isinstance(raw_state, dict):
-            raise TypeError(f"Unsupported checkpoint format at {ckpt_path}: {type(raw_state)}")
-
-        model_state = model.state_dict()
-        filtered_state = {}
-        skipped_mismatch = []
-        skipped_missing = []
-
-        for key, value in raw_state.items():
-            if key not in model_state:
-                skipped_missing.append(key)
-                continue
-            if model_state[key].shape != value.shape:
-                skipped_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
-                continue
-            filtered_state[key] = value
-
-        load_info = model.load_state_dict(filtered_state, strict=False)
-        logging.info(
-            "Compatible checkpoint load: loaded=%d, missing_in_ckpt=%d, unexpected_in_ckpt=%d, shape_mismatch=%d",
-            len(filtered_state),
-            len(load_info.missing_keys),
-            len(skipped_missing),
-            len(skipped_mismatch),
-        )
-        if skipped_mismatch:
-            preview = ", ".join(
-                f"{k}: ckpt{src_shape}->model{dst_shape}" for k, src_shape, dst_shape in skipped_mismatch[:5]
-            )
-            logging.warning(f"Checkpoint shape mismatches (first 5): {preview}")
-        if skipped_missing:
-            logging.warning(f"Checkpoint unexpected keys skipped (first 5): {skipped_missing[:5]}")
-        if load_info.missing_keys:
-            logging.warning(f"Model keys not loaded from checkpoint (first 5): {load_info.missing_keys[:5]}")
-
-        return load_info
-
     # Keep optimizer hyper-parameters from PPO implementation before replacing modules.
     actor_lr = policy.actor_opt.param_groups[0]["lr"]
     critic_lr = policy.critic_opt.param_groups[0]["lr"]
 
-    obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
-    lidar_dim = 3200
-    ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-    state_dim = int(cfg.task.get("state_dim", 14))
-    if bool(cfg.task.get("observe_vlim", False)):
-        state_dim += 1
-    camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
-    if camera_risk_dim <= 0:
-        task_name_cfg = str(cfg.task.get("name", "<unknown>"))
-        raise ValueError(
-            f"Invalid camera_risk_dim={camera_risk_dim}. obs_dim={obs_dim}, state_dim={state_dim}, "
-            f"lidar_dim={lidar_dim}, task={task_name_cfg}. "
-            "This script expects observation=[state, lidar_ku(3200), camera_risk]. "
-            "Ensure use_camera_risk_observation=true and use_depth_ku_observation=false."
-        )
-    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
-        cfg.task.get("camera_risk_features_per_bin", 4)
-    )
-    if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
-        expected_camera_risk_dim += 1
-    if camera_risk_dim != expected_camera_risk_dim:
-        logging.warning(
-            "camera_risk_dim=%d derived from observation, expected %d from config. "
-            "Using derived dimension to match the environment.",
-            camera_risk_dim,
-            expected_camera_risk_dim,
-        )
-    expected_feature_dim = 128
-    camera_geom = _read_depth_camera_geometry_from_stage(base_env)
+    # # ================= 🚀 注入论文同款双流网络架构 =================
+    # obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
+    # state_dim = obs_dim - 3200
 
-    # 从深度相机内参计算水平 FoV
-    fx = camera_geom["intrinsic_matrix"][0][0]
-    depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
-    camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
+    # # 🌟 动态获取 OmniDrones 动作头期待的输入维度
+    # try:
+    #     expected_feature_dim = policy.critic.module[1].in_features
+    # except AttributeError:
+    #     expected_feature_dim = 128  # 默认回退值，假设论文 Fusion 模块输出 128 维特征
+
+    # # actor_backbone = DualStreamBackbone(state_dim=state_dim, lidar_dim=3200, output_dim=expected_feature_dim).to(base_env.device)
+    # # critic_backbone = DualStreamBackbone(state_dim=state_dim, lidar_dim=3200, output_dim=expected_feature_dim).to(base_env.device)
+
+    # # policy.actor.module[0] = actor_backbone
+    # # policy.critic.module[0] = critic_backbone
+    
+    # actor_backbone = DualStreamBackbone(
+    # state_dim=state_dim, lidar_dim=3200, output_dim=expected_feature_dim
+    # ).to(base_env.device)
+
+    # critic_backbone = DualStreamBackbone(
+    #     state_dim=state_dim, lidar_dim=3200, output_dim=expected_feature_dim
+    # ).to(base_env.device)
+
+    # # actor: ProbabilisticActor -> TensorDictModule -> nn.Sequential(...)
+    # policy.actor.module[0].module[0] = actor_backbone
+
+    # # critic: TensorDictModule -> nn.Sequential(...)
+    # policy.critic.module[0] = critic_backbone
+    # print("actor wrapper type:", type(policy.actor.module))
+    # print("actor core:", policy.actor.module.module)
+    # print("critic core:", policy.critic.module)
+    # print("actor backbone requires_grad:", actor_backbone.lidar_encoder[0].weight.requires_grad)
+    # print("critic backbone requires_grad:", critic_backbone.lidar_encoder[0].weight.requires_grad)
+    
+    # print(f"✅ 成功注入双流网络！状态维度: {state_dim}, 雷达维度: 3200, 融合输出维度已适配为: {expected_feature_dim}")
+    # # ===============================================================
+    obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
+    state_dim = obs_dim - 3200
+    expected_feature_dim = 128
 
     actor_backbone = DualStreamBackbone(
-        state_dim=state_dim,
-        lidar_dim=lidar_dim,
-        camera_risk_dim=camera_risk_dim,
-        ku_value_max=ku_value_max,
-        output_dim=expected_feature_dim,
-        camera_h_fov_rad=camera_h_fov_rad,
+        state_dim=state_dim, lidar_dim=3200, output_dim=expected_feature_dim
     ).to(base_env.device)
 
     critic_backbone = DualStreamBackbone(
-        state_dim=state_dim,
-        lidar_dim=lidar_dim,
-        camera_risk_dim=camera_risk_dim,
-        ku_value_max=ku_value_max,
-        output_dim=expected_feature_dim,
-        camera_h_fov_rad=camera_h_fov_rad,
+        state_dim=state_dim, lidar_dim=3200, output_dim=expected_feature_dim
     ).to(base_env.device)
 
     print("type(policy.actor) =", type(policy.actor))
@@ -779,29 +379,23 @@ def main(cfg):
 # ================= 🌟 修复 1：补充正交初始化 =================
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
+            # 使用极小的标准差，让初始特征极其平缓
+            # torch.nn.init.orthogonal_(m.weight, 0.01)
+            # torch.nn.init.constant_(m.bias, 0.0)
             torch.nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
-            if m.bias is not None:
-                torch.nn.init.constant_(m.bias, 0.0)
-        elif isinstance(m, torch.nn.Conv2d):
-            # Kaiming normal for LeakyReLU (negative_slope=0.1)
-            torch.nn.init.kaiming_normal_(m.weight, a=0.1, mode='fan_out', nonlinearity='leaky_relu')
-            if m.bias is not None:
-                torch.nn.init.constant_(m.bias, 0.0)
+            torch.nn.init.constant_(m.bias, 0.0)
 
     actor_backbone.apply(init_weights)
     critic_backbone.apply(init_weights)
+    # ==========================================================
+
 
     if hasattr(policy.actor.module, "module"):
         print("actor after replace:", policy.actor.module.module)
     elif hasattr(policy.actor.module, "__getitem__") and hasattr(policy.actor.module[0], "module"):
         print("actor after replace:", policy.actor.module[0].module)
     print("critic after replace:", policy.critic.module)
-    print(
-        f"✅ 成功注入空间感知 camera-risk gating 骨干网络！state_dim={state_dim}, "
-        f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}, "
-        f"camera_h_fov_rad={camera_h_fov_rad:.4f}, "
-        f"output_dim={expected_feature_dim}"
-    )
+    print(f"✅ 成功注入双流网络！state_dim={state_dim}, lidar_dim=3200, output_dim={expected_feature_dim}")
     # ================= 🌟 致命 Bug 修复 =================
     # 重新绑定优化器，让它们追踪全新的双流网络参数。
     policy.actor_opt = torch.optim.Adam(policy.actor.parameters(), lr=actor_lr)
@@ -815,10 +409,8 @@ def main(cfg):
                     return True
         return False
 
-    actor_probe = actor_backbone.get_probe_params()
-    critic_probe = critic_backbone.get_probe_params()
-    actor_param_bound = _optimizer_has_param(policy.actor_opt, actor_probe["ku_encoder"])
-    critic_param_bound = _optimizer_has_param(policy.critic_opt, critic_probe["ku_encoder"])
+    actor_param_bound = _optimizer_has_param(policy.actor_opt, actor_backbone.lidar_encoder[0].weight)
+    critic_param_bound = _optimizer_has_param(policy.critic_opt, critic_backbone.lidar_encoder[0].weight)
     print(
         f"[debug] optimizer bind check | actor_backbone={actor_param_bound}, critic_backbone={critic_param_bound}, "
         f"actor_lr={actor_lr:.2e}, critic_lr={critic_lr:.2e}"
@@ -911,7 +503,7 @@ def main(cfg):
         def _extract_env_obstacle_points(max_points: int = 20000):
             """Read terrain mesh points directly from USD stage as environment obstacle geometry."""
             try:
-                import omni.usd  # type: ignore
+                import omni.usd
                 from pxr import UsdGeom
             except Exception:
                 return None
@@ -1386,12 +978,12 @@ def main(cfg):
     #         # info.update(policy.train_op(data.to_tensordict()))
     #         # ===== 在 train_op 前后检查参数是否真的更新 =====
     #     with torch.no_grad():
-    #         w_before = actor_backbone.ku_encoder[0].weight.detach().clone()
+    #         w_before = actor_backbone.lidar_encoder[0].weight.detach().clone()
 
     #     train_info = policy.train_op(data.to_tensordict())
 
     #     with torch.no_grad():
-    #         w_after = actor_backbone.ku_encoder[0].weight.detach()
+    #         w_after = actor_backbone.lidar_encoder[0].weight.detach()
     #         delta = (w_after - w_before).abs().mean().item()
 
     #     info.update(train_info)
@@ -1470,37 +1062,33 @@ def main(cfg):
                         logging.warning(f"Policy {policy} does not implement `.state_dict()`")
 
         with torch.no_grad():
-            actor_probe = actor_backbone.get_probe_params()
-            critic_probe = critic_backbone.get_probe_params()
-            actor_ku_before = actor_probe["ku_encoder"].detach().clone()
-            actor_fusion_before = actor_probe["fusion"].detach().clone()
-            critic_ku_before = critic_probe["ku_encoder"].detach().clone()
-            critic_fusion_before = critic_probe["fusion"].detach().clone()
+            actor_lidar_before = actor_backbone.lidar_encoder[0].weight.detach().clone()
+            actor_fusion_before = actor_backbone.fusion_mlp[0].weight.detach().clone()
+            critic_lidar_before = critic_backbone.lidar_encoder[0].weight.detach().clone()
+            critic_fusion_before = critic_backbone.fusion_mlp[0].weight.detach().clone()
 
         train_info = policy.train_op(data.to_tensordict())
 
         with torch.no_grad():
-            actor_probe = actor_backbone.get_probe_params()
-            critic_probe = critic_backbone.get_probe_params()
-            actor_ku_after = actor_probe["ku_encoder"].detach()
-            actor_fusion_after = actor_probe["fusion"].detach()
-            critic_ku_after = critic_probe["ku_encoder"].detach()
-            critic_fusion_after = critic_probe["fusion"].detach()
+            actor_lidar_after = actor_backbone.lidar_encoder[0].weight.detach()
+            actor_fusion_after = actor_backbone.fusion_mlp[0].weight.detach()
+            critic_lidar_after = critic_backbone.lidar_encoder[0].weight.detach()
+            critic_fusion_after = critic_backbone.fusion_mlp[0].weight.detach()
 
-            actor_delta_ku = (actor_ku_after - actor_ku_before).abs().mean().item()
+            actor_delta_lidar = (actor_lidar_after - actor_lidar_before).abs().mean().item()
             actor_delta_fusion = (actor_fusion_after - actor_fusion_before).abs().mean().item()
-            critic_delta_ku = (critic_ku_after - critic_ku_before).abs().mean().item()
+            critic_delta_lidar = (critic_lidar_after - critic_lidar_before).abs().mean().item()
             critic_delta_fusion = (critic_fusion_after - critic_fusion_before).abs().mean().item()
 
-            actor_delta = max(actor_delta_ku, actor_delta_fusion)
-            critic_delta = max(critic_delta_ku, critic_delta_fusion)
+            actor_delta = max(actor_delta_lidar, actor_delta_fusion)
+            critic_delta = max(critic_delta_lidar, critic_delta_fusion)
 
         info.update(train_info)
         info["debug/actor_backbone_delta"] = actor_delta
         info["debug/critic_backbone_delta"] = critic_delta
-        info["debug/actor_delta_lidar"] = actor_delta_ku
+        info["debug/actor_delta_lidar"] = actor_delta_lidar
         info["debug/actor_delta_fusion"] = actor_delta_fusion
-        info["debug/critic_delta_lidar"] = critic_delta_ku
+        info["debug/critic_delta_lidar"] = critic_delta_lidar
         info["debug/critic_delta_fusion"] = critic_delta_fusion
 
         if i % 20 == 0:
@@ -1518,7 +1106,7 @@ def main(cfg):
             )
             print(
                 f"[debug] iter={i}, "
-                f"actor_delta={actor_delta:.8e} (ku={actor_delta_ku:.8e}, fusion={actor_delta_fusion:.8e}), "
+                f"actor_delta={actor_delta:.8e} (lidar={actor_delta_lidar:.8e}, fusion={actor_delta_fusion:.8e}), "
                 f"critic_delta={critic_delta:.8e}, clip_frac={clip_fraction:.3f}, "
                 f"approx_kl={approx_kl:.3e}, actor_grad_norm={actor_grad_norm:.3e}, "
                 f"success={current_success_rate * 100:.2f}%, "
@@ -1662,5 +1250,18 @@ def main(cfg):
     simulation_app.close()
 
 
+def _ensure_default_task_override() -> None:
+    has_task_override = any(
+        arg == "task"
+        or arg.startswith("task=")
+        or arg.startswith("+task=")
+        or arg.startswith("++task=")
+        for arg in sys.argv[1:]
+    )
+    if not has_task_override:
+        sys.argv.append("task=forest_signal")
+
+
 if __name__ == "__main__":
+    _ensure_default_task_override()
     main()

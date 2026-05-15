@@ -86,6 +86,14 @@ w_camera_risk: 0.01 #0.01
 
 action_transform: null
 
+# Policy action is [vx, vy, vz, yaw] in normalized coordinates. The velocity
+# vector is projected into the unit ball before multiplying by vlim.
+control_mode: velocity
+velocity_action_dim: 4
+velocity_frame: world
+target_yaw_mode: action
+velocity_yaw_speed_threshold: 0.2
+
 # 固定俯视相机参数（仅影响可视化）
 # 主视口跟随第 0 个无人机；关闭时才使用下面的固定俯视参数。
 follow_camera: true
@@ -117,6 +125,11 @@ milestone_mid_reward: 1000 #1000
 milestone_reward_percents: [50, 40, 30, 30, 20, 20, 20, 20, 20] #5个20
 
 v_max: 8 #最新的报告好像显示最快的是8m/s，说是这个无人机的最高速度是15m/s，暂时设置成15，后续可以调整
+vlim: 8.0
+vlim_randomize: true
+vlim_train_min: 1.0
+vlim_train_max: 9.0
+observe_vlim: true
 z_min: 0.4
 z_max: 3.8
 lambda_esdf: 0.5 

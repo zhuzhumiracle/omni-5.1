@@ -26,7 +26,7 @@ vulkan_gpu_id: 1    # Vulkan render GPU (must have a display for headless=false)
 # ── YOPO tree mesh obstacle config (used by train_camlidar_trees.py) ──
 tree:
   obj_path: /home/descfly/visualandlidar/base/omni-5.1/YOPO/Simulator/src/pointcloud/tree_mesh.obj
-  map_size: 60.0
+  map_size: 40.0
   spacing: 4.0     # tree spacing in meters
   scale_min: 0.4   # minimum tree scale
   scale_max: 0.8   # maximum tree scale

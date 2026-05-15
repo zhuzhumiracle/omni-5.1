@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training script for Cam+LiDAR policy using YOPO tree_mesh.obj as obstacles.
+Training script for camera-gated Cam+LiDAR policy using YOPO tree_mesh.obj as obstacles.
 
 Key fixes compared with the previous version:
   1) Do not import omni_drones learning/torchrl utility modules before SimulationApp starts.
@@ -21,6 +21,7 @@ import contextlib
 import logging
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -410,23 +411,199 @@ def patched_realtree_forest(
 
 
 # ============================================================
-# DualStreamBackbone
+# Camera geometry + spatial-gate DualStreamBackbone
 # ============================================================
+def _normalize_np(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm <= eps:
+        raise ValueError(f"Cannot normalize near-zero vector: {vec}")
+    return vec / norm
+
+
+def _expected_row_camera_rotation_from_view(
+    camera_pos: np.ndarray,
+    target_pos: np.ndarray,
+    up_axis: np.ndarray | None = None,
+) -> np.ndarray:
+    if up_axis is None:
+        up_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    forward = _normalize_np(target_pos - camera_pos)
+    up_axis = _normalize_np(up_axis)
+    right = np.cross(forward, up_axis)
+    if np.linalg.norm(right) <= 1e-9:
+        fallback_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        right = np.cross(forward, fallback_up)
+        if np.linalg.norm(right) <= 1e-9:
+            raise ValueError("Depth camera forward axis is degenerate.")
+    right = _normalize_np(right)
+    up = _normalize_np(np.cross(right, forward))
+    return np.stack([right, up, -forward], axis=0)
+
+
+def _rotation_error_deg(candidate: np.ndarray, reference: np.ndarray) -> float:
+    relative_rot = candidate.T @ reference
+    trace_val = float(np.trace(relative_rot))
+    cos_angle = max(-1.0, min(1.0, 0.5 * (trace_val - 1.0)))
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _select_camera_rotation_convention(
+    rot_raw: np.ndarray,
+    expected_row_rot: np.ndarray,
+) -> tuple[np.ndarray, str, float, float]:
+    row_err_deg = _rotation_error_deg(rot_raw, expected_row_rot)
+    col_err_deg = _rotation_error_deg(rot_raw.T, expected_row_rot)
+    if col_err_deg + 1e-9 < row_err_deg:
+        return rot_raw.T.copy(), "column-vector-transposed", row_err_deg, col_err_deg
+    return rot_raw.copy(), "row-vector", row_err_deg, col_err_deg
+
+
+def _read_depth_camera_geometry_from_stage(base_env):
+    try:
+        import omni.usd  # type: ignore
+        from pxr import Gf, UsdGeom
+    except Exception as exc:
+        raise RuntimeError("Failed to import Omniverse USD modules for camera geometry.") from exc
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available; cannot read depth camera geometry.")
+
+    depth_prim_path = f"/World/envs/env_0/{base_env.drone.name}_0/base_link/{base_env.depth_prim_name}"
+    base_prim_path = f"/World/envs/env_0/{base_env.drone.name}_0/base_link"
+    prim = stage.GetPrimAtPath(depth_prim_path)
+    base_prim = stage.GetPrimAtPath(base_prim_path)
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"Depth camera prim not found or invalid: {depth_prim_path}")
+    if not base_prim or not base_prim.IsValid():
+        raise RuntimeError(f"Base link prim not found or invalid: {base_prim_path}")
+
+    camera = UsdGeom.Camera(prim)
+    focal_length = camera.GetFocalLengthAttr().Get()
+    horizontal_aperture = camera.GetHorizontalApertureAttr().Get()
+    vertical_aperture = camera.GetVerticalApertureAttr().Get()
+    horizontal_aperture_offset = camera.GetHorizontalApertureOffsetAttr().Get() or 0.0
+    vertical_aperture_offset = camera.GetVerticalApertureOffsetAttr().Get() or 0.0
+    clipping_range = camera.GetClippingRangeAttr().Get()
+    if focal_length is None or horizontal_aperture is None:
+        raise RuntimeError(f"Depth camera {depth_prim_path} is missing focal/aperture attributes.")
+    if vertical_aperture is None:
+        vertical_aperture = float(horizontal_aperture) * float(base_env.depth_h) / float(max(1, base_env.depth_w))
+
+    def _extract_pose_from_matrix(matrix_gf: "Gf.Matrix4d"):
+        translation = matrix_gf.ExtractTranslation()
+        quat = matrix_gf.ExtractRotationQuat()
+        rot = np.array(Gf.Matrix3d(quat), dtype=np.float64)
+        pos = np.array([translation[0], translation[1], translation[2]], dtype=np.float64)
+        return pos, rot
+
+    def _orthonormalize_rotation(rot: np.ndarray) -> np.ndarray:
+        u, _, vh = np.linalg.svd(rot)
+        rot_ortho = u @ vh
+        if np.linalg.det(rot_ortho) < 0.0:
+            u[:, -1] *= -1.0
+            rot_ortho = u @ vh
+        return rot_ortho
+
+    cam_in_base_gf = omni.usd.get_local_transform_matrix(prim)
+    if not isinstance(cam_in_base_gf, Gf.Matrix4d):
+        cam_in_base_gf = Gf.Matrix4d(cam_in_base_gf)
+    cam_pos_np, cam_rot_np = _extract_pose_from_matrix(cam_in_base_gf)
+    cam_rot_np = _orthonormalize_rotation(cam_rot_np)
+    relative_transform_source = "omni.usd.get_local_transform_matrix"
+
+    try:
+        from isaacsim.core.includes.pose import getRelativeTransform  # type: ignore
+
+        official = getRelativeTransform(stage, None, prim.GetPath(), base_prim.GetPath())
+        if not isinstance(official, Gf.Matrix4d):
+            official = Gf.Matrix4d(official)
+        official_pos, official_rot = _extract_pose_from_matrix(official)
+        official_rot = _orthonormalize_rotation(official_rot)
+        pos_err = float(np.linalg.norm(official_pos - cam_pos_np))
+        rot_err = _rotation_error_deg(official_rot, cam_rot_np)
+        if pos_err <= 1e-5 and rot_err <= 1e-3:
+            cam_pos_np = official_pos
+            cam_rot_np = official_rot
+            relative_transform_source = "isaacsim.core.includes.pose.getRelativeTransform"
+        else:
+            logging.warning(
+                "Depth camera relative transform mismatch; using local transform fallback. "
+                "pos_err=%.6e rot_err_deg=%.6e",
+                pos_err,
+                rot_err,
+            )
+    except ImportError:
+        pass
+
+    fx_px = float(base_env.depth_w) * float(focal_length) / float(horizontal_aperture)
+    fy_px = float(base_env.depth_h) * float(focal_length) / float(vertical_aperture)
+    cx_px = 0.5 * float(base_env.depth_w) + float(horizontal_aperture_offset) * fx_px
+    cy_px = 0.5 * float(base_env.depth_h) + float(vertical_aperture_offset) * fy_px
+    intrinsic_matrix = [
+        [fx_px, 0.0, cx_px],
+        [0.0, fy_px, cy_px],
+        [0.0, 0.0, 1.0],
+    ]
+
+    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.12, 0.0, 0.03])
+    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.03])
+    expected_rot = _expected_row_camera_rotation_from_view(
+        np.array(depth_cam_pos_cfg, dtype=np.float64),
+        np.array(depth_cam_target_cfg, dtype=np.float64),
+    )
+    cam_rot_np, rotation_convention, row_err_deg, col_err_deg = _select_camera_rotation_convention(
+        cam_rot_np.astype(np.float64),
+        expected_rot,
+    )
+
+    optical_axis_camera = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    optical_axis_lidar = optical_axis_camera @ cam_rot_np
+    optical_axis_lidar = optical_axis_lidar / max(np.linalg.norm(optical_axis_lidar), 1e-12)
+
+    logging.info(
+        "Depth camera geometry %s via %s | fx=%.3f fy=%.3f fov_x=%.3f deg convention=%s row_err=%.3f col_err=%.3f axis=%s",
+        depth_prim_path,
+        relative_transform_source,
+        fx_px,
+        fy_px,
+        math.degrees(2.0 * math.atan(float(base_env.depth_w) / (2.0 * fx_px))),
+        rotation_convention,
+        row_err_deg,
+        col_err_deg,
+        tuple(float(v) for v in optical_axis_lidar.tolist()),
+    )
+
+    near_clip = None
+    far_clip = None
+    if clipping_range is not None and len(clipping_range) >= 2:
+        near_clip = float(clipping_range[0])
+        far_clip = float(clipping_range[1])
+
+    return {
+        "prim_path": depth_prim_path,
+        "relative_transform_source": relative_transform_source,
+        "intrinsic_matrix": intrinsic_matrix,
+        "near_clip": near_clip,
+        "far_clip": far_clip,
+    }
+
+
 class DualStreamBackbone(torch.nn.Module):
     """
-    三输入 backbone: state + LiDAR-KU + camera risk.
-    LiDAR 仍是主导航模态，camera risk 只通过轻量 gate 调制 LiDAR 特征。
+    三输入 backbone：state + LiDAR-KU + camera risk。
+    相机的 3 个前方扇区独立计算 gate，并在像素级调制对应 LiDAR KU 列。
     """
 
     def __init__(
         self,
         state_dim,
         lidar_dim=3200,
-        camera_risk_dim=21,
+        camera_risk_dim=13,
         ku_value_max=20.0,
         output_dim=128,
-        camera_risk_gate_alpha=0.2,
-        camera_risk_fusion_mode="gate",
+        camera_h_fov_rad=None,
     ):
         super().__init__()
         if lidar_dim != 3200:
@@ -437,13 +614,17 @@ class DualStreamBackbone(torch.nn.Module):
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.camera_risk_dim = int(camera_risk_dim)
-        self.camera_risk_gate_alpha = float(camera_risk_gate_alpha)
-        self.camera_risk_fusion_mode = str(camera_risk_fusion_mode).lower()
-
         self.ku_value_max = float(ku_value_max)
+        if self.ku_value_max <= 0.0:
+            raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
         self.ku_unknown_value = self.ku_value_max
+
         self.ku_h = 40
         self.ku_w = 80
+        if camera_h_fov_rad is None:
+            camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
+        self.camera_h_fov_rad = float(camera_h_fov_rad)
+        self._build_sector_column_masks()
 
         self.ku_encoder = torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
@@ -469,21 +650,12 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.Linear(64, 64),
             torch.nn.ELU(),
         )
-        self.camera_risk_encoder = torch.nn.Sequential(
-            torch.nn.Linear(self.camera_risk_dim, 32),
-            torch.nn.ELU(),
-            torch.nn.Linear(32, 64),
-            torch.nn.ELU(),
-        )
-        self.camera_gate = torch.nn.Sequential(
-            torch.nn.Linear(128 + 64, 128),
-            torch.nn.ELU(),
-            torch.nn.Linear(128, 128),
-            torch.nn.Sigmoid(),
-        )
+        self.gate_head_L = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
+        self.gate_head_C = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
+        self.gate_head_R = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
 
         self.fusion_mlp = torch.nn.Sequential(
-            torch.nn.Linear(64 + 128 + 64, 256),
+            torch.nn.Linear(64 + 128, 256),
             torch.nn.ELU(),
             torch.nn.Linear(256, 256),
             torch.nn.ELU(),
@@ -491,10 +663,22 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.ELU(),
         )
 
+    def _build_sector_column_masks(self):
+        h_fov = self.camera_h_fov_rad
+        col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
+        col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
+        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
+        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
+        self.register_buffer(
+            "_mask_C",
+            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
+            persistent=False,
+        )
+        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
+
     def get_probe_params(self):
         return {
             "ku_encoder": self.ku_encoder[0].weight,
-            "camera_risk": self.camera_risk_encoder[0].weight,
             "fusion": self.fusion_mlp[0].weight,
         }
 
@@ -509,22 +693,35 @@ class DualStreamBackbone(torch.nn.Module):
         b = int(math.prod(batch_shape)) if len(batch_shape) > 0 else 1
 
         x_ku_raw = x_ku_flat.reshape(b, 1, self.ku_h, self.ku_w)
-        x_ku_raw = torch.nan_to_num(x_ku_raw, posinf=self.ku_unknown_value, neginf=0.0, nan=self.ku_unknown_value)
+        x_ku_raw = torch.nan_to_num(
+            x_ku_raw,
+            posinf=self.ku_unknown_value,
+            neginf=0.0,
+            nan=self.ku_unknown_value,
+        )
         x_ku_raw = torch.clamp(x_ku_raw, 0.0, self.ku_unknown_value)
-        lidar_feat = self.ku_encoder(x_ku_raw / self.ku_value_max)
+
+        camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
+        camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)
+
+        gate_R = self.gate_head_R(sector_features[:, 0, :])
+        gate_C = self.gate_head_C(sector_features[:, 1, :])
+        gate_L = self.gate_head_L(sector_features[:, 2, :])
+
+        spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
+        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
+        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
+        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
+
+        x_ku_gated = x_ku_raw * spatial_gate
+        lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
 
         state_2d = state.reshape(b, self.state_dim)
-        camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
-        camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         state_z = self.state_encoder(state_2d)
-        camera_z = self.camera_risk_encoder(camera_risk_2d)
 
-        if self.camera_risk_fusion_mode == "gate":
-            gate = self.camera_gate(torch.cat([lidar_z, camera_z], dim=-1))
-            lidar_z = lidar_z * (1.0 - self.camera_risk_gate_alpha * gate)
-
-        fused = torch.cat([state_z, lidar_z, camera_z], dim=-1)
+        fused = torch.cat([state_z, lidar_z], dim=-1)
         out = self.fusion_mlp(fused)
         return out.reshape(*batch_shape, -1)
 
@@ -754,6 +951,22 @@ def main(cfg):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
+    if str(cfg.task.name) != "forest_lc_gate":
+        logging.warning(
+            "train_canlidargate_trees.py is intended for task=forest_lc_gate, got task=%s.",
+            cfg.task.name,
+        )
+
+    vlim_override = cfg.get("vlim", None)
+    if vlim_override is not None:
+        cfg.task.vlim = float(vlim_override)
+    cfg.task.vlim = float(cfg.task.get("vlim", cfg.task.get("v_max", 8.0)))
+    if bool(cfg.get("sync_vlim_to_v_max", True)):
+        cfg.task.v_max = float(cfg.task.vlim)
+    if bool(cfg.task.get("observe_vlim", False)) and not bool(cfg.task.get("vlim_randomize", False)):
+        cfg.task.vlim_train_min = float(cfg.task.vlim)
+        cfg.task.vlim_train_max = float(cfg.task.vlim)
+
     # GPU config: do not use CUDA_VISIBLE_DEVICES. Use cfg keys.
     gpu_id = int(cfg.get("gpu_id", cfg.get("sim_gpu_index", 0)))
     vulkan_gpu_id = int(cfg.get("vulkan_gpu_id", cfg.get("active_gpu", 1)))
@@ -879,12 +1092,14 @@ def main(cfg):
         obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
         lidar_dim = 3200
         ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
+        state_dim = int(cfg.task.get("state_dim", 14))
+        if bool(cfg.task.get("observe_vlim", False)):
+            state_dim += 1
         expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
             cfg.task.get("camera_risk_features_per_bin", 4)
         )
         if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
             expected_camera_risk_dim += 1
-        state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
         camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
 
         if state_dim <= 0 or camera_risk_dim <= 0:
@@ -892,22 +1107,29 @@ def main(cfg):
                 f"Invalid observation split: obs_dim={obs_dim}, state_dim={state_dim}, "
                 f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}"
             )
+        if camera_risk_dim != expected_camera_risk_dim:
+            logging.warning(
+                "camera_risk_dim=%d derived from observation, expected %d from config. "
+                "Using derived dimension to match the environment.",
+                camera_risk_dim,
+                expected_camera_risk_dim,
+            )
 
-        camera_risk_gate_alpha = float(cfg.task.get("camera_risk_gate_alpha", 0.2))
-        camera_risk_fusion_mode = str(cfg.task.get("camera_risk_fusion_mode", "gate"))
+        camera_geom = _read_depth_camera_geometry_from_stage(base_env)
+        fx = camera_geom["intrinsic_matrix"][0][0]
+        depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
+        camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
         expected_feature_dim = 128
 
         actor_backbone = DualStreamBackbone(
             state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
             ku_value_max=ku_value_max, output_dim=expected_feature_dim,
-            camera_risk_gate_alpha=camera_risk_gate_alpha,
-            camera_risk_fusion_mode=camera_risk_fusion_mode,
+            camera_h_fov_rad=camera_h_fov_rad,
         ).to(base_env.device)
         critic_backbone = DualStreamBackbone(
             state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
             ku_value_max=ku_value_max, output_dim=expected_feature_dim,
-            camera_risk_gate_alpha=camera_risk_gate_alpha,
-            camera_risk_fusion_mode=camera_risk_fusion_mode,
+            camera_h_fov_rad=camera_h_fov_rad,
         ).to(base_env.device)
 
         actor_replaced = False
@@ -957,8 +1179,9 @@ def main(cfg):
         policy.critic_opt = torch.optim.Adam(policy.critic.parameters(), lr=critic_lr)
 
         print(
-            f"✅ DualStreamBackbone injected: state_dim={state_dim}, lidar_dim={lidar_dim}, "
-            f"camera_risk_dim={camera_risk_dim}, fusion={camera_risk_fusion_mode}"
+            f"✅ Spatial-gate DualStreamBackbone injected: state_dim={state_dim}, lidar_dim={lidar_dim}, "
+            f"camera_risk_dim={camera_risk_dim}, camera_h_fov_rad={camera_h_fov_rad:.4f}, "
+            f"vlim={float(cfg.task.vlim):.3f}"
         )
 
         # Optional warm start.
@@ -1160,5 +1383,18 @@ def main(cfg):
             simulation_app.close()
 
 
+def _ensure_default_task_override() -> None:
+    has_task_override = any(
+        arg == "task"
+        or arg.startswith("task=")
+        or arg.startswith("+task=")
+        or arg.startswith("++task=")
+        for arg in sys.argv[1:]
+    )
+    if not has_task_override:
+        sys.argv.append("task=forest_lc_gate")
+
+
 if __name__ == "__main__":
+    _ensure_default_task_override()
     main()

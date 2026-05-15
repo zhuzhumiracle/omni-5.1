@@ -1198,7 +1198,10 @@ class forest_lc(IsaacEnv):
         self.depth_dirty = True
 
     def _map_velocity_action_to_world(self, action_norm: torch.Tensor, root_state: torch.Tensor) -> torch.Tensor:
-        target_vel_local = action_norm[..., :3] * self.vlim_episode
+        vel_action = action_norm[..., :3]
+        vel_norm = vel_action.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        vel_action = torch.where(vel_norm > 1.0, vel_action / vel_norm, vel_action)
+        target_vel_local = vel_action * self.vlim_episode
         if self.velocity_frame == "world":
             return target_vel_local
         if self.velocity_frame == "body":

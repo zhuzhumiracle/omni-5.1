@@ -8,7 +8,7 @@ defaults:
 
 
 env:
-  num_envs: 10
+  num_envs: 30
   max_episode_length: 1500
 
 # ../viewer:
