@@ -26,10 +26,10 @@ num_lidar_points: 20000
 
 action_transform: null
 
-# Policy action is [vx, vy, vz, yaw] in normalized coordinates. The velocity
-# vector is projected into the unit ball before multiplying by vlim.
+# Policy action is [dir_x, dir_y, dir_z, speed_ratio, yaw].
+# Direction and speed are decoded separately before multiplying by vlim.
 control_mode: velocity
-velocity_action_dim: 4
+velocity_action_dim: 5
 velocity_frame: world
 target_yaw_mode: action
 velocity_yaw_speed_threshold: 0.2

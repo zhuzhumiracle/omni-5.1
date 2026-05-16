@@ -754,6 +754,18 @@ def main(cfg):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
+    if (
+        str(cfg.task.get("control_mode", "")).lower() == "velocity"
+        and str(cfg.task.get("target_yaw_mode", "")).lower() == "action"
+        and int(cfg.task.get("velocity_action_dim", 5)) != 5
+    ):
+        logging.warning(
+            "Using decoupled velocity action [dir_x, dir_y, dir_z, speed_ratio, yaw]; "
+            "overriding velocity_action_dim=%s to 5.",
+            cfg.task.get("velocity_action_dim"),
+        )
+        cfg.task.velocity_action_dim = 5
+
     # GPU config: do not use CUDA_VISIBLE_DEVICES. Use cfg keys.
     gpu_id = int(cfg.get("gpu_id", cfg.get("sim_gpu_index", 0)))
     vulkan_gpu_id = int(cfg.get("vulkan_gpu_id", cfg.get("active_gpu", 1)))

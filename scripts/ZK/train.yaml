@@ -10,7 +10,7 @@ headless: true # 是否弹出渲染窗口
 sim: ${task.sim}
 env: ${task.env}
 
-total_frames: 10_000_000 # 总共训练多少帧
+total_frames: 80_000_000 # 总共训练多少帧
 max_iters: -1
 eval_interval: -1
 save_interval: -1
@@ -40,7 +40,7 @@ tree:
 init_mode: goodpt
 # 可填 .pt 文件，或填写目录（优先 checkpoint_final.pt，否则选最新修改的 .pt）
 # 相对路径按本脚本所在目录 OmniDrones/scripts/ZK 解析
-goodpt_path: goodpt/5-14-vlim-lc_best_return_2619.32.pt
+goodpt_path: goodpt/5-16-vlim-lc-tree_best_return_2460.18.pt
 
 viewer:
   resolution: [1080, 780] # 可视化窗口分辨率
@@ -65,6 +65,6 @@ tensorboard:
   log_dir: ""
 
 defaults:
-  - task: forest_lc
+  - task: forest_lc_gate
   - algo: ppo
   - _self_

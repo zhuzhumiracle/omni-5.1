@@ -83,10 +83,11 @@ class forest_lc(IsaacEnv):
         if self.control_mode not in {"rotor", "velocity"}:
             raise ValueError(f"Unsupported control_mode={self.control_mode}. Expected 'rotor' or 'velocity'.")
         self.velocity_action_dim = int(cfg.task.get("velocity_action_dim", 3))
-        if self.velocity_action_dim not in {3, 4}:
+        if self.velocity_action_dim not in {3, 4, 5}:
             raise ValueError(
                 f"velocity_action_dim={self.velocity_action_dim} is not supported yet. "
-                "Use 3D [vx, vy, vz] or 4D [vx, vy, vz, yaw] normalized velocity actions."
+                "Use 3D [vx, vy, vz], 4D [vx, vy, vz, yaw], or "
+                "5D [dir_x, dir_y, dir_z, speed_ratio, yaw] actions."
             )
         self.velocity_frame = str(cfg.task.get("velocity_frame", "world")).lower()
         if self.velocity_frame not in {"world", "body", "goal"}:
@@ -112,7 +113,7 @@ class forest_lc(IsaacEnv):
                 "Expected 'goal', 'velocity', 'current', or 'action'."
             )
         if self.target_yaw_mode == "action" and self.velocity_action_dim < 4:
-            raise ValueError("target_yaw_mode=action requires velocity_action_dim=4.")
+            raise ValueError("target_yaw_mode=action requires velocity_action_dim >= 4.")
         self.velocity_yaw_speed_threshold = float(cfg.task.get("velocity_yaw_speed_threshold", 0.2))
 
         depth_res = cfg.task.get("depth_resolution", [96, 160])
@@ -897,7 +898,7 @@ class forest_lc(IsaacEnv):
             (E, self.downsampled_dim), self.depth_max_range, device=self.device, dtype=torch.float32
         )
         cam_valid_bin = torch.zeros(
-            (E, self.downsampled_dim), dtype=torch.float32, device=self.device
+            (E, self.downsampled_dim), dtype=torch.bool, device=self.device
         )
 
         if not valid.any():
@@ -939,7 +940,8 @@ class forest_lc(IsaacEnv):
         )
 
         # ---- mark bins that received at least one pixel ----
-        cam_valid_bin_flat = cam_valid_bin.view(-1)
+        cam_valid_bin_f = cam_valid_bin.float()
+        cam_valid_bin_flat = cam_valid_bin_f.view(-1)
         cam_valid_bin_flat.scatter_reduce_(
             0,
             scatter_idx,
@@ -947,7 +949,7 @@ class forest_lc(IsaacEnv):
             reduce="amax",
             include_self=True,
         )
-        cam_valid_bin = cam_valid_bin > 0.5
+        cam_valid_bin = cam_valid_bin_f > 0.5
         return cam_dist_bin, cam_valid_bin
 
     def _compute_camera_lidar_risk(self):
@@ -1131,6 +1133,15 @@ class forest_lc(IsaacEnv):
             "reward_death": Unbounded(1),
             "reward_thrust": Unbounded(1),
             "reward_milestone": Unbounded(1),
+            # 死亡原因追踪（episode-level: 该条件是否曾经触发）
+            "death_z_low": Unbounded(1),
+            "death_z_high": Unbounded(1),
+            "death_overspeed": Unbounded(1),
+            "death_collision": Unbounded(1),
+            "death_contact": Unbounded(1),
+            "death_oob": Unbounded(1),
+            "death_flip": Unbounded(1),
+            "death_nan": Unbounded(1),
         }
         for i in range(self.num_milestones):
             stats_spec_dict[f"reward_milestone_{i + 1}"] = Unbounded(1)
@@ -1197,10 +1208,60 @@ class forest_lc(IsaacEnv):
         self.lidar_dirty = True
         self.depth_dirty = True
 
-    def _map_velocity_action_to_world(self, action_norm: torch.Tensor, root_state: torch.Tensor) -> torch.Tensor:
-        vel_action = action_norm[..., :3]
+    def _limit_velocity_action(self, action_norm: torch.Tensor) -> torch.Tensor:
+        """Project normalized velocity action into the executable action set.
+
+        The first three channels encode a desired velocity ratio and are limited
+        to the unit ball before multiplying by vlim.  The optional yaw channel is
+        already bounded per component by tanh/clamp in _pre_sim_step.
+        """
+        action_exec = action_norm.clone()
+        vel_action = action_exec[..., :3]
         vel_norm = vel_action.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         vel_action = torch.where(vel_norm > 1.0, vel_action / vel_norm, vel_action)
+        action_exec[..., :3] = vel_action
+        return action_exec
+
+    def _prepare_velocity_action(self, actions: torch.Tensor) -> torch.Tensor:
+        """Convert raw policy output to the executable velocity action.
+
+        5D actions use decoupled semantics:
+          [0:3] direction, [3] speed ratio in [0, 1], [4] yaw in [-1, 1].
+
+        Legacy 3D/4D actions keep the old normalized velocity-vector behavior
+        for backward compatibility with existing configs/checkpoints.
+        """
+        if self.velocity_action_dim >= 5:
+            action_exec = torch.zeros_like(actions)
+            dir_raw = torch.tanh(actions[..., :3])
+            dir_raw = torch.nan_to_num(dir_raw, nan=0.0, posinf=1.0, neginf=-1.0)
+            dir_norm = dir_raw.norm(dim=-1, keepdim=True)
+            direction = torch.where(
+                dir_norm > 1e-6,
+                dir_raw / dir_norm.clamp_min(1e-6),
+                torch.zeros_like(dir_raw),
+            )
+            speed_ratio = (actions[..., 3:4] + 1.0) / 2.0
+            speed_ratio = torch.nan_to_num(speed_ratio, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            yaw = torch.tanh(actions[..., 4:5])
+            yaw = torch.nan_to_num(yaw, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            action_exec[..., :3] = direction
+            action_exec[..., 3:4] = speed_ratio.clamp(0.0, 1.0)
+            action_exec[..., 4:5] = yaw.clamp(-1.0, 1.0)
+            return action_exec
+
+        action_norm = torch.tanh(actions)
+        action_norm = torch.clamp(action_norm, min=-1.0, max=1.0)
+        if torch.isnan(action_norm).any():
+            action_norm = torch.nan_to_num(action_norm, nan=0.0)
+        return self._limit_velocity_action(action_norm)
+
+    def _map_velocity_action_to_world(self, action_norm: torch.Tensor, root_state: torch.Tensor) -> torch.Tensor:
+        if self.velocity_action_dim >= 5:
+            vel_action = action_norm[..., :3] * action_norm[..., 3:4]
+        else:
+            vel_action = action_norm[..., :3]
         target_vel_local = vel_action * self.vlim_episode
         if self.velocity_frame == "world":
             return target_vel_local
@@ -1228,9 +1289,10 @@ class forest_lc(IsaacEnv):
         action_norm: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.target_yaw_mode == "action":
-            if action_norm is None or action_norm.shape[-1] < 4:
-                raise RuntimeError("target_yaw_mode=action requires a 4D normalized action.")
-            return action_norm[..., 3:4] * math.pi
+            yaw_idx = 4 if self.velocity_action_dim >= 5 else 3
+            if action_norm is None or action_norm.shape[-1] <= yaw_idx:
+                raise RuntimeError("target_yaw_mode=action requires an action yaw channel.")
+            return action_norm[..., yaw_idx:yaw_idx + 1] * math.pi
 
         goal_vec = self.target_pos - root_state[..., :3]
         goal_yaw = torch.atan2(goal_vec[..., 1:2], goal_vec[..., 0:1])
@@ -1253,14 +1315,11 @@ class forest_lc(IsaacEnv):
             if self.controller is None:
                 raise RuntimeError("control_mode=velocity requires a configured LeePositionController.")
 
-            action_norm = torch.tanh(actions)
-            action_norm = torch.clamp(action_norm, min=-1.0, max=1.0)
-            if torch.isnan(action_norm).any():
-                action_norm = torch.nan_to_num(action_norm, nan=0.0)
+            action_exec = self._prepare_velocity_action(actions)
 
             root_state = self.drone.get_state(env_frame=False)[..., :13]
-            target_vel_world = self._map_velocity_action_to_world(action_norm, root_state)
-            target_yaw = self._compute_target_yaw(root_state, target_vel_world, action_norm)
+            target_vel_world = self._map_velocity_action_to_world(action_exec, root_state)
+            target_yaw = self._compute_target_yaw(root_state, target_vel_world, action_exec)
             target_pos = root_state[..., :3]
             target_acc = torch.zeros_like(target_vel_world)
 
@@ -1278,7 +1337,7 @@ class forest_lc(IsaacEnv):
             self.last_target_vel.copy_(self.current_target_vel)
             self.last_motor_cmds.copy_(self.current_motor_cmds)
             self.effort = self.drone.apply_action(rotor_cmds)
-            self.current_actions = action_norm.clone()
+            self.current_actions = action_exec.clone()
             self.current_target_vel = target_vel_world.clone()
             self.current_motor_cmds = rotor_cmds.clone()
             return
@@ -2011,8 +2070,8 @@ class forest_lc(IsaacEnv):
             stage_reward_parts = []
             stage_reward_total = torch.zeros_like(curr_dist)
             for i in range(self.num_milestones):
-                just_hit = (~self.milestone_hit[:, i : i + 1]) & (progress_ratio >= self.milestone_thresholds[i])
-                self.milestone_hit[:, i : i + 1] = self.milestone_hit[:, i : i + 1] | just_hit
+                just_hit = torch.logical_and(~self.milestone_hit[:, i : i + 1], progress_ratio >= self.milestone_thresholds[i])
+                self.milestone_hit[:, i : i + 1] = torch.logical_or(self.milestone_hit[:, i : i + 1], just_hit)
                 stage_reward_i = just_hit.float() * self.milestone_rewards[i]
                 stage_reward_parts.append(stage_reward_i)
                 stage_reward_total = stage_reward_total + stage_reward_i
@@ -2141,6 +2200,40 @@ class forest_lc(IsaacEnv):
         # ===============================================================
 
         hasnan = torch.isnan(self.drone_state).any(-1)
+
+        # ---- 记录死亡原因（episode-level: 该条件是否曾经触发，不包括成功到达） ----
+        self.stats["death_z_low"] = torch.maximum(
+            self.stats["death_z_low"],
+            ((z < self.terminate_z_min) & ~reached_goal).float()
+        )
+        self.stats["death_z_high"] = torch.maximum(
+            self.stats["death_z_high"],
+            ((z > self.terminate_z_max) & ~reached_goal).float()
+        )
+        self.stats["death_overspeed"] = torch.maximum(
+            self.stats["death_overspeed"],
+            ((v_norm > self.terminate_v_norm) & ~reached_goal).float()
+        )
+        self.stats["death_collision"] = torch.maximum(
+            self.stats["death_collision"],
+            (is_collision & ~reached_goal).float()
+        )
+        self.stats["death_contact"] = torch.maximum(
+            self.stats["death_contact"],
+            (is_contact_collision & ~reached_goal).float()
+        )
+        self.stats["death_oob"] = torch.maximum(
+            self.stats["death_oob"],
+            (out_of_bounds & ~reached_goal).float()
+        )
+        self.stats["death_flip"] = torch.maximum(
+            self.stats["death_flip"],
+            (flip_early & ~reached_goal).float()
+        )
+        self.stats["death_nan"] = torch.maximum(
+            self.stats["death_nan"],
+            (hasnan & ~reached_goal).float()
+        )
 
         terminated = misbehave | hasnan | reached_goal
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)

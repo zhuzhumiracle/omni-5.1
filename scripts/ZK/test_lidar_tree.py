@@ -155,6 +155,17 @@ def main(cfg):
             "test_lidar_tree.py is intended for forest_singal/forest_signal, got task=%s.",
             cfg.task.name,
         )
+    if (
+        str(cfg.task.get("control_mode", "")).lower() == "velocity"
+        and str(cfg.task.get("target_yaw_mode", "")).lower() == "action"
+        and int(cfg.task.get("velocity_action_dim", 5)) != 5
+    ):
+        logging.warning(
+            "Using decoupled velocity action [dir_x, dir_y, dir_z, speed_ratio, yaw]; "
+            "overriding velocity_action_dim=%s to 5.",
+            cfg.task.get("velocity_action_dim"),
+        )
+        cfg.task.velocity_action_dim = 5
 
     vlim_override = cfg.get("vlim", None)
     if vlim_override is not None:

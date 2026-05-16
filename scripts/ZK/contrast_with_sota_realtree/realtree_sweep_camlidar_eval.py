@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,7 +24,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-14-vlim-lc_best_return_2465.99.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-16-vlim-lc-tree_best_return_2460.18.pt"
 DEFAULT_POLICY_TASK = "forest_lc"
 
 
@@ -274,6 +275,42 @@ def surfel_cross_mesh(points, surfel_size=0.08):
     return vertices.astype(np.float32), faces.astype(np.int32)
 
 
+_DEATH_REASON_KEYS = [
+    "death_z_low", "death_z_high", "death_overspeed",
+    "death_collision", "death_contact", "death_oob",
+    "death_flip", "death_nan",
+]
+_DEATH_REASON_LABELS = [
+    "z_low", "z_high", "overspeed",
+    "collision", "contact", "out_of_bounds",
+    "flip", "nan",
+]
+
+
+def _extract_death_reason_from_stats(stats_td, env_idx):
+    """Extract a single death reason string for one env from the final stats TensorDict."""
+    try:
+        success_val = float(stats_td["success"][env_idx].item())
+    except (KeyError, IndexError):
+        success_val = 0.0
+    if success_val >= 0.5:
+        return "success"
+    for key, label in zip(_DEATH_REASON_KEYS, _DEATH_REASON_LABELS):
+        try:
+            if float(stats_td[key][env_idx].item()) >= 0.5:
+                return label
+        except (KeyError, IndexError):
+            continue
+    return "timeout"
+
+
+def _aggregate_death_reasons(reasons):
+    """Aggregate a list of per-episode death reasons into a summary string."""
+    from collections import Counter
+    counts = Counter(reasons)
+    return ",".join(f"{k}:{v}" for k, v in sorted(counts.items()))
+
+
 def write_results(output_dir, rows):
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "density_sweep_results.csv"
@@ -293,6 +330,7 @@ def write_results(output_dir, rows):
         "mean_arrival_time_s",
         "mean_path_length_m",
         "mean_speed_mps",
+        "death_reason",
         "result",
         "duration_s",
     ]
@@ -1035,6 +1073,7 @@ def run_worker(args, hydra_overrides):
             episode_arrival_times = []
             episode_path_lengths = []
             episode_speeds = []
+            episode_death_reasons = []
             latest_success_rate = 0.0
             trajectory = []
             with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
@@ -1070,7 +1109,7 @@ def run_worker(args, hydra_overrides):
                         td = policy(td)
                         td = env.step(td)
                         reward = td[("next", "agents", "reward")].reshape(-1).float()
-                        done = td[("next", "done")].reshape(-1).bool()
+                        done = td[("next", "done")].reshape(-1).to(torch.bool)
                         stats_td = td[("next", "stats")]
                         current_pos = base_env.drone.pos.detach().clone().reshape(num_envs_eval, 3)
 
@@ -1080,17 +1119,17 @@ def run_worker(args, hydra_overrides):
                             prev_positions[active] = current_pos[active]
 
                         # Capture final positions for envs that just finished
-                        just_finished = ~finished & done
+                        just_finished = torch.logical_and(~finished, done)
                         if just_finished.any():
                             final_positions[just_finished] = current_pos[just_finished]
                             finish_steps[just_finished] = step_count
 
                         if active.any():
                             ep_returns[active] += reward[active]
-                        finished = finished | done
+                        finished = torch.logical_or(finished, done)
                         if "success" in stats_td.keys():
-                            success_now = stats_td["success"].reshape(-1) >= 0.5
-                            first_success = success_now & (arrival_steps < 0)
+                            success_now = (stats_td["success"].reshape(-1).float() >= 0.5).to(torch.bool)
+                            first_success = torch.logical_and(success_now, arrival_steps < 0)
                             if first_success.any():
                                 arrival_steps[first_success] = step_count
                             ep_success = torch.maximum(ep_success, success_now.to(torch.int32))
@@ -1165,9 +1204,22 @@ def run_worker(args, hydra_overrides):
                         float(v) for v in episode_speeds_tensor[success_mask].detach().cpu().tolist()
                     )
 
+                # ---- extract death reasons from final stats ----
+                try:
+                    final_stats = td.get(("next", "stats"))
+                    if final_stats is not None:
+                        for e in range(num_envs_eval):
+                            episode_death_reasons.append(
+                                _extract_death_reason_from_stats(final_stats, e)
+                            )
+                except Exception:
+                    for _ in range(num_envs_eval):
+                        episode_death_reasons.append("unknown")
+
             success_count = int(sum(episode_success))
             episode_count = int(len(episode_success))
             mean_completion = float(np.mean(episode_completion_pct)) if episode_completion_pct else 0.0
+            death_reason = _aggregate_death_reasons(episode_death_reasons) if episode_death_reasons else ""
             return {
                 "obstacles_per_tile": int(args.worker_density),
                 "tree_spacing_m": float(args.worker_density),
@@ -1184,6 +1236,7 @@ def run_worker(args, hydra_overrides):
                 "mean_arrival_time_s": round(float(np.mean(episode_arrival_times)), 3) if episode_arrival_times else float("nan"),
                 "mean_path_length_m": round(float(np.mean(episode_path_lengths)), 3) if episode_path_lengths else float("nan"),
                 "mean_speed_mps": round(float(np.mean(episode_speeds)), 3) if episode_speeds else float("nan"),
+                "death_reason": death_reason,
                 "result": "ok",
                 "duration_s": round(time.time() - trial_start, 3),
             }
@@ -1198,6 +1251,7 @@ def run_worker(args, hydra_overrides):
                 write_json(trial_result_path, row)
                 print(json.dumps(row, indent=2))
             except Exception as exc:
+                trial_tb = traceback.format_exc()
                 row = {
                     "obstacles_per_tile": int(args.worker_density),
                     "tree_spacing_m": float(args.worker_density),
@@ -1214,6 +1268,7 @@ def run_worker(args, hydra_overrides):
                     "mean_arrival_time_s": float("nan"),
                     "mean_path_length_m": float("nan"),
                     "mean_speed_mps": float("nan"),
+                    "death_reason": "",
                     "result": f"error:{type(exc).__name__}:{exc}",
                     "duration_s": 0.0,
                 }
@@ -1222,6 +1277,7 @@ def run_worker(args, hydra_overrides):
                 write_json(trial_result_path, row)
                 write_json(live_state_path, {**row, "phase": "error", "obstacles": preview_obstacles})
                 print(f"[worker] trial {trial_idx} failed: {exc}")
+                print(trial_tb)
 
         # Each trial is written to its own worker_density_*_trial_N.json file above.
         # Do not overwrite trial_1 with the last trial; the controller reads these
@@ -1235,6 +1291,7 @@ def run_worker(args, hydra_overrides):
         print(f"[worker] density={args.worker_density} completed {len(all_rows)}/{args.trials} trials")
         return 0
     except Exception as exc:
+        worker_tb = traceback.format_exc()
         row = {
             "obstacles_per_tile": int(args.worker_density),
             "tree_spacing_m": float(args.worker_density),
@@ -1251,11 +1308,13 @@ def run_worker(args, hydra_overrides):
             "mean_arrival_time_s": float("nan"),
             "mean_path_length_m": float("nan"),
             "mean_speed_mps": float("nan"),
+            "death_reason": "",
             "result": f"error:{type(exc).__name__}:{exc}",
             "duration_s": round(time.time() - start_time, 3),
         }
         write_json(result_path, row)
         write_json(live_state_path, {**row, "phase": "error", "obstacles": preview_obstacles})
+        print(worker_tb)
         raise
     finally:
         if simulation_app is not None:
@@ -1407,6 +1466,7 @@ def controller(args, hydra_overrides):
                             "mean_arrival_time_s": float("nan"),
                             "mean_path_length_m": float("nan"),
                             "mean_speed_mps": float("nan"),
+                            "death_reason": "",
                             "result": f"worker_exit_{proc.returncode}",
                             "duration_s": 0.0,
                         },

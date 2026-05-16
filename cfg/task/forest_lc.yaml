@@ -9,7 +9,7 @@ defaults:
 
 env:
   num_envs: 30
-  max_episode_length: 1500
+  max_episode_length: 3000
 
 # ../viewer:
 #   eye: [0., 8., 6.]
@@ -117,10 +117,10 @@ milestone_mid_reward: 1000 #1000
 milestone_reward_percents: [50, 40, 30, 30, 20, 20, 20, 20, 20] #5个20
 
 # ===== control mode =====
-# First-stage NavRL-style baseline: the policy outputs normalized velocity,
-# then LeePositionController converts target velocity to rotor commands.
+# Policy action is [dir_x, dir_y, dir_z, speed_ratio, yaw].
+# Direction and speed are decoded separately before multiplying by vlim.
 control_mode: velocity # velocity | rotor
-velocity_action_dim: 4
+velocity_action_dim: 5
 velocity_frame: world # start with world for controller smoke tests; later try body/goal
 vlim: 3.0
 target_yaw_mode: action # action | goal | velocity | current
@@ -154,7 +154,7 @@ time_penalty_power: 2.0
 time_penalty_progress_thresholds: [0.2, 0.4, 0.6]
 time_penalty_progress_discounts: [1.0, 0.5, 0.25, 0.0]
 
-terminate_z_min: 0.4
+terminate_z_min: 0.4 #0.4
 terminate_z_max: 10
 terminate_v_norm: 15 #8
 

@@ -956,6 +956,17 @@ def main(cfg):
             "train_canlidargate_trees.py is intended for task=forest_lc_gate, got task=%s.",
             cfg.task.name,
         )
+    if (
+        str(cfg.task.get("control_mode", "")).lower() == "velocity"
+        and str(cfg.task.get("target_yaw_mode", "")).lower() == "action"
+        and int(cfg.task.get("velocity_action_dim", 5)) != 5
+    ):
+        logging.warning(
+            "Using decoupled velocity action [dir_x, dir_y, dir_z, speed_ratio, yaw]; "
+            "overriding velocity_action_dim=%s to 5.",
+            cfg.task.get("velocity_action_dim"),
+        )
+        cfg.task.velocity_action_dim = 5
 
     vlim_override = cfg.get("vlim", None)
     if vlim_override is not None:
@@ -1092,14 +1103,12 @@ def main(cfg):
         obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
         lidar_dim = 3200
         ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-        state_dim = int(cfg.task.get("state_dim", 14))
-        if bool(cfg.task.get("observe_vlim", False)):
-            state_dim += 1
         expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
             cfg.task.get("camera_risk_features_per_bin", 4)
         )
         if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
             expected_camera_risk_dim += 1
+        state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
         camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
 
         if state_dim <= 0 or camera_risk_dim <= 0:

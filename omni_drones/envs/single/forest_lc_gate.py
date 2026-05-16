@@ -143,10 +143,11 @@ class forest_lc_gate(IsaacEnv):
         if self.control_mode not in {"rotor", "velocity"}:
             raise ValueError(f"Unsupported control_mode={self.control_mode}. Expected 'rotor' or 'velocity'.")
         self.velocity_action_dim = int(cfg.task.get("velocity_action_dim", 4))
-        if self.velocity_action_dim not in {3, 4}:
+        if self.velocity_action_dim not in {3, 4, 5}:
             raise ValueError(
                 f"velocity_action_dim={self.velocity_action_dim} is not supported yet. "
-                "Use 3D [vx, vy, vz] or 4D [vx, vy, vz, yaw] normalized velocity actions."
+                "Use 3D [vx, vy, vz], 4D [vx, vy, vz, yaw], or "
+                "5D [dir_x, dir_y, dir_z, speed_ratio, yaw] actions."
             )
         self.velocity_frame = str(cfg.task.get("velocity_frame", "world")).lower()
         if self.velocity_frame not in {"world", "body", "goal"}:
@@ -160,7 +161,7 @@ class forest_lc_gate(IsaacEnv):
                 "Expected 'goal', 'velocity', 'current', or 'action'."
             )
         if self.target_yaw_mode == "action" and self.velocity_action_dim < 4:
-            raise ValueError("target_yaw_mode=action requires velocity_action_dim=4.")
+            raise ValueError("target_yaw_mode=action requires velocity_action_dim >= 4.")
         self.velocity_yaw_speed_threshold = float(cfg.task.get("velocity_yaw_speed_threshold", 0.2))
 
         self.vlim = float(cfg.task.get("vlim", cfg.task.get("v_max", 3.0)))
@@ -172,6 +173,9 @@ class forest_lc_gate(IsaacEnv):
                 f"vlim_train_max ({self.vlim_train_max}) must be >= vlim_train_min ({self.vlim_train_min})."
             )
         self.observe_vlim = bool(cfg.task.get("observe_vlim", False))
+        self.normalize_velocity_rewards = bool(cfg.task.get("normalize_velocity_rewards", False))
+        self.v_max_reward = float(cfg.task.get("v_max_reward", cfg.task.get("v_max", self.vlim)))
+        self.v_max_reward_ratio = float(cfg.task.get("v_max_reward_ratio", 1.0))
         self.v_max = float(cfg.task.get("v_max", self.vlim))
         self.z_min = float(cfg.task.get("z_min", 0.5))
         self.z_max = float(cfg.task.get("z_max", 3.5))
@@ -364,15 +368,22 @@ class forest_lc_gate(IsaacEnv):
         self.ray_dirs_local = torch.nn.functional.normalize(ray_dirs_local, dim=-1)
 
         # ---------- camera extrinsics (position & rotation in body/LiDAR frame) ----------
-        _cam_pos_cfg = cfg.task.get("depth_camera_pos", [0.12, 0.0, 0.03])
+        _cam_pos_cfg = cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18])
+        _cam_target_cfg = cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18])
         self._t_cam2body = torch.tensor(_cam_pos_cfg, dtype=torch.float32, device=self.device)
-        # Camera looks along -Z (OpenGL convention).  body+X ← camera-Z
-        # R maps column vector P_cam → P_body:  P_body = R @ P_cam + t
-        self._R_cam2body = torch.tensor(
-            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            dtype=torch.float32,
-            device=self.device,
-        )
+        _cam_target = torch.tensor(_cam_target_cfg, dtype=torch.float32, device=self.device)
+        _forward = _cam_target - self._t_cam2body
+        if torch.linalg.norm(_forward) < 1e-6:
+            _forward = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
+        _forward = torch.nn.functional.normalize(_forward, dim=0)
+        _up_hint = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+        if torch.abs(torch.dot(_forward, _up_hint)) > 0.98:
+            _up_hint = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.device)
+        # USD/OpenGL camera convention: local -Z looks at target, local +Y is up.
+        _right = torch.nn.functional.normalize(torch.cross(_forward, _up_hint, dim=0), dim=0)
+        _up = torch.nn.functional.normalize(torch.cross(_right, _forward, dim=0), dim=0)
+        # R maps column vector P_cam -> P_body: P_body = R @ P_cam + t.
+        self._R_cam2body = torch.stack((_right, _up, -_forward), dim=1)
 
         # ---------- precompute camera ray directions (same for all envs) ----------
         if self.use_camera_risk_observation:
@@ -607,8 +618,8 @@ class forest_lc_gate(IsaacEnv):
         self.depth_camera = DepthSensorOfficial(depth_camera_cfg)
         self.depth_camera.spawn(
             [f"/World/envs/env_0/{self.drone.name}_0/base_link/{self.depth_prim_name}"],
-            translations=[tuple(self.cfg.task.get("depth_camera_pos", [0.12, 0.0, 0.03]))],
-            targets=[tuple(self.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.03]))],
+            translations=[tuple(self.cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]))],
+            targets=[tuple(self.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]))],
         )
 
         import isaaclab.sim as sim_utils
@@ -737,7 +748,7 @@ class forest_lc_gate(IsaacEnv):
         vv, uu = torch.meshgrid(v, u, indexing="ij")
 
         dx = (uu - self.cx) / self.fx
-        dy = (vv - self.cy) / self.fy
+        dy = (self.cy - vv) / self.fy
         dz = torch.full_like(dx, -1.0)  # camera looks along -Z (OpenGL convention)
 
         dirs = torch.stack([dx, dy, dz], dim=-1)  # [H, W, 3]
@@ -884,14 +895,14 @@ class forest_lc_gate(IsaacEnv):
             (E, self.downsampled_dim), self.depth_max_range, device=self.device, dtype=torch.float32
         )
         cam_valid_bin = torch.zeros(
-            (E, self.downsampled_dim), dtype=torch.float32, device=self.device
+            (E, self.downsampled_dim), dtype=torch.bool, device=self.device
         )
 
         if not valid.any():
             return cam_dist_bin, cam_valid_bin
 
         # ---- unproject valid pixels to 3D camera frame ----
-        valid_depths = depth_values[valid]  # [N]
+        valid_depths = depth_values[valid]  # [N], distance from camera center
         valid_dirs = self._cam_ray_dirs.unsqueeze(0).expand(E, -1, -1)[valid]  # [N, 3]
         P_cam = valid_dirs * valid_depths.unsqueeze(-1)  # [N, 3]
 
@@ -900,6 +911,7 @@ class forest_lc_gate(IsaacEnv):
 
         # ---- yaw / pitch in body frame ----
         x, y, z = P_body[:, 0], P_body[:, 1], P_body[:, 2]
+        body_dist = torch.sqrt(x * x + y * y + z * z).clamp(0.0, self.depth_max_range)
         yaw = torch.atan2(y, x)
         yaw = torch.remainder(yaw, 2 * torch.pi)
         pitch = torch.atan2(z, torch.sqrt(x * x + y * y + 1e-6))
@@ -921,11 +933,12 @@ class forest_lc_gate(IsaacEnv):
         scatter_idx = valid_env * self.downsampled_dim + flat_bin
         cam_dist_bin_flat = cam_dist_bin.view(-1)
         cam_dist_bin_flat.scatter_reduce_(
-            0, scatter_idx, valid_depths, reduce="amin", include_self=True
+            0, scatter_idx, body_dist, reduce="amin", include_self=True
         )
 
         # ---- mark bins that received at least one pixel ----
-        cam_valid_bin_flat = cam_valid_bin.view(-1)
+        cam_valid_bin_f = cam_valid_bin.float()
+        cam_valid_bin_flat = cam_valid_bin_f.view(-1)
         cam_valid_bin_flat.scatter_reduce_(
             0,
             scatter_idx,
@@ -933,7 +946,7 @@ class forest_lc_gate(IsaacEnv):
             reduce="amax",
             include_self=True,
         )
-        cam_valid_bin = cam_valid_bin > 0.5
+        cam_valid_bin = cam_valid_bin_f > 0.5
         return cam_dist_bin, cam_valid_bin
 
     def _compute_camera_lidar_risk(self):
@@ -1180,10 +1193,49 @@ class forest_lc_gate(IsaacEnv):
         self.lidar_dirty = True
         self.depth_dirty = True
 
-    def _map_velocity_action_to_world(self, action_norm: torch.Tensor, root_state: torch.Tensor) -> torch.Tensor:
-        vel_action = action_norm[..., :3]
+    def _prepare_velocity_action(self, actions: torch.Tensor) -> torch.Tensor:
+        """Convert raw policy output to executable velocity action.
+
+        5D actions use [direction_xyz, speed_ratio, yaw], separating speed
+        magnitude from direction before vlim scaling.  3D/4D actions keep the
+        old normalized velocity-vector behavior for compatibility.
+        """
+        if self.velocity_action_dim >= 5:
+            action_exec = torch.zeros_like(actions)
+            dir_raw = torch.tanh(actions[..., :3])
+            dir_raw = torch.nan_to_num(dir_raw, nan=0.0, posinf=1.0, neginf=-1.0)
+            dir_norm = dir_raw.norm(dim=-1, keepdim=True)
+            direction = torch.where(
+                dir_norm > 1e-6,
+                dir_raw / dir_norm.clamp_min(1e-6),
+                torch.zeros_like(dir_raw),
+            )
+            speed_ratio = (actions[..., 3:4] + 1.0) / 2.0
+            speed_ratio = torch.nan_to_num(speed_ratio, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            yaw = torch.tanh(actions[..., 4:5])
+            yaw = torch.nan_to_num(yaw, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            action_exec[..., :3] = direction
+            action_exec[..., 3:4] = speed_ratio.clamp(0.0, 1.0)
+            action_exec[..., 4:5] = yaw.clamp(-1.0, 1.0)
+            return action_exec
+
+        action_norm = torch.tanh(actions)
+        action_norm = torch.clamp(action_norm, min=-1.0, max=1.0)
+        if torch.isnan(action_norm).any():
+            action_norm = torch.nan_to_num(action_norm, nan=0.0)
+        action_exec = action_norm.clone()
+        vel_action = action_exec[..., :3]
         vel_norm = vel_action.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         vel_action = torch.where(vel_norm > 1.0, vel_action / vel_norm, vel_action)
+        action_exec[..., :3] = vel_action
+        return action_exec
+
+    def _map_velocity_action_to_world(self, action_norm: torch.Tensor, root_state: torch.Tensor) -> torch.Tensor:
+        if self.velocity_action_dim >= 5:
+            vel_action = action_norm[..., :3] * action_norm[..., 3:4]
+        else:
+            vel_action = action_norm[..., :3]
         target_vel_local = vel_action * self.vlim_episode
         if self.velocity_frame == "world":
             return target_vel_local
@@ -1211,9 +1263,10 @@ class forest_lc_gate(IsaacEnv):
         action_norm: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.target_yaw_mode == "action":
-            if action_norm is None or action_norm.shape[-1] < 4:
-                raise RuntimeError("target_yaw_mode=action requires a 4D normalized action.")
-            return action_norm[..., 3:4] * math.pi
+            yaw_idx = 4 if self.velocity_action_dim >= 5 else 3
+            if action_norm is None or action_norm.shape[-1] <= yaw_idx:
+                raise RuntimeError("target_yaw_mode=action requires an action yaw channel.")
+            return action_norm[..., yaw_idx:yaw_idx + 1] * math.pi
 
         goal_vec = self.target_pos - root_state[..., :3]
         goal_yaw = torch.atan2(goal_vec[..., 1:2], goal_vec[..., 0:1])
@@ -1236,14 +1289,11 @@ class forest_lc_gate(IsaacEnv):
             if self.controller is None:
                 raise RuntimeError("control_mode=velocity requires a configured LeePositionController.")
 
-            action_norm = torch.tanh(actions)
-            action_norm = torch.clamp(action_norm, min=-1.0, max=1.0)
-            if torch.isnan(action_norm).any():
-                action_norm = torch.nan_to_num(action_norm, nan=0.0)
+            action_exec = self._prepare_velocity_action(actions)
 
             root_state = self.drone.get_state(env_frame=False)[..., :13]
-            target_vel_world = self._map_velocity_action_to_world(action_norm, root_state)
-            target_yaw = self._compute_target_yaw(root_state, target_vel_world, action_norm)
+            target_vel_world = self._map_velocity_action_to_world(action_exec, root_state)
+            target_yaw = self._compute_target_yaw(root_state, target_vel_world, action_exec)
             target_pos = root_state[..., :3]
             target_acc = torch.zeros_like(target_vel_world)
 
@@ -1260,7 +1310,7 @@ class forest_lc_gate(IsaacEnv):
             self.last_actions.copy_(self.current_actions)
             self.last_target_vel.copy_(self.current_target_vel)
             self.effort = self.drone.apply_action(rotor_cmds)
-            self.current_actions = action_norm.clone()
+            self.current_actions = action_exec.clone()
             self.current_target_vel = target_vel_world.clone()
             return
 
@@ -1758,7 +1808,7 @@ class forest_lc_gate(IsaacEnv):
 
         depth_flat = self.depth_obs_cache
 
-        # ---------------- 14D proprioception ----------------
+        # ---------------- proprioception ----------------
         z_pos = self.drone.pos[..., 2:3]
 
         rpos_xy = self.rpos.clone()
@@ -1778,7 +1828,7 @@ class forest_lc_gate(IsaacEnv):
             z_pos,            # [1]
             v_body,           # [3]
             attitude,         # [4]
-            last_act          # [4]
+            last_act          # [action_dim]
         ], dim=-1)
         if self.observe_vlim:
             denom = max(self.vlim_train_max - self.vlim_train_min, 1e-6)
@@ -1903,6 +1953,9 @@ class forest_lc_gate(IsaacEnv):
         prev_dist = (self.target_pos - self.prev_pos).norm(dim=-1)
 
         r_forward = prev_dist - curr_dist
+        speed_ref = self.vlim_episode.squeeze(-1).clamp_min(1e-6)
+        if self.control_mode == "velocity" and self.normalize_velocity_rewards:
+            r_forward = r_forward / (speed_ref * self.dt).clamp_min(1e-6)
         distance = curr_dist
 
         # omega = self.drone.vel_w[..., 3:]
@@ -1915,20 +1968,24 @@ class forest_lc_gate(IsaacEnv):
         # action_diff = self.current_actions - self.last_actions
         # r_smoothness = torch.sum(torch.square(action_diff), dim=-1)
         omega = self.drone.vel_w[..., 3:]                  # [ωx, ωy, ωz]
+        action_diff = self.current_actions - self.last_actions
         if self.control_mode == "velocity":
-            speed_ref = self.vlim_episode.squeeze(-1).clamp_min(1e-6)
-            target_vel_diff = (self.current_target_vel - self.last_target_vel).norm(dim=-1) / speed_ref
+            target_vel_diff = (self.current_target_vel - self.last_target_vel).norm(dim=-1)
+            if self.normalize_velocity_rewards:
+                target_vel_diff = target_vel_diff / speed_ref
             r_smoothness = omega.norm(dim=-1) + target_vel_diff
         else:
-            action_diff = self.current_actions - self.last_actions
             r_smoothness = omega.norm(dim=-1) + action_diff.norm(dim=-1)
        
         # # r_max_speed = torch.exp(torch.relu(v_norm - self.v_max)) - 1.0
         # speed_excess = torch.relu(v_norm - self.v_max)
         # # r_max_speed = torch.exp(torch.clamp(speed_excess, max=5.0)) - 1.0
         # # 3. 修改超速惩罚：【绝对不要用 exp】！改用二次方(平方)，温柔且有效
-        speed_limit = self.vlim_episode.squeeze(-1).clamp_min(1e-6)
-        speed_excess = torch.relu(v_norm - speed_limit)
+        if self.control_mode == "velocity" and self.normalize_velocity_rewards:
+            speed_limit = (self.vlim_episode.squeeze(-1) * self.v_max_reward_ratio).clamp_min(1e-6)
+            speed_excess = torch.relu(v_norm / speed_limit - 1.0)
+        else:
+            speed_excess = torch.relu(v_norm - self.v_max_reward)
         r_max_speed = torch.square(speed_excess)
         # speed_excess = torch.relu(v_norm - self.v_max)
         # r_max_speed = 1.0 - torch.exp(speed_excess)
@@ -1981,8 +2038,8 @@ class forest_lc_gate(IsaacEnv):
             stage_reward_parts = []
             stage_reward_total = torch.zeros_like(curr_dist)
             for i in range(self.num_milestones):
-                just_hit = (~self.milestone_hit[:, i : i + 1]) & (progress_ratio >= self.milestone_thresholds[i])
-                self.milestone_hit[:, i : i + 1] = self.milestone_hit[:, i : i + 1] | just_hit
+                just_hit = torch.logical_and(~self.milestone_hit[:, i : i + 1], progress_ratio >= self.milestone_thresholds[i])
+                self.milestone_hit[:, i : i + 1] = torch.logical_or(self.milestone_hit[:, i : i + 1], just_hit)
                 stage_reward_i = just_hit.float() * self.milestone_rewards[i]
                 stage_reward_parts.append(stage_reward_i)
                 stage_reward_total = stage_reward_total + stage_reward_i
