@@ -991,7 +991,7 @@ def main(cfg):
     tree_map_size = float(tree_cfg.get("map_size", 60.0))
     tree_spacing = float(tree_cfg.get("spacing", 6.0))
     tree_scale_min = float(tree_cfg.get("scale_min", 0.35))
-    tree_scale_max = float(tree_cfg.get("scale_max", 0.55))
+    tree_scale_max = float(tree_cfg.get("scale_max", 0.6))
     tree_tilt_deg = float(tree_cfg.get("tilt_deg", 5.0))
     tree_clear_radius = float(tree_cfg.get("clear_radius", 6.0))
     tree_seed = int(tree_cfg.get("seed", cfg.seed))

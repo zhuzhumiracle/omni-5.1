@@ -15,17 +15,236 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
+import torch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ZK_DIR = SCRIPT_DIR.parent
 OMNIDRONES_DIR = ZK_DIR.parent.parent
 REPO_ROOT = OMNIDRONES_DIR.parent
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-16-vlim-lc-tree_best_return_2460.18.pt"
-DEFAULT_POLICY_TASK = "forest_lc"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-17-vlim-lcgate-tree_best_return_598.03.pt"
+DEFAULT_POLICY_TASK = "forest_lc_gate"
+
+
+class CanLiDARGateBackbone(torch.nn.Module):
+    """Backbone matching train_canlidargate_trees.py exactly for lc-gate checkpoints."""
+
+    def __init__(
+        self,
+        state_dim,
+        lidar_dim=3200,
+        camera_risk_dim=13,
+        ku_value_max=20.0,
+        output_dim=128,
+        camera_h_fov_rad=None,
+    ):
+        super().__init__()
+        if lidar_dim != 3200:
+            raise ValueError(f"This backbone expects lidar_dim=3200, got {lidar_dim}.")
+        if camera_risk_dim <= 0:
+            raise ValueError(f"camera_risk_dim must be positive, got {camera_risk_dim}.")
+
+        self.state_dim = int(state_dim)
+        self.lidar_dim = int(lidar_dim)
+        self.camera_risk_dim = int(camera_risk_dim)
+        self.ku_value_max = float(ku_value_max)
+        if self.ku_value_max <= 0.0:
+            raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
+        self.ku_unknown_value = self.ku_value_max
+
+        self.ku_h = 40
+        self.ku_w = 80
+        if camera_h_fov_rad is None:
+            camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
+        self.camera_h_fov_rad = float(camera_h_fov_rad)
+        self._build_sector_column_masks()
+
+        self.ku_encoder = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
+            torch.nn.GroupNorm(4, 16),
+            torch.nn.LeakyReLU(0.1, inplace=True),
+            torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
+            torch.nn.GroupNorm(8, 32),
+            torch.nn.LeakyReLU(0.1, inplace=True),
+            torch.nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            torch.nn.GroupNorm(8, 64),
+            torch.nn.LeakyReLU(0.1, inplace=True),
+        )
+        self.ku_global_head = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Flatten(),
+            torch.nn.Linear(64, 128),
+            torch.nn.LeakyReLU(0.1, inplace=True),
+        )
+
+        self.state_encoder = torch.nn.Sequential(
+            torch.nn.Linear(self.state_dim, 64),
+            torch.nn.ELU(),
+            torch.nn.Linear(64, 64),
+            torch.nn.ELU(),
+        )
+        self.gate_head_L = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
+        self.gate_head_C = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
+        self.gate_head_R = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
+
+        self.fusion_mlp = torch.nn.Sequential(
+            torch.nn.Linear(64 + 128, 256),
+            torch.nn.ELU(),
+            torch.nn.Linear(256, 256),
+            torch.nn.ELU(),
+            torch.nn.Linear(256, output_dim),
+            torch.nn.ELU(),
+        )
+
+    def _build_sector_column_masks(self):
+        h_fov = self.camera_h_fov_rad
+        col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
+        col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
+        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
+        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
+        self.register_buffer(
+            "_mask_C",
+            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
+            persistent=False,
+        )
+        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
+
+    def forward(self, obs):
+        state = obs[..., :self.state_dim]
+        x_ku_flat = obs[..., self.state_dim:self.state_dim + self.lidar_dim]
+        camera_risk_start = self.state_dim + self.lidar_dim
+        camera_risk_end = camera_risk_start + self.camera_risk_dim
+        camera_risk = obs[..., camera_risk_start:camera_risk_end]
+
+        batch_shape = state.shape[:-1]
+        b = int(math.prod(batch_shape)) if len(batch_shape) > 0 else 1
+
+        x_ku_raw = x_ku_flat.reshape(b, 1, self.ku_h, self.ku_w)
+        x_ku_raw = torch.nan_to_num(
+            x_ku_raw,
+            posinf=self.ku_unknown_value,
+            neginf=0.0,
+            nan=self.ku_unknown_value,
+        )
+        x_ku_raw = torch.clamp(x_ku_raw, 0.0, self.ku_unknown_value)
+
+        camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
+        camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)
+
+        gate_R = self.gate_head_R(sector_features[:, 0, :])
+        gate_C = self.gate_head_C(sector_features[:, 1, :])
+        gate_L = self.gate_head_L(sector_features[:, 2, :])
+
+        spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
+        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
+        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
+        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
+
+        lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
+        lidar_z = self.ku_global_head(lidar_feat)
+
+        state_2d = state.reshape(b, self.state_dim)
+        state_z = self.state_encoder(state_2d)
+
+        fused = torch.cat([state_z, lidar_z], dim=-1)
+        out = self.fusion_mlp(fused)
+        return out.reshape(*batch_shape, -1)
+
+
+def _camera_h_fov_rad_from_cfg(cfg):
+    focal = float(cfg.task.get("depth_camera_focal_length", 12.0))
+    h_aperture = float(cfg.task.get("depth_camera_horizontal_aperture", 20.955))
+    if focal <= 0.0 or h_aperture <= 0.0:
+        raise ValueError(
+            f"Invalid depth camera intrinsics for FoV: focal={focal}, horizontal_aperture={h_aperture}"
+        )
+    return 2.0 * math.atan(h_aperture / (2.0 * focal))
+
+
+def _inject_canlidargate_backbone(policy, base_env, env, cfg):
+    obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
+    lidar_dim = 3200
+    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 3)) * int(
+        cfg.task.get("camera_risk_features_per_bin", 4)
+    )
+    if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
+        expected_camera_risk_dim += 1
+
+    state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
+    camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
+    if state_dim <= 0 or camera_risk_dim <= 0:
+        raise RuntimeError(
+            f"Invalid observation split: obs_dim={obs_dim}, state_dim={state_dim}, "
+            f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}"
+        )
+    if camera_risk_dim != expected_camera_risk_dim:
+        print(
+            f"[Warning] camera_risk_dim={camera_risk_dim} derived from observation, "
+            f"but config expects {expected_camera_risk_dim}; using derived dimension."
+        )
+
+    expected_feature_dim = 128
+    ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
+    camera_h_fov_rad = _camera_h_fov_rad_from_cfg(cfg)
+
+    actor_backbone = CanLiDARGateBackbone(
+        state_dim=state_dim,
+        lidar_dim=lidar_dim,
+        camera_risk_dim=camera_risk_dim,
+        ku_value_max=ku_value_max,
+        output_dim=expected_feature_dim,
+        camera_h_fov_rad=camera_h_fov_rad,
+    ).to(base_env.device)
+    critic_backbone = CanLiDARGateBackbone(
+        state_dim=state_dim,
+        lidar_dim=lidar_dim,
+        camera_risk_dim=camera_risk_dim,
+        ku_value_max=ku_value_max,
+        output_dim=expected_feature_dim,
+        camera_h_fov_rad=camera_h_fov_rad,
+    ).to(base_env.device)
+
+    actor_replaced = False
+    critic_replaced = False
+    if hasattr(policy.actor, "module") and hasattr(policy.actor.module, "module"):
+        actor_core = policy.actor.module.module
+        if isinstance(actor_core, torch.nn.Sequential) and len(actor_core) > 0:
+            actor_core[0] = actor_backbone
+            actor_replaced = True
+    if not actor_replaced and hasattr(policy.actor, "module") and hasattr(policy.actor.module, "__getitem__"):
+        try:
+            actor_td_module = policy.actor.module[0]
+            if hasattr(actor_td_module, "module") and isinstance(actor_td_module.module, torch.nn.Sequential):
+                actor_td_module.module[0] = actor_backbone
+                actor_replaced = True
+        except Exception:
+            pass
+
+    if hasattr(policy.critic, "module") and isinstance(policy.critic.module, torch.nn.Sequential):
+        policy.critic.module[0] = critic_backbone
+        critic_replaced = True
+    if not critic_replaced and hasattr(policy.critic, "module") and hasattr(policy.critic.module, "__getitem__"):
+        try:
+            critic_td_module = policy.critic.module[0]
+            if hasattr(critic_td_module, "module"):
+                critic_td_module.module = critic_backbone
+                critic_replaced = True
+        except Exception:
+            pass
+
+    if not actor_replaced or not critic_replaced:
+        raise RuntimeError(f"Backbone injection failed: actor={actor_replaced}, critic={critic_replaced}")
+
+    print(
+        f"[+] train_canlidargate_trees-compatible backbone injected | "
+        f"task={cfg.task.name}, state_dim={state_dim}, lidar_dim={lidar_dim}, "
+        f"camera_risk_dim={camera_risk_dim}, camera_h_fov_rad={camera_h_fov_rad:.4f}"
+    )
+    return actor_backbone, critic_backbone
 
 
 def make_int_range(min_value, max_value, step):
@@ -211,6 +430,144 @@ def tree_positions_jittered_grid(map_size=60.0, spacing=4.0, seed=0, clear_radiu
     return np.asarray(positions, dtype=np.float32)
 
 
+def _rotation_matrix(roll, pitch, yaw):
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.asarray([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float32)
+    ry = np.asarray([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float32)
+    rz = np.asarray([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float32)
+    return (rz @ ry @ rx).astype(np.float32)
+
+
+def _parse_face_index(token, vertex_count):
+    raw = token.split("/", 1)[0]
+    if not raw:
+        raise ValueError(f"Invalid OBJ face token: {token!r}")
+    idx = int(raw)
+    if idx < 0:
+        idx = vertex_count + idx
+    else:
+        idx = idx - 1
+    return idx
+
+
+def read_obj_mesh(path, max_faces=0):
+    """Read vertices and triangulated faces from a simple OBJ mesh."""
+    path = Path(path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Tree OBJ file not found: {path}")
+
+    vertices = []
+    faces = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("v "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                if max_faces and len(faces) >= int(max_faces):
+                    continue
+                parts = line.split()[1:]
+                if len(parts) < 3:
+                    continue
+                idxs = [_parse_face_index(tok, len(vertices)) for tok in parts]
+                for i in range(1, len(idxs) - 1):
+                    if max_faces and len(faces) >= int(max_faces):
+                        break
+                    faces.append((idxs[0], idxs[i], idxs[i + 1]))
+
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int32)
+    if vertices.size == 0 or faces.size == 0:
+        raise ValueError(f"OBJ mesh contains no usable vertices/faces: {path}")
+    if np.any(faces < 0) or np.any(faces >= vertices.shape[0]):
+        raise ValueError(f"OBJ mesh has out-of-range face indices: {path}")
+    return vertices, faces
+
+
+def normalize_tree_mesh(vertices, auto_upright=True):
+    """Match train_canlidargate_trees.py: z-up, centered in XY, rooted at z=0."""
+    vertices = np.asarray(vertices, dtype=np.float32).copy()
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError(f"Expected OBJ vertices with shape [N,3], got {vertices.shape}")
+
+    if auto_upright:
+        extents = np.ptp(vertices, axis=0)
+        up_axis = int(np.argmax(extents))
+        if up_axis == 1:
+            vertices = vertices[:, [0, 2, 1]]
+        elif up_axis == 0:
+            vertices = vertices[:, [1, 2, 0]]
+
+    mins = vertices.min(axis=0)
+    maxs = vertices.max(axis=0)
+    center_xy = 0.5 * (mins[:2] + maxs[:2])
+    vertices[:, 0] -= center_xy[0]
+    vertices[:, 1] -= center_xy[1]
+    vertices[:, 2] -= vertices[:, 2].min()
+    return vertices.astype(np.float32)
+
+
+def make_combined_tree_forest_mesh(
+    tree_obj_path,
+    map_size=60.0,
+    spacing=4.0,
+    seed=0,
+    scale_min=0.5,
+    scale_max=1.0,
+    tilt_deg=10.0,
+    clear_radius=2.0,
+    max_faces_per_tree=8000,
+    auto_upright=True,
+):
+    """Instantiate one OBJ tree mesh many times and return one combined mesh."""
+    base_vertices, base_faces = read_obj_mesh(tree_obj_path, max_faces=int(max_faces_per_tree))
+    base_vertices = normalize_tree_mesh(base_vertices, auto_upright=auto_upright)
+
+    positions = tree_positions_jittered_grid(
+        map_size=float(map_size),
+        spacing=float(spacing),
+        seed=int(seed),
+        clear_radius=float(clear_radius),
+    )
+    if positions.size == 0:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.int32), positions
+
+    rng = np.random.default_rng(int(seed))
+    scale_min = float(scale_min)
+    scale_max = float(scale_max)
+    if scale_max < scale_min:
+        scale_min, scale_max = scale_max, scale_min
+    max_tilt_rad = math.radians(float(tilt_deg))
+
+    all_vertices = []
+    all_faces = []
+    vert_offset = 0
+    for px, py in positions:
+        scale = float(rng.uniform(scale_min, scale_max))
+        roll = float(rng.uniform(-max_tilt_rad, max_tilt_rad))
+        pitch = float(rng.uniform(-max_tilt_rad, max_tilt_rad))
+        yaw = float(rng.uniform(-math.pi, math.pi))
+        rot = _rotation_matrix(roll, pitch, yaw)
+        verts = (base_vertices @ rot.T) * scale
+        verts += np.asarray([float(px), float(py), 0.0], dtype=np.float32)
+        verts[:, 2] = np.maximum(verts[:, 2], 0.02)
+        all_vertices.append(verts.astype(np.float32))
+        all_faces.append((base_faces + vert_offset).astype(np.int32))
+        vert_offset += verts.shape[0]
+
+    return (
+        np.concatenate(all_vertices, axis=0).astype(np.float32),
+        np.concatenate(all_faces, axis=0).astype(np.int32),
+        positions,
+    )
+
+
 def make_realtree_forest_points(
     tree_ply,
     map_size=60.0,
@@ -309,6 +666,18 @@ def _aggregate_death_reasons(reasons):
     from collections import Counter
     counts = Counter(reasons)
     return ",".join(f"{k}:{v}" for k, v in sorted(counts.items()))
+
+
+def _get_final_stats_from_td(td):
+    """Return the most recent stats TensorDict from either next/current scope."""
+    for key in (("next", "stats"), "stats"):
+        try:
+            stats_td = td.get(key)
+            if stats_td is not None:
+                return stats_td
+        except Exception:
+            continue
+    return None
 
 
 def write_results(output_dir, rows):
@@ -727,50 +1096,46 @@ def patched_realtree_forest(args):
         if not tree_obj_path.exists():
             raise FileNotFoundError(f"Tree OBJ file not found: {tree_obj_path}")
 
-        rng = np.random.default_rng(int(args.worker_seed))
-        positions = tree_positions_jittered_grid(
+        vertices, faces, positions = make_combined_tree_forest_mesh(
+            tree_obj_path,
             map_size=float(args.tree_map_size),
             spacing=float(args.worker_density),
             seed=int(args.worker_seed),
+            scale_min=float(args.tree_scale_min),
+            scale_max=float(args.tree_scale_max),
+            tilt_deg=float(args.tree_tilt_deg),
             clear_radius=float(args.tree_clear_radius),
+            max_faces_per_tree=int(args.tree_max_faces_per_tree),
+            auto_upright=bool(args.tree_auto_upright),
         )
+        if vertices.size == 0 or faces.size == 0:
+            raise RuntimeError("No real-tree mesh was generated. Check tree spacing/map size/clear radius.")
 
-        scale_min = float(args.tree_scale_min)
-        scale_max = float(args.tree_scale_max)
-        if scale_max < scale_min:
-            scale_min, scale_max = scale_max, scale_min
-        max_tilt_rad = math.radians(float(args.tree_tilt_deg))
+        mesh_path = "/World/ground/realtree_forest_mesh"
+        mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+        mesh.CreatePointsAttr([tuple(map(float, p)) for p in vertices])
+        mesh.CreateFaceVertexCountsAttr([3] * int(faces.shape[0]))
+        mesh.CreateFaceVertexIndicesAttr([int(i) for i in faces.reshape(-1)])
+        mesh.CreateDoubleSidedAttr(True)
 
-        parent_path = "/World/ground/realtree_forest_mesh"
-        parent = UsdGeom.Xform.Define(stage, parent_path)
-
-        for i, (px, py) in enumerate(positions):
-            scale = float(rng.uniform(scale_min, scale_max))
-            roll = float(rng.uniform(-max_tilt_rad, max_tilt_rad))
-            pitch = float(rng.uniform(-max_tilt_rad, max_tilt_rad))
-            yaw = float(rng.uniform(-math.pi, math.pi))
-
-            child_path = f"{parent_path}/tree_{i}"
-            child = UsdGeom.Xform.Define(stage, child_path)
-            child.AddTranslateOp().Set((float(px), float(py), 0.0))
-            child.AddRotateXYZOp().Set((math.degrees(roll), math.degrees(pitch), math.degrees(yaw)))
-            child.AddScaleOp().Set((scale, scale, scale))
-            child.GetPrim().GetReferences().AddReference(str(tree_obj_path))
-            UsdPhysics.CollisionAPI.Apply(child.GetPrim())
-
-        prim = parent.GetPrim()
+        prim = mesh.GetPrim()
+        UsdPhysics.CollisionAPI.Apply(prim)
         prim.CreateAttribute("realtree:tree_count", Sdf.ValueTypeNames.Int).Set(int(positions.shape[0]))
+        prim.CreateAttribute("realtree:vertices", Sdf.ValueTypeNames.Int).Set(int(vertices.shape[0]))
+        prim.CreateAttribute("realtree:faces", Sdf.ValueTypeNames.Int).Set(int(faces.shape[0]))
         prim.CreateAttribute("realtree:spacing_m", Sdf.ValueTypeNames.Double).Set(float(args.worker_density))
-        return int(positions.shape[0]), 0, int(positions.shape[0]), 0
+
+        print(
+            "[realtree] installed combined tree mesh: "
+            f"spacing={float(args.worker_density):.3f}m trees={positions.shape[0]} "
+            f"vertices={vertices.shape[0]} faces={faces.shape[0]} "
+            f"max_faces_per_tree={int(args.tree_max_faces_per_tree)}"
+        )
+        return int(positions.shape[0])
 
     def terrain_init_wrapper(self, cfg):
         original_terrain_init(self, cfg)
-        counts = install_realtree_mesh()
-        print(
-            "[realtree] installed YOPO tree_mesh.obj forest: "
-            f"spacing={float(args.worker_density):.3f}m trees={counts[0]} "
-            f"instanced_meshes={counts[2]}"
-        )
+        install_realtree_mesh()
 
     def ray_initialize_all_meshes(self):
         import omni.usd  # type: ignore
@@ -799,41 +1164,41 @@ def patched_realtree_forest(args):
             all_points = []
             all_faces = []
             vert_offset = 0
-            for prim in root.GetAllChildren():
-                stack = [prim]
-                while stack:
-                    curr = stack.pop()
-                    stack.extend(list(curr.GetChildren()))
-                    if curr.GetTypeName() != "Mesh":
+            stack = [root]
+            while stack:
+                curr = stack.pop()
+                stack.extend(list(curr.GetChildren()))
+                if curr.GetTypeName() != "Mesh":
+                    continue
+                mesh = UsdGeom.Mesh(curr)
+                pts_attr = mesh.GetPointsAttr().Get()
+                idx_attr = mesh.GetFaceVertexIndicesAttr().Get()
+                counts_attr = mesh.GetFaceVertexCountsAttr().Get()
+                if pts_attr is None or idx_attr is None or counts_attr is None:
+                    continue
+                pts = np.asarray(pts_attr, dtype=np.float32)
+                if pts.size == 0:
+                    continue
+                transform_matrix = np.array(omni.usd.get_world_transform_matrix(mesh)).T
+                pts = np.matmul(pts, transform_matrix[:3, :3].T)
+                pts += transform_matrix[:3, 3]
+                idx = np.asarray(idx_attr, dtype=np.int32)
+                counts = np.asarray(counts_attr, dtype=np.int32)
+                cursor = 0
+                tris = []
+                for count in counts:
+                    count = int(count)
+                    poly = idx[cursor:cursor + count]
+                    cursor += count
+                    if count < 3:
                         continue
-                    mesh = UsdGeom.Mesh(curr)
-                    pts_attr = mesh.GetPointsAttr().Get()
-                    idx_attr = mesh.GetFaceVertexIndicesAttr().Get()
-                    counts_attr = mesh.GetFaceVertexCountsAttr().Get()
-                    if pts_attr is None or idx_attr is None or counts_attr is None:
-                        continue
-                    pts = np.asarray(pts_attr, dtype=np.float32)
-                    if pts.size == 0:
-                        continue
-                    transform_matrix = np.array(omni.usd.get_world_transform_matrix(mesh)).T
-                    pts = np.matmul(pts, transform_matrix[:3, :3].T)
-                    pts += transform_matrix[:3, 3]
-                    idx = np.asarray(idx_attr, dtype=np.int32)
-                    counts = np.asarray(counts_attr, dtype=np.int32)
-                    cursor = 0
-                    tris = []
-                    for count in counts:
-                        poly = idx[cursor:cursor + count]
-                        cursor += count
-                        if count < 3:
-                            continue
-                        for j in range(1, count - 1):
-                            tris.append([poly[0], poly[j], poly[j + 1]])
-                    if not tris:
-                        continue
-                    all_points.append(pts)
-                    all_faces.append(np.asarray(tris, dtype=np.int32) + vert_offset)
-                    vert_offset += pts.shape[0]
+                    for j in range(1, count - 1):
+                        tris.append([poly[0], poly[j], poly[j + 1]])
+                if not tris:
+                    continue
+                all_points.append(pts.astype(np.float32))
+                all_faces.append(np.asarray(tris, dtype=np.int32) + vert_offset)
+                vert_offset += pts.shape[0]
 
             if not all_points:
                 raise RuntimeError(f"No Mesh children found under raycast path: {mesh_prim_path}")
@@ -875,9 +1240,14 @@ def _sample_first_env_lidar_points(base_env, max_points=800):
         return []
 
 
-def make_preview_obstacles(tree_spacing_m, seed, map_size=60.0, max_boxes=1200):
+def make_preview_obstacles(tree_spacing_m, seed, map_size=60.0, clear_radius=2.0, max_boxes=1200):
     """Preview real-tree instance positions as small top-down canopy boxes."""
-    positions = tree_positions_jittered_grid(map_size=map_size, spacing=float(tree_spacing_m), seed=seed)
+    positions = tree_positions_jittered_grid(
+        map_size=map_size,
+        spacing=float(tree_spacing_m),
+        seed=seed,
+        clear_radius=float(clear_radius),
+    )
     boxes = []
     for px, py in positions[:max_boxes]:
         boxes.append(
@@ -915,7 +1285,6 @@ def run_worker(args, hydra_overrides):
         f"seed={int(args.worker_seed)}",
         f"eval_num_envs={int(args.eval_num_envs)}",
         f"num_episodes={int(args.num_episodes)}",
-        f"max_steps={int(args.max_steps)}",
         f"++task.vlim={float(args.worker_speed)}",
         f"++task.vlim_train_min={float(args.vlim_train_min)}",
         f"++task.vlim_train_max={float(args.vlim_train_max)}",
@@ -926,6 +1295,8 @@ def run_worker(args, hydra_overrides):
         f"enable_viewport={'true' if isaacsim_view else 'false'}",
         "task.show_depth_preview_window=false",
     ]
+    if args.max_steps is not None:
+        overrides.append(f"max_steps={int(args.max_steps)}")
     if args.checkpoint_path:
         overrides.append(f"checkpoint_path={args.checkpoint_path}")
 
@@ -934,6 +1305,17 @@ def run_worker(args, hydra_overrides):
     OmegaConf.register_new_resolver("eval", eval, replace=True)
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+
+    if args.max_steps is None:
+        cfg_max_steps = None
+        if "env" in cfg:
+            cfg_max_steps = cfg.env.get("max_episode_length", None)
+        if cfg_max_steps is None:
+            cfg_max_steps = cfg.get("max_steps", None)
+        args.max_steps = int(cfg_max_steps if cfg_max_steps is not None else 1500)
+    else:
+        args.max_steps = int(args.max_steps)
+    cfg.max_steps = int(args.max_steps)
 
     requested_visible = _resolve_requested_cuda_visible(cfg, hydra_overrides)
 
@@ -952,12 +1334,19 @@ def run_worker(args, hydra_overrides):
     from omni_drones.utils.torchrl.transforms import FromDiscreteAction, FromMultiDiscreteAction, ravel_composite
 
     from play_camlidar import (
-        _inject_camlidar_backbone,
         _load_checkpoint_strictish,
         _preflight_runtime_checks,
         _resolve_checkpoint_path,
         _select_first_env_value,
     )
+
+    exploration_name = str(args.exploration_type).lower()
+    if exploration_name == "mode":
+        exploration_type = ExplorationType.MODE
+    elif exploration_name == "random":
+        exploration_type = ExplorationType.RANDOM
+    else:
+        raise ValueError(f"Unsupported exploration type: {args.exploration_type}")
 
     cfg.task.obstacles_per_tile = 0
     if "env" in cfg:
@@ -989,6 +1378,7 @@ def run_worker(args, hydra_overrides):
         float(args.worker_density),
         int(args.worker_seed),
         map_size=float(args.tree_map_size),
+        clear_radius=float(args.tree_clear_radius),
     )
     tree_count = len(preview_obstacles)
     start_time = time.time()
@@ -1055,7 +1445,7 @@ def run_worker(args, hydra_overrides):
             env.reward_spec,
             device=base_env.device,
         )
-        _inject_camlidar_backbone(policy, base_env, env, cfg)
+        _inject_canlidargate_backbone(policy, base_env, env, cfg)
         checkpoint_path = _resolve_checkpoint_path(cfg.get("checkpoint_path"))
         _load_checkpoint_strictish(policy, checkpoint_path, base_env.device)
         policy.eval()
@@ -1076,10 +1466,11 @@ def run_worker(args, hydra_overrides):
             episode_death_reasons = []
             latest_success_rate = 0.0
             trajectory = []
-            with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
+            with torch.no_grad(), set_exploration_type(exploration_type):
                 for ep in range(int(args.num_episodes)):
                     td = env.reset()
                     num_envs_eval = int(base_env.num_envs)
+                    ep_death_reasons = [None] * num_envs_eval
                     # Capture start / target positions for completion_pct
                     init_pos = base_env.drone.pos.detach().clone().reshape(num_envs_eval, 3)
                     target_pos = base_env.target_pos.detach().clone().reshape(num_envs_eval, 3)
@@ -1123,6 +1514,11 @@ def run_worker(args, hydra_overrides):
                         if just_finished.any():
                             final_positions[just_finished] = current_pos[just_finished]
                             finish_steps[just_finished] = step_count
+                            for e in torch.nonzero(just_finished, as_tuple=False).flatten().detach().cpu().tolist():
+                                try:
+                                    ep_death_reasons[int(e)] = _extract_death_reason_from_stats(stats_td, int(e))
+                                except Exception:
+                                    ep_death_reasons[int(e)] = "unknown"
 
                         if active.any():
                             ep_returns[active] += reward[active]
@@ -1179,6 +1575,9 @@ def run_worker(args, hydra_overrides):
                     if never_finished.any():
                         current_pos = base_env.drone.pos.detach().clone().reshape(num_envs_eval, 3)
                         final_positions[never_finished] = current_pos[never_finished]
+                        for e in torch.nonzero(never_finished, as_tuple=False).flatten().detach().cpu().tolist():
+                            if ep_death_reasons[int(e)] is None:
+                                ep_death_reasons[int(e)] = "timeout"
 
                     # Compute per-env completion_pct
                     final_dist = torch.norm(target_pos - final_positions, dim=-1)
@@ -1204,17 +1603,18 @@ def run_worker(args, hydra_overrides):
                         float(v) for v in episode_speeds_tensor[success_mask].detach().cpu().tolist()
                     )
 
-                # ---- extract death reasons from final stats ----
-                try:
-                    final_stats = td.get(("next", "stats"))
-                    if final_stats is not None:
-                        for e in range(num_envs_eval):
-                            episode_death_reasons.append(
-                                _extract_death_reason_from_stats(final_stats, e)
-                            )
-                except Exception:
-                    for _ in range(num_envs_eval):
-                        episode_death_reasons.append("unknown")
+                    # ---- extract/fill death reasons for this episode ----
+                    final_stats = _get_final_stats_from_td(td)
+                    for e in range(num_envs_eval):
+                        if ep_death_reasons[e] is None:
+                            if final_stats is None:
+                                ep_death_reasons[e] = "unknown"
+                            else:
+                                try:
+                                    ep_death_reasons[e] = _extract_death_reason_from_stats(final_stats, e)
+                                except Exception:
+                                    ep_death_reasons[e] = "unknown"
+                    episode_death_reasons.extend(ep_death_reasons)
 
             success_count = int(sum(episode_success))
             episode_count = int(len(episode_success))
@@ -1353,7 +1753,12 @@ def controller(args, hydra_overrides):
     print(f"[realtree sweep] tree obj: {Path(args.tree_ply).expanduser().resolve()}")
     print(f"[realtree sweep] output: {output_dir}")
     if args.dry_run:
-        dry_obstacles = make_preview_obstacles(densities[0], int(args.seed), map_size=float(args.tree_map_size)) if densities else []
+        dry_obstacles = make_preview_obstacles(
+            densities[0],
+            int(args.seed),
+            map_size=float(args.tree_map_size),
+            clear_radius=float(args.tree_clear_radius),
+        ) if densities else []
         write_json(
             live_state,
             {
@@ -1396,8 +1801,6 @@ def controller(args, hydra_overrides):
                     str(args.eval_num_envs),
                     "--num-episodes",
                     str(args.num_episodes),
-                    "--max-steps",
-                    str(args.max_steps),
                     "--web-update-interval",
                     str(args.web_update_interval),
                     "--view-mode",
@@ -1420,6 +1823,10 @@ def controller(args, hydra_overrides):
                     str(args.tree_tilt_deg),
                     "--tree-clear-radius",
                     str(args.tree_clear_radius),
+                    "--tree-max-faces-per-tree",
+                    str(args.tree_max_faces_per_tree),
+                    "--exploration-type",
+                    str(args.exploration_type),
                     "--vlim-train-min",
                     str(args.vlim_train_min),
                     "--vlim-train-max",
@@ -1431,6 +1838,10 @@ def controller(args, hydra_overrides):
                     "--worker-result",
                     str(result_path),
                 ]
+                if args.max_steps is not None:
+                    cmd += ["--max-steps", str(args.max_steps)]
+                if not args.tree_auto_upright:
+                    cmd += ["--no-tree-auto-upright"]
                 if not args.observe_vlim:
                     cmd += ["--no-observe-vlim"]
                 if args.vlim_randomize_eval:
@@ -1454,7 +1865,12 @@ def controller(args, hydra_overrides):
                             "obstacles_per_tile": density,
                             "tree_spacing_m": float(density),
                             "target_speed_mps": float(speed),
-                            "tree_count": len(make_preview_obstacles(density, seed, map_size=float(args.tree_map_size))),
+                            "tree_count": len(make_preview_obstacles(
+                                density,
+                                seed,
+                                map_size=float(args.tree_map_size),
+                                clear_radius=float(args.tree_clear_radius),
+                            )),
                             "trial": trial,
                             "seed": seed,
                             "success_rate": 0.0,
@@ -1492,14 +1908,24 @@ def controller(args, hydra_overrides):
                             "obstacles_per_tile": density,
                             "tree_spacing_m": float(density),
                             "target_speed_mps": float(speed),
-                            "tree_count": len(make_preview_obstacles(density, seed, map_size=float(args.tree_map_size))),
+                            "tree_count": len(make_preview_obstacles(
+                                density,
+                                seed,
+                                map_size=float(args.tree_map_size),
+                                clear_radius=float(args.tree_clear_radius),
+                            )),
                             "trial": 1,
                             "trials": int(args.trials),
                             "seed": seed,
                             "result": f"worker_exit_{proc.returncode}",
                             "trajectory": [],
                             "lidar_points": [],
-                            "obstacles": make_preview_obstacles(density, seed, map_size=float(args.tree_map_size)),
+                            "obstacles": make_preview_obstacles(
+                                density,
+                                seed,
+                                map_size=float(args.tree_map_size),
+                                clear_radius=float(args.tree_clear_radius),
+                            ),
                         },
                     )
                     print("[realtree sweep] stopped because worker failed; use --keep-going to continue after errors")
@@ -1513,7 +1939,7 @@ def controller(args, hydra_overrides):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="Evaluate an existing OmniDrones camera+LiDAR policy in a YOPO tree.ply real-tree forest.",
+        description="Evaluate an existing OmniDrones camera-gated camera+LiDAR policy in a YOPO tree_mesh.obj forest.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--tree-spacing-min", "--obstacles-per-tile-min", dest="obstacles_per_tile_min", type=int, default=4,
@@ -1526,12 +1952,17 @@ def parse_args(argv):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-num-envs", type=int, default=10)
     parser.add_argument("--num-episodes", type=int, default=3)
-    parser.add_argument("--max-steps", type=int, default=1500)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Maximum eval loop steps. Defaults to cfg.env.max_episode_length from the selected task.",
+    )
     parser.add_argument("--checkpoint-path", default=DEFAULT_VLIM_CHECKPOINT)
     parser.add_argument(
         "--policy-task",
         default=DEFAULT_POLICY_TASK,
-        help="Hydra task config used by the checkpoint; latest vlim checkpoint uses forest_lc.",
+        help="Hydra task config used by the checkpoint; train_canlidargate_trees.py uses forest_lc_gate.",
     )
     parser.add_argument("--speed", type=float, default=3.0, help="Fixed eval vlim / target speed value in m/s")
     parser.add_argument("--speed-min", type=float, default=None, help="Minimum eval vlim for a speed sweep")
@@ -1545,6 +1976,12 @@ def parse_args(argv):
                         help="Disable vlim in observation; keep enabled for latest vlim checkpoints")
     parser.add_argument("--vlim-randomize-eval", action="store_true",
                         help="Randomize vlim during evaluation resets instead of using --speed")
+    parser.add_argument(
+        "--exploration-type",
+        choices=["random", "mode"],
+        default="random",
+        help="Policy action selection. random matches the stochastic PPO train metric used by best-return checkpoints; mode is deterministic.",
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument(
         "--no-run-subdir",
@@ -1569,13 +2006,15 @@ def parse_args(argv):
                         help="Ignored in realtree mode; kept for CLI compatibility")
     parser.add_argument("--tree-ply", default=str(DEFAULT_TREE_OBJ),
                         help="Path to tree OBJ mesh file (default: YOPO tree_mesh.obj)")
-    parser.add_argument("--tree-map-size", type=float, default=60.0)
+    parser.add_argument("--tree-map-size", type=float, default=40.0)
     parser.add_argument("--tree-points-per-instance", type=int, default=320)
     parser.add_argument("--tree-surfel-size", type=float, default=0.08)
-    parser.add_argument("--tree-scale-min", type=float, default=0.5)
-    parser.add_argument("--tree-scale-max", type=float, default=1.0)
+    parser.add_argument("--tree-scale-min", type=float, default=0.4)
+    parser.add_argument("--tree-scale-max", type=float, default=0.6)
     parser.add_argument("--tree-tilt-deg", type=float, default=10.0)
     parser.add_argument("--tree-clear-radius", type=float, default=2.0)
+    parser.add_argument("--tree-max-faces-per-tree", type=int, default=20000)
+    parser.add_argument("--no-tree-auto-upright", dest="tree_auto_upright", action="store_false")
     parser.set_defaults(stop_on_error=True, run_subdir=True)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-density", type=int, default=40, help=argparse.SUPPRESS)
@@ -1584,7 +2023,7 @@ def parse_args(argv):
     parser.add_argument("--worker-seed", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--live-state", default="", help=argparse.SUPPRESS)
     parser.add_argument("--worker-result", default="", help=argparse.SUPPRESS)
-    parser.set_defaults(observe_vlim=True)
+    parser.set_defaults(observe_vlim=True, tree_auto_upright=True)
     args, hydra_overrides = parser.parse_known_args(argv)
     return args, hydra_overrides
 

@@ -17,7 +17,7 @@ warn_multi_env_camera_eval: true
 eval_num_envs: 30
 final_eval_rounds: 10
 num_episodes: 100
-max_steps: 1500
+max_steps: 5000
 print_every: 50
 
 # Supports either a .pt file or a directory. For a directory, checkpoint_final.pt

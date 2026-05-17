@@ -1,0 +1,20 @@
+{
+  "obstacles_per_tile": 6,
+  "tree_spacing_m": 6.0,
+  "target_speed_mps": 7.0,
+  "tree_count": 49,
+  "trial": 1,
+  "seed": 0,
+  "success_rate": 0.0,
+  "success_count": 0,
+  "episode_count": 0,
+  "mean_return": 0.0,
+  "mean_episode_len": 0.0,
+  "mean_completion_pct": 0.0,
+  "mean_arrival_time_s": null,
+  "mean_path_length_m": null,
+  "mean_speed_mps": null,
+  "death_reason": "",
+  "result": "error:RuntimeError:CUDA error: an illegal memory access was encountered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+  "duration_s": 23.992
+}

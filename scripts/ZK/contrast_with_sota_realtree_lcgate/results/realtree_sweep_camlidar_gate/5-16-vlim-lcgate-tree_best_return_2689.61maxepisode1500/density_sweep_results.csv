@@ -1,0 +1,10 @@
+obstacles_per_tile,tree_spacing_m,target_speed_mps,tree_count,trial,seed,success_rate,success_count,episode_count,mean_return,mean_episode_len,mean_completion_pct,mean_arrival_time_s,mean_path_length_m,mean_speed_mps,death_reason,result,duration_s
+6,6.0,1.0,45,1,0,0.0,0,50,2416.5441967773436,1425.48,44.1,,,,"timeout:46,z_low:4",ok,95.263
+6,6.0,2.0,45,1,0,0.76,38,50,2395.9388494873047,1198.92,73.2,27.708,41.742,1.507,"contact:1,flip:1,overspeed:1,success:36,z_low:11",ok,91.886
+6,6.0,3.0,45,1,0,0.82,41,50,1722.723656616211,804.86,71.1,19.206,39.098,2.048,"collision:1,flip:4,overspeed:4,success:34,z_low:7",ok,68.784
+6,6.0,4.0,45,1,0,0.72,36,50,1365.4149252319337,606.7,69.7,14.836,40.812,2.769,"collision:1,contact:1,flip:4,overspeed:3,success:31,z_low:10",ok,56.393
+6,6.0,5.0,45,1,0,0.62,31,50,1198.949328918457,498.3,70.2,11.644,41.909,3.606,"collision:1,contact:1,flip:2,out_of_bounds:1,overspeed:3,success:30,z_low:12",ok,40.267
+6,6.0,6.0,45,1,0,0.68,34,50,967.2362414550781,408.06,66.6,10.298,39.234,3.861,"contact:2,flip:1,out_of_bounds:4,overspeed:3,success:25,z_low:15",ok,42.045
+6,6.0,7.0,45,1,0,0.7,35,50,953.9399478149414,379.1,70.2,8.934,39.455,4.465,"flip:4,out_of_bounds:4,overspeed:3,success:27,z_low:12",ok,34.794
+6,6.0,8.0,45,1,0,0.48,24,50,700.0828984832764,292.42,59.3,7.792,39.892,5.174,"flip:1,out_of_bounds:5,overspeed:6,success:20,z_low:18",ok,30.771
+6,6.0,9.0,45,1,0,0.3,15,50,428.58605239868166,221.76,46.5,7.38,39.199,5.394,"collision:1,contact:3,flip:3,out_of_bounds:3,overspeed:11,success:12,z_low:17",ok,33.487
