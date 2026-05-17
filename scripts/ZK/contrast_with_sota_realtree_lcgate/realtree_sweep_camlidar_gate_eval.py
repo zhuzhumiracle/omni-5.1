@@ -40,6 +40,10 @@ class CanLiDARGateBackbone(torch.nn.Module):
         ku_value_max=20.0,
         output_dim=128,
         camera_h_fov_rad=None,
+        fov_pitch_range=None,
+        num_rows=1,
+        num_cols=3,
+        features_per_sector=4,
     ):
         super().__init__()
         if lidar_dim != 3200:
@@ -50,6 +54,11 @@ class CanLiDARGateBackbone(torch.nn.Module):
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.camera_risk_dim = int(camera_risk_dim)
+        self.num_rows = int(num_rows)
+        self.num_cols = int(num_cols)
+        self.features_per_sector = int(features_per_sector)
+        if self.num_rows < 1 or self.num_cols < 1:
+            raise ValueError(f"num_rows/num_cols must be >= 1, got {self.num_rows}×{self.num_cols}")
         self.ku_value_max = float(ku_value_max)
         if self.ku_value_max <= 0.0:
             raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
@@ -60,7 +69,11 @@ class CanLiDARGateBackbone(torch.nn.Module):
         if camera_h_fov_rad is None:
             camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
         self.camera_h_fov_rad = float(camera_h_fov_rad)
-        self._build_sector_column_masks()
+        if fov_pitch_range is None:
+            fov_pitch_range = (-math.pi / 2, math.pi / 2)
+        self.fov_pitch_min = float(fov_pitch_range[0])
+        self.fov_pitch_max = float(fov_pitch_range[1])
+        self._build_sector_2d_masks()
 
         self.ku_encoder = torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
@@ -86,9 +99,11 @@ class CanLiDARGateBackbone(torch.nn.Module):
             torch.nn.Linear(64, 64),
             torch.nn.ELU(),
         )
-        self.gate_head_L = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
-        self.gate_head_C = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
-        self.gate_head_R = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
+        total_sectors = self.num_rows * self.num_cols
+        self.gate_heads = torch.nn.ModuleList([
+            torch.nn.Sequential(torch.nn.Linear(self.features_per_sector, 1), torch.nn.Sigmoid())
+            for _ in range(total_sectors)
+        ])
 
         self.fusion_mlp = torch.nn.Sequential(
             torch.nn.Linear(64 + 128, 256),
@@ -99,18 +114,37 @@ class CanLiDARGateBackbone(torch.nn.Module):
             torch.nn.ELU(),
         )
 
-    def _build_sector_column_masks(self):
+    def _build_sector_2d_masks(self):
+        """Precompute 2D boolean masks [ku_h, ku_w] for each (row, col) sector."""
         h_fov = self.camera_h_fov_rad
+        p_min = self.fov_pitch_min
+        p_max = self.fov_pitch_max
+
         col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
         col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
-        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
-        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
-        self.register_buffer(
-            "_mask_C",
-            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
-            persistent=False,
+        row_pitches = (torch.arange(self.ku_h, dtype=torch.float32) + 0.5) / self.ku_h * math.pi - math.pi / 2.0
+
+        yaw_grid = col_yaws.unsqueeze(0).expand(self.ku_h, -1)
+        pitch_grid = row_pitches.unsqueeze(1).expand(-1, self.ku_w)
+
+        fov_mask = (
+            (yaw_grid >= -h_fov / 2.0) & (yaw_grid <= h_fov / 2.0)
+            & (pitch_grid >= p_min) & (pitch_grid <= p_max)
         )
-        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
+
+        self._sector_masks = torch.nn.ParameterList()
+        for ri in range(self.num_rows):
+            p_left = p_min + ri * (p_max - p_min) / self.num_rows
+            p_right = p_min + (ri + 1) * (p_max - p_min) / self.num_rows
+            for ci in range(self.num_cols):
+                y_left = -h_fov / 2.0 + ci * h_fov / self.num_cols
+                y_right = -h_fov / 2.0 + (ci + 1) * h_fov / self.num_cols
+                mask = (
+                    fov_mask
+                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (pitch_grid >= p_left) & (pitch_grid <= p_right)
+                )
+                self._sector_masks.append(torch.nn.Parameter(mask.bool(), requires_grad=False))
 
     def forward(self, obs):
         state = obs[..., :self.state_dim]
@@ -133,16 +167,14 @@ class CanLiDARGateBackbone(torch.nn.Module):
 
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)
-
-        gate_R = self.gate_head_R(sector_features[:, 0, :])
-        gate_C = self.gate_head_C(sector_features[:, 1, :])
-        gate_L = self.gate_head_L(sector_features[:, 2, :])
+        total_sectors = self.num_rows * self.num_cols
+        sector_feat_dim = total_sectors * self.features_per_sector
+        sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
-        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
+        for i in range(total_sectors):
+            gate_i = self.gate_heads[i](sector_features[:, i, :])
+            spatial_gate[:, :, :, self._sector_masks[i]] = gate_i.view(b, 1, 1, 1)
 
         lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
@@ -168,9 +200,20 @@ def _camera_h_fov_rad_from_cfg(cfg):
 def _inject_canlidargate_backbone(policy, base_env, env, cfg):
     obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
     lidar_dim = 3200
-    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 3)) * int(
-        cfg.task.get("camera_risk_features_per_bin", 4)
-    )
+    _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+    _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+    _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
+    if _num_rows <= 0 and _num_cols <= 0:
+        num_rows, num_cols = 1, _num_bins
+    elif _num_rows <= 0:
+        num_rows, num_cols = 1, _num_cols
+    elif _num_cols <= 0:
+        num_rows, num_cols = _num_rows, 1
+    else:
+        num_rows, num_cols = _num_rows, _num_cols
+    features_per_sector = int(cfg.task.get("camera_risk_features_per_bin", 4))
+    total_sectors = num_rows * num_cols
+    expected_camera_risk_dim = total_sectors * features_per_sector
     if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
         expected_camera_risk_dim += 1
 
@@ -190,6 +233,19 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
     expected_feature_dim = 128
     ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
     camera_h_fov_rad = _camera_h_fov_rad_from_cfg(cfg)
+    # Compute effective pitch range for 2D masks
+    focal = float(cfg.task.get("depth_camera_focal_length", 12.0))
+    v_aperture = float(cfg.task.get("depth_camera_vertical_aperture", 0.0))
+    depth_h_cfg = int(cfg.task.get("depth_resolution", [96, 160])[0])
+    if v_aperture <= 0:
+        h_aperture = float(cfg.task.get("depth_camera_horizontal_aperture", 20.955))
+        v_aperture = h_aperture * depth_h_cfg / max(1, int(cfg.task.get("depth_resolution", [96, 160])[1]))
+    camera_v_fov_rad = 2.0 * math.atan(v_aperture / (2.0 * focal))
+    _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
+    lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
+    lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
+    fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
+    fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
 
     actor_backbone = CanLiDARGateBackbone(
         state_dim=state_dim,
@@ -198,6 +254,10 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
         ku_value_max=ku_value_max,
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
+        fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+        num_rows=num_rows,
+        num_cols=num_cols,
+        features_per_sector=features_per_sector,
     ).to(base_env.device)
     critic_backbone = CanLiDARGateBackbone(
         state_dim=state_dim,
@@ -206,6 +266,10 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
         ku_value_max=ku_value_max,
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
+        fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+        num_rows=num_rows,
+        num_cols=num_cols,
+        features_per_sector=features_per_sector,
     ).to(base_env.device)
 
     actor_replaced = False
@@ -242,7 +306,8 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
     print(
         f"[+] train_canlidargate_trees-compatible backbone injected | "
         f"task={cfg.task.name}, state_dim={state_dim}, lidar_dim={lidar_dim}, "
-        f"camera_risk_dim={camera_risk_dim}, camera_h_fov_rad={camera_h_fov_rad:.4f}"
+        f"camera_risk_dim={camera_risk_dim}, grid={num_rows}×{num_cols}, "
+        f"camera_h_fov_rad={camera_h_fov_rad:.4f}"
     )
     return actor_backbone, critic_backbone
 

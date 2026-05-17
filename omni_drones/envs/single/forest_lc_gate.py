@@ -102,7 +102,23 @@ class forest_lc_gate(IsaacEnv):
 
         # ---------- camera risk observation config ----------
         self.use_camera_risk_observation = bool(cfg.task.get("use_camera_risk_observation", False))
-        self.camera_risk_num_bins = int(cfg.task.get("camera_risk_num_bins", 5))
+        # 2D grid layout: rows=pitch, cols=yaw.  Backward compat: old camera_risk_num_bins -> 1 row × N cols.
+        _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+        _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+        _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
+        if _num_rows <= 0 and _num_cols <= 0:
+            self.camera_risk_num_rows = 1
+            self.camera_risk_num_cols = _num_bins
+        elif _num_rows <= 0:
+            self.camera_risk_num_rows = 1
+            self.camera_risk_num_cols = _num_cols
+        elif _num_cols <= 0:
+            self.camera_risk_num_rows = _num_rows
+            self.camera_risk_num_cols = 1
+        else:
+            self.camera_risk_num_rows = _num_rows
+            self.camera_risk_num_cols = _num_cols
+        self.camera_risk_total_sectors = self.camera_risk_num_rows * self.camera_risk_num_cols
         self.camera_risk_features_per_bin = int(cfg.task.get("camera_risk_features_per_bin", 4))
         self.camera_risk_add_stale_ratio = bool(cfg.task.get("camera_risk_add_stale_ratio", True))
         self.camera_danger_dist = float(cfg.task.get("camera_danger_dist", 3.0))
@@ -110,7 +126,7 @@ class forest_lc_gate(IsaacEnv):
 
         # camera_risk_dim 必须在 super().__init__ 之前计算，_set_specs 在 super 里会用到
         self.camera_risk_dim = (
-            self.camera_risk_num_bins * self.camera_risk_features_per_bin
+            self.camera_risk_total_sectors * self.camera_risk_features_per_bin
             + (1 if self.camera_risk_add_stale_ratio else 0)
         )
 
@@ -1010,12 +1026,22 @@ class forest_lc_gate(IsaacEnv):
             (pitch_grid <= pitch_max)
         )
 
-        # Three front sectors — yaw>0 is left, yaw<0 is right
-        sector_masks = [
-            front_mask & (yaw_grid < -h_fov / 6.0),                                      # front-right
-            front_mask & (yaw_grid >= -h_fov / 6.0) & (yaw_grid <= h_fov / 6.0),          # front-center
-            front_mask & (yaw_grid > h_fov / 6.0),                                       # front-left
-        ]
+        # Dynamically divide camera FoV into a 2D grid: num_rows (pitch) × num_cols (yaw).
+        N_rows = max(1, self.camera_risk_num_rows)
+        N_cols = max(1, self.camera_risk_num_cols)
+        sector_masks = []
+        for ri in range(N_rows):
+            p_left = pitch_min + ri * (pitch_max - pitch_min) / N_rows
+            p_right = pitch_min + (ri + 1) * (pitch_max - pitch_min) / N_rows
+            for ci in range(N_cols):
+                y_left = -h_fov / 2.0 + ci * h_fov / N_cols
+                y_right = -h_fov / 2.0 + (ci + 1) * h_fov / N_cols
+                mask = (
+                    front_mask
+                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (pitch_grid >= p_left) & (pitch_grid <= p_right)
+                )
+                sector_masks.append(mask)
 
         sector_masks = [m.reshape(-1).unsqueeze(0).expand(E, -1) for m in sector_masks]
 

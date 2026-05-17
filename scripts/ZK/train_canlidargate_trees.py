@@ -593,7 +593,9 @@ def _read_depth_camera_geometry_from_stage(base_env):
 class DualStreamBackbone(torch.nn.Module):
     """
     三输入 backbone：state + LiDAR-KU + camera risk。
-    相机的 3 个前方扇区独立计算 gate，并在像素级调制对应 LiDAR KU 列。
+    相机前方 FoV 被均分为 num_rows (pitch) × num_cols (yaw) 个 2D 扇区，
+    每扇区独立计算 gate，在像素级调制对应 LiDAR KU 区域。
+    扇区布局由 camera_risk_num_rows / camera_risk_num_cols 单一控制。
     """
 
     def __init__(
@@ -604,6 +606,10 @@ class DualStreamBackbone(torch.nn.Module):
         ku_value_max=20.0,
         output_dim=128,
         camera_h_fov_rad=None,
+        fov_pitch_range=None,
+        num_rows=3,
+        num_cols=3,
+        features_per_sector=4,
     ):
         super().__init__()
         if lidar_dim != 3200:
@@ -614,6 +620,11 @@ class DualStreamBackbone(torch.nn.Module):
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.camera_risk_dim = int(camera_risk_dim)
+        self.num_rows = int(num_rows)
+        self.num_cols = int(num_cols)
+        self.features_per_sector = int(features_per_sector)
+        if self.num_rows < 1 or self.num_cols < 1:
+            raise ValueError(f"num_rows/num_cols must be >= 1, got {self.num_rows}×{self.num_cols}")
         self.ku_value_max = float(ku_value_max)
         if self.ku_value_max <= 0.0:
             raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
@@ -621,11 +632,20 @@ class DualStreamBackbone(torch.nn.Module):
 
         self.ku_h = 40
         self.ku_w = 80
+
+        # 相机水平 FoV（从环境配置传入）
         if camera_h_fov_rad is None:
             camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
         self.camera_h_fov_rad = float(camera_h_fov_rad)
-        self._build_sector_column_masks()
+        if fov_pitch_range is None:
+            fov_pitch_range = (-math.pi / 2, math.pi / 2)
+        self.fov_pitch_min = float(fov_pitch_range[0])
+        self.fov_pitch_max = float(fov_pitch_range[1])
 
+        # 预计算 2D 扇区掩码
+        self._build_sector_2d_masks()
+
+        # ================= 1. LiDAR-KU 编码分支 =================
         self.ku_encoder = torch.nn.Sequential(
             torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
             torch.nn.GroupNorm(4, 16),
@@ -644,16 +664,25 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.LeakyReLU(0.1, inplace=True),
         )
 
+        # ================= 2. 自身状态编码 =================
         self.state_encoder = torch.nn.Sequential(
             torch.nn.Linear(self.state_dim, 64),
             torch.nn.ELU(),
             torch.nn.Linear(64, 64),
             torch.nn.ELU(),
         )
-        self.gate_head_L = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
-        self.gate_head_C = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
-        self.gate_head_R = torch.nn.Sequential(torch.nn.Linear(4, 1), torch.nn.Sigmoid())
 
+        # ================= 3. 逐扇区空间 Gate 头 =================
+        total_sectors = self.num_rows * self.num_cols
+        self.gate_heads = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(self.features_per_sector, 1),
+                torch.nn.Sigmoid(),
+            )
+            for _ in range(total_sectors)
+        ])
+
+        # ================= 4. 最终融合 MLP =================
         self.fusion_mlp = torch.nn.Sequential(
             torch.nn.Linear(64 + 128, 256),
             torch.nn.ELU(),
@@ -663,20 +692,40 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.ELU(),
         )
 
-    def _build_sector_column_masks(self):
+    def _build_sector_2d_masks(self):
+        """Precompute 2D boolean masks [ku_h, ku_w] for each (row, col) sector."""
         h_fov = self.camera_h_fov_rad
+        p_min = self.fov_pitch_min
+        p_max = self.fov_pitch_max
+
         col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
         col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
-        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
-        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
-        self.register_buffer(
-            "_mask_C",
-            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
-            persistent=False,
+        row_pitches = (torch.arange(self.ku_h, dtype=torch.float32) + 0.5) / self.ku_h * math.pi - math.pi / 2.0
+
+        yaw_grid = col_yaws.unsqueeze(0).expand(self.ku_h, -1)
+        pitch_grid = row_pitches.unsqueeze(1).expand(-1, self.ku_w)
+
+        fov_mask = (
+            (yaw_grid >= -h_fov / 2.0) & (yaw_grid <= h_fov / 2.0)
+            & (pitch_grid >= p_min) & (pitch_grid <= p_max)
         )
-        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
+
+        self._sector_masks = torch.nn.ParameterList()
+        for ri in range(self.num_rows):
+            p_left = p_min + ri * (p_max - p_min) / self.num_rows
+            p_right = p_min + (ri + 1) * (p_max - p_min) / self.num_rows
+            for ci in range(self.num_cols):
+                y_left = -h_fov / 2.0 + ci * h_fov / self.num_cols
+                y_right = -h_fov / 2.0 + (ci + 1) * h_fov / self.num_cols
+                mask = (
+                    fov_mask
+                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (pitch_grid >= p_left) & (pitch_grid <= p_right)
+                )
+                self._sector_masks.append(torch.nn.Parameter(mask.bool(), requires_grad=False))
 
     def get_probe_params(self):
+        """Expose representative parameters for optimizer/gradient debug checks."""
         return {
             "ku_encoder": self.ku_encoder[0].weight,
             "fusion": self.fusion_mlp[0].weight,
@@ -703,18 +752,20 @@ class DualStreamBackbone(torch.nn.Module):
 
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)
 
-        gate_R = self.gate_head_R(sector_features[:, 0, :])
-        gate_C = self.gate_head_C(sector_features[:, 1, :])
-        gate_L = self.gate_head_L(sector_features[:, 2, :])
+        total_sectors = self.num_rows * self.num_cols
+        sector_feat_dim = total_sectors * self.features_per_sector
+        sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
-        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
+        for i in range(total_sectors):
+            gate_i = self.gate_heads[i](sector_features[:, i, :])
+            sector_mask = self._sector_masks[i]
+            if bool(sector_mask.any()):
+                spatial_gate[:, :, sector_mask] = gate_i.view(b, 1, 1)
 
         x_ku_gated = x_ku_raw * spatial_gate
+
         lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
 
@@ -1061,324 +1112,350 @@ def main(cfg):
             env_class = IsaacEnv.REGISTRY[cfg.task.name]
             base_env = env_class(cfg, headless=cfg.headless)
 
-        # Transforms.
-        transforms = [InitTracker()]
-        if cfg.task.get("ravel_obs", False):
-            transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation")))
-        if cfg.task.get("ravel_obs_central", False):
-            transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation_central")))
-        if (
-            cfg.task.get("flatten_intrinsics", True)
-            and ("agents", "intrinsics") in base_env.observation_spec.keys(True)
-            and isinstance(base_env.observation_spec[("agents", "intrinsics")], CompositeSpec)
-        ):
-            transforms.append(ravel_composite(base_env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
+            # Transforms.
+            transforms = [InitTracker()]
+            if cfg.task.get("ravel_obs", False):
+                transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation")))
+            if cfg.task.get("ravel_obs_central", False):
+                transforms.append(ravel_composite(base_env.observation_spec, ("agents", "observation_central")))
+            if (
+                cfg.task.get("flatten_intrinsics", True)
+                and ("agents", "intrinsics") in base_env.observation_spec.keys(True)
+                and isinstance(base_env.observation_spec[("agents", "intrinsics")], CompositeSpec)
+            ):
+                transforms.append(ravel_composite(base_env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
 
-        action_transform = cfg.task.get("action_transform", None)
-        if action_transform is not None:
-            action_transform = str(action_transform)
-            if action_transform.startswith("multidiscrete"):
-                transforms.append(FromMultiDiscreteAction(nbins=int(action_transform.split(":")[1])))
-            elif action_transform.startswith("discrete"):
-                transforms.append(FromDiscreteAction(nbins=int(action_transform.split(":")[1])))
-            else:
-                raise NotImplementedError(f"Unknown action transform: {action_transform}")
+            action_transform = cfg.task.get("action_transform", None)
+            if action_transform is not None:
+                action_transform = str(action_transform)
+                if action_transform.startswith("multidiscrete"):
+                    transforms.append(FromMultiDiscreteAction(nbins=int(action_transform.split(":")[1])))
+                elif action_transform.startswith("discrete"):
+                    transforms.append(FromDiscreteAction(nbins=int(action_transform.split(":")[1])))
+                else:
+                    raise NotImplementedError(f"Unknown action transform: {action_transform}")
 
-        env = TransformedEnv(base_env, Compose(*transforms)).train()
-        env.set_seed(cfg.seed)
+            env = TransformedEnv(base_env, Compose(*transforms)).train()
+            env.set_seed(cfg.seed)
 
-        # Policy.
-        try:
-            policy = ALGOS[cfg.algo.name.lower()](
-                cfg.algo, env.observation_spec, env.action_spec, env.reward_spec,
-                device=base_env.device,
-            )
-        except KeyError as exc:
-            raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}") from exc
-
-        # Inject DualStreamBackbone.
-        actor_lr = policy.actor_opt.param_groups[0]["lr"]
-        critic_lr = policy.critic_opt.param_groups[0]["lr"]
-
-        obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
-        lidar_dim = 3200
-        ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-        expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
-            cfg.task.get("camera_risk_features_per_bin", 4)
-        )
-        if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
-            expected_camera_risk_dim += 1
-        state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
-        camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
-
-        if state_dim <= 0 or camera_risk_dim <= 0:
-            raise RuntimeError(
-                f"Invalid observation split: obs_dim={obs_dim}, state_dim={state_dim}, "
-                f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}"
-            )
-        if camera_risk_dim != expected_camera_risk_dim:
-            logging.warning(
-                "camera_risk_dim=%d derived from observation, expected %d from config. "
-                "Using derived dimension to match the environment.",
-                camera_risk_dim,
-                expected_camera_risk_dim,
-            )
-
-        camera_geom = _read_depth_camera_geometry_from_stage(base_env)
-        fx = camera_geom["intrinsic_matrix"][0][0]
-        depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
-        camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
-        expected_feature_dim = 128
-
-        actor_backbone = DualStreamBackbone(
-            state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
-            ku_value_max=ku_value_max, output_dim=expected_feature_dim,
-            camera_h_fov_rad=camera_h_fov_rad,
-        ).to(base_env.device)
-        critic_backbone = DualStreamBackbone(
-            state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
-            ku_value_max=ku_value_max, output_dim=expected_feature_dim,
-            camera_h_fov_rad=camera_h_fov_rad,
-        ).to(base_env.device)
-
-        actor_replaced = False
-        critic_replaced = False
-        if hasattr(policy.actor, "module") and hasattr(policy.actor.module, "module"):
-            actor_core = policy.actor.module.module
-            if isinstance(actor_core, torch.nn.Sequential) and len(actor_core) > 0:
-                actor_core[0] = actor_backbone
-                actor_replaced = True
-        if not actor_replaced and hasattr(policy.actor, "module") and hasattr(policy.actor.module, "__getitem__"):
+            # Policy.
             try:
-                actor_td_module = policy.actor.module[0]
-                if hasattr(actor_td_module, "module") and isinstance(actor_td_module.module, torch.nn.Sequential):
-                    actor_td_module.module[0] = actor_backbone
+                policy = ALGOS[cfg.algo.name.lower()](
+                    cfg.algo, env.observation_spec, env.action_spec, env.reward_spec,
+                    device=base_env.device,
+                )
+            except KeyError as exc:
+                raise NotImplementedError(f"Unknown algorithm: {cfg.algo.name}") from exc
+
+            # Inject DualStreamBackbone.
+            actor_lr = policy.actor_opt.param_groups[0]["lr"]
+            critic_lr = policy.critic_opt.param_groups[0]["lr"]
+
+            obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
+            lidar_dim = 3200
+            ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
+            # 2D grid layout: rows=pitch, cols=yaw.  Backward compat: old camera_risk_num_bins -> 1 row × N cols.
+            _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+            _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+            _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
+            if _num_rows <= 0 and _num_cols <= 0:
+                num_rows, num_cols = 1, _num_bins
+            elif _num_rows <= 0:
+                num_rows, num_cols = 1, _num_cols
+            elif _num_cols <= 0:
+                num_rows, num_cols = _num_rows, 1
+            else:
+                num_rows, num_cols = _num_rows, _num_cols
+            features_per_sector = int(cfg.task.get("camera_risk_features_per_bin", 4))
+            total_sectors = num_rows * num_cols
+            expected_camera_risk_dim = total_sectors * features_per_sector
+            if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
+                expected_camera_risk_dim += 1
+            state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
+            camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
+
+            if state_dim <= 0 or camera_risk_dim <= 0:
+                raise RuntimeError(
+                    f"Invalid observation split: obs_dim={obs_dim}, state_dim={state_dim}, "
+                    f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}"
+                )
+            if camera_risk_dim != expected_camera_risk_dim:
+                logging.warning(
+                    "camera_risk_dim=%d derived from observation, expected %d from config. "
+                    "Using derived dimension to match the environment.",
+                    camera_risk_dim,
+                    expected_camera_risk_dim,
+                )
+
+            camera_geom = _read_depth_camera_geometry_from_stage(base_env)
+            fx = camera_geom["intrinsic_matrix"][0][0]
+            fy = camera_geom["intrinsic_matrix"][1][1]
+            depth_h_cfg = int(cfg.task.get("depth_resolution", [96, 160])[0])
+            depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
+            camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
+            camera_v_fov_rad = 2.0 * math.atan(depth_h_cfg / (2.0 * fy))
+            # Effective pitch range = camera vFoV ∩ LiDAR vFoV
+            _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
+            lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
+            lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
+            fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
+            fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
+            expected_feature_dim = 128
+
+            actor_backbone = DualStreamBackbone(
+                state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
+                ku_value_max=ku_value_max, output_dim=expected_feature_dim,
+                camera_h_fov_rad=camera_h_fov_rad,
+                fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+                num_rows=num_rows, num_cols=num_cols, features_per_sector=features_per_sector,
+            ).to(base_env.device)
+            critic_backbone = DualStreamBackbone(
+                state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
+                ku_value_max=ku_value_max, output_dim=expected_feature_dim,
+                camera_h_fov_rad=camera_h_fov_rad,
+                fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+                num_rows=num_rows, num_cols=num_cols, features_per_sector=features_per_sector,
+            ).to(base_env.device)
+
+            actor_replaced = False
+            critic_replaced = False
+            if hasattr(policy.actor, "module") and hasattr(policy.actor.module, "module"):
+                actor_core = policy.actor.module.module
+                if isinstance(actor_core, torch.nn.Sequential) and len(actor_core) > 0:
+                    actor_core[0] = actor_backbone
                     actor_replaced = True
-            except Exception:
-                pass
+            if not actor_replaced and hasattr(policy.actor, "module") and hasattr(policy.actor.module, "__getitem__"):
+                try:
+                    actor_td_module = policy.actor.module[0]
+                    if hasattr(actor_td_module, "module") and isinstance(actor_td_module.module, torch.nn.Sequential):
+                        actor_td_module.module[0] = actor_backbone
+                        actor_replaced = True
+                except Exception:
+                    pass
 
-        if hasattr(policy.critic, "module") and isinstance(policy.critic.module, torch.nn.Sequential):
-            policy.critic.module[0] = critic_backbone
-            critic_replaced = True
-        if not critic_replaced and hasattr(policy.critic, "module") and hasattr(policy.critic.module, "__getitem__"):
-            try:
-                critic_td_module = policy.critic.module[0]
-                if hasattr(critic_td_module, "module"):
-                    critic_td_module.module = critic_backbone
-                    critic_replaced = True
-            except Exception:
-                pass
+            if hasattr(policy.critic, "module") and isinstance(policy.critic.module, torch.nn.Sequential):
+                policy.critic.module[0] = critic_backbone
+                critic_replaced = True
+            if not critic_replaced and hasattr(policy.critic, "module") and hasattr(policy.critic.module, "__getitem__"):
+                try:
+                    critic_td_module = policy.critic.module[0]
+                    if hasattr(critic_td_module, "module"):
+                        critic_td_module.module = critic_backbone
+                        critic_replaced = True
+                except Exception:
+                    pass
 
-        if not actor_replaced or not critic_replaced:
-            raise RuntimeError(f"Backbone injection failed: actor={actor_replaced}, critic={critic_replaced}")
+            if not actor_replaced or not critic_replaced:
+                raise RuntimeError(f"Backbone injection failed: actor={actor_replaced}, critic={critic_replaced}")
 
-        def init_weights(m):
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, torch.nn.Conv2d):
-                torch.nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out", nonlinearity="leaky_relu")
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0.0)
+            def init_weights(m):
+                if isinstance(m, torch.nn.Linear):
+                    torch.nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+                    if m.bias is not None:
+                        torch.nn.init.constant_(m.bias, 0.0)
+                elif isinstance(m, torch.nn.Conv2d):
+                    torch.nn.init.kaiming_normal_(m.weight, a=0.1, mode="fan_out", nonlinearity="leaky_relu")
+                    if m.bias is not None:
+                        torch.nn.init.constant_(m.bias, 0.0)
 
-        actor_backbone.apply(init_weights)
-        critic_backbone.apply(init_weights)
-        policy.actor_opt = torch.optim.Adam(policy.actor.parameters(), lr=actor_lr)
-        policy.critic_opt = torch.optim.Adam(policy.critic.parameters(), lr=critic_lr)
+            actor_backbone.apply(init_weights)
+            critic_backbone.apply(init_weights)
+            policy.actor_opt = torch.optim.Adam(policy.actor.parameters(), lr=actor_lr)
+            policy.critic_opt = torch.optim.Adam(policy.critic.parameters(), lr=critic_lr)
 
-        print(
-            f"✅ Spatial-gate DualStreamBackbone injected: state_dim={state_dim}, lidar_dim={lidar_dim}, "
-            f"camera_risk_dim={camera_risk_dim}, camera_h_fov_rad={camera_h_fov_rad:.4f}, "
-            f"vlim={float(cfg.task.vlim):.3f}"
-        )
+            print(
+                f"✅ Spatial-gate DualStreamBackbone injected: state_dim={state_dim}, lidar_dim={lidar_dim}, "
+                f"camera_risk_dim={camera_risk_dim}, grid={num_rows}×{num_cols}, "
+                f"camera_h_fov_rad={camera_h_fov_rad:.4f}, "
+                f"vlim={float(cfg.task.vlim):.3f}"
+            )
 
-        # Optional warm start.
-        init_mode = str(cfg.get("init_mode", "scratch")).lower()
-        goodpt_path_cfg = str(cfg.get("goodpt_path", "")).strip()
-        if init_mode == "goodpt":
-            if not goodpt_path_cfg:
-                raise ValueError("init_mode=goodpt but goodpt_path is empty.")
-            resolved_ckpt_path = _resolve_goodpt_path(goodpt_path_cfg)
-            if os.path.exists(resolved_ckpt_path):
-                _load_policy_checkpoint_compatible(policy, resolved_ckpt_path, map_location=base_env.device)
-                logging.info("Loaded checkpoint: %s", resolved_ckpt_path)
-            else:
-                raise FileNotFoundError(f"goodpt checkpoint not found: {resolved_ckpt_path}")
+            # Optional warm start.
+            init_mode = str(cfg.get("init_mode", "scratch")).lower()
+            goodpt_path_cfg = str(cfg.get("goodpt_path", "")).strip()
+            if init_mode == "goodpt":
+                if not goodpt_path_cfg:
+                    raise ValueError("init_mode=goodpt but goodpt_path is empty.")
+                resolved_ckpt_path = _resolve_goodpt_path(goodpt_path_cfg)
+                if os.path.exists(resolved_ckpt_path):
+                    _load_policy_checkpoint_compatible(policy, resolved_ckpt_path, map_location=base_env.device)
+                    logging.info("Loaded checkpoint: %s", resolved_ckpt_path)
+                else:
+                    raise FileNotFoundError(f"goodpt checkpoint not found: {resolved_ckpt_path}")
 
-        # Training loop.
-        frames_per_batch = env.num_envs * int(cfg.algo.train_every)
-        total_frames = cfg.get("total_frames", -1)
-        if int(total_frames) > 0:
-            total_frames = int(total_frames) // frames_per_batch * frames_per_batch
-        max_iters = int(cfg.get("max_iters", -1))
-        eval_interval = int(cfg.get("eval_interval", -1))
-        save_interval = int(cfg.get("save_interval", -1))
-        max_return = -float("inf")
-        last_best_return_ckpt_path = None
+            # Training loop.
+            frames_per_batch = env.num_envs * int(cfg.algo.train_every)
+            total_frames = cfg.get("total_frames", -1)
+            if int(total_frames) > 0:
+                total_frames = int(total_frames) // frames_per_batch * frames_per_batch
+            max_iters = int(cfg.get("max_iters", -1))
+            eval_interval = int(cfg.get("eval_interval", -1))
+            save_interval = int(cfg.get("save_interval", -1))
+            max_return = -float("inf")
+            last_best_return_ckpt_path = None
 
-        stats_keys = [k for k in base_env.observation_spec.keys(True, True) if isinstance(k, tuple) and k[0] == "stats"]
-        episode_stats = EpisodeStats(stats_keys)
+            stats_keys = [k for k in base_env.observation_spec.keys(True, True) if isinstance(k, tuple) and k[0] == "stats"]
+            episode_stats = EpisodeStats(stats_keys)
 
-        collector = SyncDataCollector(
-            env, policy=policy, frames_per_batch=frames_per_batch,
-            total_frames=total_frames, device=cfg.sim.device, return_same_td=True,
-        )
+            collector = SyncDataCollector(
+                env, policy=policy, frames_per_batch=frames_per_batch,
+                total_frames=total_frames, device=cfg.sim.device, return_same_td=True,
+            )
 
-        pbar_iters = max_iters if max_iters > 0 else (total_frames // frames_per_batch if total_frames > 0 else None)
-        from tqdm import tqdm
-        pbar = tqdm(collector, total=pbar_iters, dynamic_ncols=True)
+            pbar_iters = max_iters if max_iters > 0 else (total_frames // frames_per_batch if total_frames > 0 else None)
+            from tqdm import tqdm
+            pbar = tqdm(collector, total=pbar_iters, dynamic_ncols=True)
 
-        env.train()
-        success_ema = None
-        return_ema = None
-        ema_alpha = float(cfg.get("train_metric_ema_alpha", 0.1))
-        for i, data in enumerate(pbar):
-            if max_iters > 0 and i >= max_iters:
-                break
+            env.train()
+            success_ema = None
+            return_ema = None
+            ema_alpha = float(cfg.get("train_metric_ema_alpha", 0.1))
+            for i, data in enumerate(pbar):
+                if max_iters > 0 and i >= max_iters:
+                    break
 
-            info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+                info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
+                run_dir = run.dir if run is not None else os.getcwd()
+                episode_stats.add(data.to_tensordict())
+
+                if len(episode_stats) > 0:
+                    for key, val in episode_stats.pop().items(True, True):
+                        try:
+                            key_name = ".".join(key) if isinstance(key, tuple) else key
+                            info[f"train/{key_name}"] = val.detach().float().mean().item()
+                        except (AttributeError, RuntimeError):
+                            pass
+
+                with torch.no_grad():
+                    actor_probe_before = {
+                        k: v.detach().clone() for k, v in actor_backbone.get_probe_params().items()
+                    }
+                    critic_probe_before = {
+                        k: v.detach().clone() for k, v in critic_backbone.get_probe_params().items()
+                    }
+
+                train_info = policy.train_op(data.to_tensordict())
+                info.update(train_info)
+
+                with torch.no_grad():
+                    actor_probe_after = actor_backbone.get_probe_params()
+                    critic_probe_after = critic_backbone.get_probe_params()
+                    actor_deltas = {
+                        k: (actor_probe_after[k].detach() - actor_probe_before[k]).abs().mean().item()
+                        for k in actor_probe_before
+                    }
+                    critic_deltas = {
+                        k: (critic_probe_after[k].detach() - critic_probe_before[k]).abs().mean().item()
+                        for k in critic_probe_before
+                    }
+                    for key, val in actor_deltas.items():
+                        info[f"debug/actor_delta_{key}"] = val
+                    for key, val in critic_deltas.items():
+                        info[f"debug/critic_delta_{key}"] = val
+                    info["debug/actor_backbone_delta"] = max(actor_deltas.values())
+                    info["debug/critic_backbone_delta"] = max(critic_deltas.values())
+
+                if "train/stats.success" in info:
+                    current_success = float(info["train/stats.success"])
+                    success_ema = current_success if success_ema is None else (
+                        ema_alpha * current_success + (1.0 - ema_alpha) * success_ema
+                    )
+                    info["train/stats.success_ema"] = success_ema
+                if "train/stats.return" in info:
+                    current_return_for_ema = float(info["train/stats.return"])
+                    return_ema = current_return_for_ema if return_ema is None else (
+                        ema_alpha * current_return_for_ema + (1.0 - ema_alpha) * return_ema
+                    )
+                    info["train/stats.return_ema"] = return_ema
+
+                if "train/stats.return" in info:
+                    current_return = float(info["train/stats.return"])
+                    if current_return > max_return:
+                        max_return = current_return
+                        try:
+                            ckpt_path = os.path.join(run_dir, f"checkpoint_best_return_{max_return:.2f}.pt")
+                            torch.save({"model_state_dict": policy.state_dict()}, ckpt_path)
+                            info["best_return"] = max_return
+                            info["best_return_checkpoint_path"] = ckpt_path
+                            logging.info("Saved best-return checkpoint to %s", ckpt_path)
+                            if last_best_return_ckpt_path is not None and last_best_return_ckpt_path != ckpt_path:
+                                try:
+                                    if os.path.exists(last_best_return_ckpt_path):
+                                        os.remove(last_best_return_ckpt_path)
+                                except OSError:
+                                    pass
+                            last_best_return_ckpt_path = ckpt_path
+                        except AttributeError:
+                            logging.warning("Policy %s does not implement `.state_dict()`", policy)
+
+                if eval_interval > 0 and (i + 1) % eval_interval == 0:
+                    info.update(
+                        _evaluate(
+                            env,
+                            policy,
+                            base_env,
+                            cfg,
+                            run_dir=run.dir if run is not None else None,
+                            step_frames=collector._frames,
+                        )
+                    )
+
+                if save_interval > 0 and (i + 1) % save_interval == 0:
+                    ckpt_path = os.path.join(run_dir, f"checkpoint_step_{collector._frames}.pt")
+                    torch.save({"model_state_dict": policy.state_dict()}, ckpt_path)
+                    info["checkpoint_path"] = ckpt_path
+
+                if run is not None:
+                    run.log(info)
+
+                info_str = f"frames={collector._frames}"
+                if "train/stats.return" in info:
+                    info_str += f" return={info['train/stats.return']:.2f}"
+                if "train/stats.success" in info:
+                    info_str += f" success={info['train/stats.success']:.2f}"
+                if "eval/success_rate" in info:
+                    info_str += f" eval_success={info['eval/success_rate']:.2f}"
+                pbar.set_description(info_str)
+
             run_dir = run.dir if run is not None else os.getcwd()
-            episode_stats.add(data.to_tensordict())
-
-            if len(episode_stats) > 0:
-                for key, val in episode_stats.pop().items(True, True):
-                    try:
-                        key_name = ".".join(key) if isinstance(key, tuple) else key
-                        info[f"train/{key_name}"] = val.detach().float().mean().item()
-                    except (AttributeError, RuntimeError):
-                        pass
-
-            with torch.no_grad():
-                actor_probe_before = {
-                    k: v.detach().clone() for k, v in actor_backbone.get_probe_params().items()
-                }
-                critic_probe_before = {
-                    k: v.detach().clone() for k, v in critic_backbone.get_probe_params().items()
-                }
-
-            train_info = policy.train_op(data.to_tensordict())
-            info.update(train_info)
-
-            with torch.no_grad():
-                actor_probe_after = actor_backbone.get_probe_params()
-                critic_probe_after = critic_backbone.get_probe_params()
-                actor_deltas = {
-                    k: (actor_probe_after[k].detach() - actor_probe_before[k]).abs().mean().item()
-                    for k in actor_probe_before
-                }
-                critic_deltas = {
-                    k: (critic_probe_after[k].detach() - critic_probe_before[k]).abs().mean().item()
-                    for k in critic_probe_before
-                }
-                for key, val in actor_deltas.items():
-                    info[f"debug/actor_delta_{key}"] = val
-                for key, val in critic_deltas.items():
-                    info[f"debug/critic_delta_{key}"] = val
-                info["debug/actor_backbone_delta"] = max(actor_deltas.values())
-                info["debug/critic_backbone_delta"] = max(critic_deltas.values())
-
-            if "train/stats.success" in info:
-                current_success = float(info["train/stats.success"])
-                success_ema = current_success if success_ema is None else (
-                    ema_alpha * current_success + (1.0 - ema_alpha) * success_ema
-                )
-                info["train/stats.success_ema"] = success_ema
-            if "train/stats.return" in info:
-                current_return_for_ema = float(info["train/stats.return"])
-                return_ema = current_return_for_ema if return_ema is None else (
-                    ema_alpha * current_return_for_ema + (1.0 - ema_alpha) * return_ema
-                )
-                info["train/stats.return_ema"] = return_ema
-
-            if "train/stats.return" in info:
-                current_return = float(info["train/stats.return"])
-                if current_return > max_return:
-                    max_return = current_return
-                    try:
-                        ckpt_path = os.path.join(run_dir, f"checkpoint_best_return_{max_return:.2f}.pt")
-                        torch.save({"model_state_dict": policy.state_dict()}, ckpt_path)
-                        info["best_return"] = max_return
-                        info["best_return_checkpoint_path"] = ckpt_path
-                        logging.info("Saved best-return checkpoint to %s", ckpt_path)
-                        if last_best_return_ckpt_path is not None and last_best_return_ckpt_path != ckpt_path:
-                            try:
-                                if os.path.exists(last_best_return_ckpt_path):
-                                    os.remove(last_best_return_ckpt_path)
-                            except OSError:
-                                pass
-                        last_best_return_ckpt_path = ckpt_path
-                    except AttributeError:
-                        logging.warning("Policy %s does not implement `.state_dict()`", policy)
-
-            if eval_interval > 0 and (i + 1) % eval_interval == 0:
-                info.update(
-                    _evaluate(
-                        env,
-                        policy,
-                        base_env,
-                        cfg,
-                        run_dir=run.dir if run is not None else None,
-                        step_frames=collector._frames,
+            final_eval_enabled = bool(cfg.get("final_eval", True))
+            if run is not None and final_eval_enabled:
+                try:
+                    logging.info("Final Eval at %s steps.", collector._frames)
+                    final_info = {"env_frames": collector._frames}
+                    final_info.update(
+                        _evaluate(
+                            env,
+                            policy,
+                            base_env,
+                            cfg,
+                            run_dir=run_dir,
+                            step_frames=collector._frames,
+                        )
                     )
-                )
+                    run.log(final_info)
+                except Exception as exc:
+                    logging.warning("Final evaluation skipped: %s", exc)
 
-            if save_interval > 0 and (i + 1) % save_interval == 0:
-                ckpt_path = os.path.join(run_dir, f"checkpoint_step_{collector._frames}.pt")
-                torch.save({"model_state_dict": policy.state_dict()}, ckpt_path)
-                info["checkpoint_path"] = ckpt_path
-
+            final_ckpt = os.path.join(run_dir, "checkpoint_final.pt")
+            torch.save({"model_state_dict": policy.state_dict()}, final_ckpt)
             if run is not None:
-                run.log(info)
+                try:
+                    import wandb
 
-            info_str = f"frames={collector._frames}"
-            if "train/stats.return" in info:
-                info_str += f" return={info['train/stats.return']:.2f}"
-            if "train/stats.success" in info:
-                info_str += f" success={info['train/stats.success']:.2f}"
-            if "eval/success_rate" in info:
-                info_str += f" eval_success={info['eval/success_rate']:.2f}"
-            pbar.set_description(info_str)
-
-        run_dir = run.dir if run is not None else os.getcwd()
-        final_eval_enabled = bool(cfg.get("final_eval", True))
-        if run is not None and final_eval_enabled:
-            try:
-                logging.info("Final Eval at %s steps.", collector._frames)
-                final_info = {"env_frames": collector._frames}
-                final_info.update(
-                    _evaluate(
-                        env,
-                        policy,
-                        base_env,
-                        cfg,
-                        run_dir=run_dir,
-                        step_frames=collector._frames,
+                    artifact_name = f"{cfg.task.name}-{cfg.algo.name.lower()}"
+                    model_artifact = wandb.Artifact(
+                        artifact_name,
+                        type="model",
+                        description=artifact_name,
+                        metadata=OmegaConf.to_container(cfg, resolve=True),
                     )
-                )
-                run.log(final_info)
-            except Exception as exc:
-                logging.warning("Final evaluation skipped: %s", exc)
-
-        final_ckpt = os.path.join(run_dir, "checkpoint_final.pt")
-        torch.save({"model_state_dict": policy.state_dict()}, final_ckpt)
-        if run is not None:
-            try:
-                import wandb
-
-                artifact_name = f"{cfg.task.name}-{cfg.algo.name.lower()}"
-                model_artifact = wandb.Artifact(
-                    artifact_name,
-                    type="model",
-                    description=artifact_name,
-                    metadata=OmegaConf.to_container(cfg, resolve=True),
-                )
-                model_artifact.add_file(final_ckpt)
-                wandb.save(final_ckpt)
-                run.log_artifact(model_artifact)
-            except Exception as exc:
-                logging.warning("Failed to upload checkpoint artifact to wandb: %s", exc)
-        print(f"Training done. Final checkpoint: {final_ckpt}")
+                    model_artifact.add_file(final_ckpt)
+                    wandb.save(final_ckpt)
+                    run.log_artifact(model_artifact)
+                except Exception as exc:
+                    logging.warning("Failed to upload checkpoint artifact to wandb: %s", exc)
+            print(f"Training done. Final checkpoint: {final_ckpt}")
 
     finally:
         if run is not None:

@@ -39,9 +39,9 @@ from torchrl.envs.transforms import TransformedEnv, InitTracker, Compose
 class DualStreamBackbone(torch.nn.Module):
     """
     三输入 backbone：state + LiDAR-KU + camera risk。
-    LiDAR 是主导航模态，camera risk 通过空间 Gate 在像素级调制 LiDAR KU 图。
-    相机的 3 个前方扇区（左/中/右）各自独立计算 gate，只作用于对应空间区域。
-    FoV 外的 LiDAR 区域 gate=1，不受相机影响。
+    相机前方 FoV 被均分为 num_rows (pitch) × num_cols (yaw) 个 2D 扇区，
+    每扇区独立计算 gate，在像素级调制对应 LiDAR KU 区域。
+    扇区布局由 camera_risk_num_rows / camera_risk_num_cols 单一控制。
     """
 
     def __init__(
@@ -52,6 +52,10 @@ class DualStreamBackbone(torch.nn.Module):
         ku_value_max=20.0,
         output_dim=128,
         camera_h_fov_rad=None,
+        fov_pitch_range=None,
+        num_rows=1,
+        num_cols=3,
+        features_per_sector=4,
     ):
         super().__init__()
         if lidar_dim != 3200:
@@ -62,6 +66,11 @@ class DualStreamBackbone(torch.nn.Module):
         self.state_dim = int(state_dim)
         self.lidar_dim = int(lidar_dim)
         self.camera_risk_dim = int(camera_risk_dim)
+        self.num_rows = int(num_rows)
+        self.num_cols = int(num_cols)
+        self.features_per_sector = int(features_per_sector)
+        if self.num_rows < 1 or self.num_cols < 1:
+            raise ValueError(f"num_rows/num_cols must be >= 1, got {self.num_rows}×{self.num_cols}")
         self.ku_value_max = float(ku_value_max)
         if self.ku_value_max <= 0.0:
             raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
@@ -72,12 +81,15 @@ class DualStreamBackbone(torch.nn.Module):
 
         # 相机水平 FoV（从环境配置传入）
         if camera_h_fov_rad is None:
-            # 默认：深度相机 ~96° 水平 FoV（160px / fx≈320px 的典型值）
             camera_h_fov_rad = 2.0 * math.atan(160.0 / (2.0 * 320.0))
         self.camera_h_fov_rad = float(camera_h_fov_rad)
+        if fov_pitch_range is None:
+            fov_pitch_range = (-math.pi / 2, math.pi / 2)
+        self.fov_pitch_min = float(fov_pitch_range[0])
+        self.fov_pitch_max = float(fov_pitch_range[1])
 
-        # 预计算 3 前方扇区的列掩码
-        self._build_sector_column_masks()
+        # 预计算 2D 扇区掩码
+        self._build_sector_2d_masks()
 
         # ================= 1. LiDAR-KU 编码分支 =================
         self.ku_encoder = torch.nn.Sequential(
@@ -107,22 +119,16 @@ class DualStreamBackbone(torch.nn.Module):
         )
 
         # ================= 3. 逐扇区空间 Gate 头 =================
-        # 3 个独立轻量门控头，每个将 4 维扇区风险映射为一个标量 gate ∈ [0,1]
-        self.gate_head_L = torch.nn.Sequential(
-            torch.nn.Linear(4, 1),
-            torch.nn.Sigmoid(),
-        )
-        self.gate_head_C = torch.nn.Sequential(
-            torch.nn.Linear(4, 1),
-            torch.nn.Sigmoid(),
-        )
-        self.gate_head_R = torch.nn.Sequential(
-            torch.nn.Linear(4, 1),
-            torch.nn.Sigmoid(),
-        )
+        total_sectors = self.num_rows * self.num_cols
+        self.gate_heads = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                torch.nn.Linear(self.features_per_sector, 1),
+                torch.nn.Sigmoid(),
+            )
+            for _ in range(total_sectors)
+        ])
 
         # ================= 4. 最终融合 MLP =================
-        # state_z(64) + lidar_z(128) = 192
         self.fusion_mlp = torch.nn.Sequential(
             torch.nn.Linear(64 + 128, 256),
             torch.nn.ELU(),
@@ -132,22 +138,37 @@ class DualStreamBackbone(torch.nn.Module):
             torch.nn.ELU(),
         )
 
-    def _build_sector_column_masks(self):
-        """预计算 [40,80] LiDAR KU 网格中属于前方左/中/右扇区的列索引。"""
+    def _build_sector_2d_masks(self):
+        """Precompute 2D boolean masks [ku_h, ku_w] for each (row, col) sector."""
         h_fov = self.camera_h_fov_rad
+        p_min = self.fov_pitch_min
+        p_max = self.fov_pitch_max
 
-        # 80 列覆盖 360°: [-π, π]，列中心方位角
         col_yaws = (torch.arange(self.ku_w, dtype=torch.float32) + 0.5) / self.ku_w * 2.0 * math.pi
         col_yaws = torch.remainder(col_yaws + math.pi, 2.0 * math.pi) - math.pi
+        row_pitches = (torch.arange(self.ku_h, dtype=torch.float32) + 0.5) / self.ku_h * math.pi - math.pi / 2.0
 
-        fov_mask = (col_yaws >= -h_fov / 2.0) & (col_yaws <= h_fov / 2.0)
-        self.register_buffer("_mask_L", (fov_mask & (col_yaws > h_fov / 6.0)).bool(), persistent=False)
-        self.register_buffer(
-            "_mask_C",
-            (fov_mask & (col_yaws >= -h_fov / 6.0) & (col_yaws <= h_fov / 6.0)).bool(),
-            persistent=False,
+        yaw_grid = col_yaws.unsqueeze(0).expand(self.ku_h, -1)
+        pitch_grid = row_pitches.unsqueeze(1).expand(-1, self.ku_w)
+
+        fov_mask = (
+            (yaw_grid >= -h_fov / 2.0) & (yaw_grid <= h_fov / 2.0)
+            & (pitch_grid >= p_min) & (pitch_grid <= p_max)
         )
-        self.register_buffer("_mask_R", (fov_mask & (col_yaws < -h_fov / 6.0)).bool(), persistent=False)
+
+        self._sector_masks = torch.nn.ParameterList()
+        for ri in range(self.num_rows):
+            p_left = p_min + ri * (p_max - p_min) / self.num_rows
+            p_right = p_min + (ri + 1) * (p_max - p_min) / self.num_rows
+            for ci in range(self.num_cols):
+                y_left = -h_fov / 2.0 + ci * h_fov / self.num_cols
+                y_right = -h_fov / 2.0 + (ci + 1) * h_fov / self.num_cols
+                mask = (
+                    fov_mask
+                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (pitch_grid >= p_left) & (pitch_grid <= p_right)
+                )
+                self._sector_masks.append(torch.nn.Parameter(mask.bool(), requires_grad=False))
 
     def get_probe_params(self):
         """Expose representative parameters for optimizer/gradient debug checks."""
@@ -157,7 +178,6 @@ class DualStreamBackbone(torch.nn.Module):
         }
 
     def forward(self, obs):
-        # obs: [*, state_dim + lidar_ku(3200) + camera_risk(camera_risk_dim)]
         state = obs[..., :self.state_dim]
         x_ku_flat = obs[..., self.state_dim:self.state_dim + self.lidar_dim]
         camera_risk_start = self.state_dim + self.lidar_dim
@@ -167,7 +187,6 @@ class DualStreamBackbone(torch.nn.Module):
         batch_shape = state.shape[:-1]
         b = int(math.prod(batch_shape)) if len(batch_shape) > 0 else 1
 
-        # ---------- LiDAR-KU 预处理 ----------
         x_ku_raw = x_ku_flat.reshape(b, 1, self.ku_h, self.ku_w)
         x_ku_raw = torch.nan_to_num(
             x_ku_raw,
@@ -177,35 +196,26 @@ class DualStreamBackbone(torch.nn.Module):
         )
         x_ku_raw = torch.clamp(x_ku_raw, 0.0, self.ku_unknown_value)
 
-        # ---------- 空间 Gate：相机风险逐扇区调制 LiDAR KU ----------
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-        # 取前 12 维 = 3 扇区 × 4 特征，环境输出顺序为 right / center / left。
-        sector_features = camera_risk_2d[:, :12].reshape(b, 3, 4)  # [B, 3, 4]
+        total_sectors = self.num_rows * self.num_cols
+        sector_feat_dim = total_sectors * self.features_per_sector
+        sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
-        gate_R = self.gate_head_R(sector_features[:, 0, :])  # [B, 1]
-        gate_C = self.gate_head_C(sector_features[:, 1, :])  # [B, 1]
-        gate_L = self.gate_head_L(sector_features[:, 2, :])  # [B, 1]
-
-        # 构建空间 gate 图：FoV 外 = 1.0（不调制），FoV 内各扇区用对应的 gate 值
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
-        spatial_gate[:, :, :, self._mask_L] = gate_L.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_C] = gate_C.view(b, 1, 1, 1)
-        spatial_gate[:, :, :, self._mask_R] = gate_R.view(b, 1, 1, 1)
+        for i in range(total_sectors):
+            gate_i = self.gate_heads[i](sector_features[:, i, :])
+            spatial_gate[:, :, :, self._sector_masks[i]] = gate_i.view(b, 1, 1, 1)
 
-        # LiDAR KU × 空间 gate（逐像素乘法）
         x_ku_gated = x_ku_raw * spatial_gate
 
-        # ---------- LiDAR-KU 编码 ----------
         lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
 
-        # ---------- 自身状态编码 ----------
         state_2d = state.reshape(b, self.state_dim)
         state_z = self.state_encoder(state_2d)
 
-        # ---------- 最终融合 ----------
         fused = torch.cat([state_z, lidar_z], dim=-1)
         out = self.fusion_mlp(fused)
         return out.reshape(*batch_shape, -1)
@@ -682,9 +692,20 @@ def main(cfg):
             "This script expects observation=[state, lidar_ku(3200), camera_risk]. "
             "Ensure use_camera_risk_observation=true and use_depth_ku_observation=false."
         )
-    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
-        cfg.task.get("camera_risk_features_per_bin", 4)
-    )
+    # Compute grid layout before expected_camera_risk_dim check
+    _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+    _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+    _num_bins = int(cfg.task.get("camera_risk_num_bins", 5))
+    if _num_rows <= 0 and _num_cols <= 0:
+        _grid_rows, _grid_cols = 1, _num_bins
+    elif _num_rows <= 0:
+        _grid_rows, _grid_cols = 1, _num_cols
+    elif _num_cols <= 0:
+        _grid_rows, _grid_cols = _num_rows, 1
+    else:
+        _grid_rows, _grid_cols = _num_rows, _num_cols
+    _features_per_sector = int(cfg.task.get("camera_risk_features_per_bin", 4))
+    expected_camera_risk_dim = _grid_rows * _grid_cols * _features_per_sector
     if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
         expected_camera_risk_dim += 1
     if camera_risk_dim != expected_camera_risk_dim:
@@ -697,10 +718,31 @@ def main(cfg):
     expected_feature_dim = 128
     camera_geom = _read_depth_camera_geometry_from_stage(base_env)
 
-    # 从深度相机内参计算水平 FoV
+    # 从深度相机内参计算水平/垂直 FoV
     fx = camera_geom["intrinsic_matrix"][0][0]
+    fy = camera_geom["intrinsic_matrix"][1][1]
+    depth_h_cfg = int(cfg.task.get("depth_resolution", [96, 160])[0])
     depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
     camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
+    camera_v_fov_rad = 2.0 * math.atan(depth_h_cfg / (2.0 * fy))
+    _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
+    lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
+    lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
+    fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
+    fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
+
+    _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+    _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+    _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
+    if _num_rows <= 0 and _num_cols <= 0:
+        num_rows, num_cols = 1, _num_bins
+    elif _num_rows <= 0:
+        num_rows, num_cols = 1, _num_cols
+    elif _num_cols <= 0:
+        num_rows, num_cols = _num_rows, 1
+    else:
+        num_rows, num_cols = _num_rows, _num_cols
+    features_per_sector = int(cfg.task.get("camera_risk_features_per_bin", 4))
 
     actor_backbone = DualStreamBackbone(
         state_dim=state_dim,
@@ -709,6 +751,10 @@ def main(cfg):
         ku_value_max=ku_value_max,
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
+        fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+        num_rows=num_rows,
+        num_cols=num_cols,
+        features_per_sector=features_per_sector,
     ).to(base_env.device)
 
     critic_backbone = DualStreamBackbone(
@@ -718,6 +764,10 @@ def main(cfg):
         ku_value_max=ku_value_max,
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
+        fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+        num_rows=num_rows,
+        num_cols=num_cols,
+        features_per_sector=features_per_sector,
     ).to(base_env.device)
 
     print("type(policy.actor) =", type(policy.actor))
