@@ -112,16 +112,33 @@ topdown_lookat_z: 0.0
 reward_effort_weight: 0.1
 
 # ===== curriculum stage-1 (easy) =====
-goal_radius: 7 #7.0
+goal_radius: 4 #7.0
 goal_bonus: 2000 #2000
-collision_dist: 0.1 #0.1 0.5
+collision_dist: 0.25 #0.1 0.5 0.1
 collision_penalty: -5.0 #-30 -20
+
+# Start/goal corridor. Forest remains controlled by eval/train tree_map_size;
+# this only controls the drone task geometry.
+start_x_min: -5.0
+start_x_max: 5.0
+start_y: -24.0
+target_y: 24.0
+flight_z: 2.0
+target_x_mode: match_start # match_start | range | zero
+target_x_min: -5.0
+target_x_max: 5.0
+
+# Soft boundary penalty starts 10m before death. At/over the limit, episode terminates.
+boundary_x_limit: 20.0
+boundary_x_soft_start: 10.0
+boundary_y_limit: 40.0
+boundary_y_soft_start: 30.0
 
 # 分段里程碑奖励：按路程比例触发一次性奖励。
 # 当 milestone_segments=3 且 milestone_include_goal_segment=false 时，阈值为 1/3、2/3。
 milestone_segments: 10 #5
 milestone_include_goal_segment: false
-milestone_mid_reward: 1000 #1000
+milestone_mid_reward: 700 #1000
 # 每段奖励 = milestone_mid_reward * 对应百分比 / 100
 # 下面示例表示：第1段 100%，第2段 160%
 milestone_reward_percents: [50, 40, 30, 30, 20, 20, 20, 20, 20] #5个20
@@ -137,16 +154,17 @@ v_max_reward: 9.0
 v_max_reward_ratio: 1.0
 z_min: 1
 z_max: 6
-lambda_esdf: 0.5 
-k_esdf: 1.6 #1.6
+lambda_esdf: 0.8 #0.5
+k_esdf: 2.2 #1.6
 
 w_forward: 10 # 3 30 6 10
-w_smooth: -0.3 #-0.5 --0.3
+w_smooth: -0.5 #-0.5 --0.3
 w_max_speed: -0.5 #-0.1 -0.5
-w_z: -2 #-2
-w_esdf: 1 # 2 1
-w_yaw: 0.3 #0.3
+w_z: -3 #-2
+w_esdf: 1.5 # 2 1
+w_yaw: 0.5 #0.3
 w_thrust: -0.1
+w_boundary: -5.0
 # 延迟型时间惩罚：只惩罚“过了宽限期仍缺少路程进度”的拖延行为。
 # 30s episode 中 12s 后平滑启动，进度越高惩罚越弱，避免误伤慢速避障。
 w_time: 1.0

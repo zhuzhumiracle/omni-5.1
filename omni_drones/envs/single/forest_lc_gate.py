@@ -208,6 +208,27 @@ class forest_lc_gate(IsaacEnv):
         self.collision_force_threshold = float(cfg.task.get("collision_force_threshold", 1.0))
         self.flip_tilt_deg = float(cfg.task.get("flip_tilt_deg", 80.0))
         self.flip_consecutive_steps = int(cfg.task.get("flip_consecutive_steps", 10))
+        self.start_x_min = float(cfg.task.get("start_x_min", -5.0))
+        self.start_x_max = float(cfg.task.get("start_x_max", 5.0))
+        self.start_y = float(cfg.task.get("start_y", -24.0))
+        self.target_y = float(cfg.task.get("target_y", 24.0))
+        self.flight_z = float(cfg.task.get("flight_z", 2.0))
+        self.target_x_mode = str(cfg.task.get("target_x_mode", "match_start")).lower()
+        self.target_x_min = float(cfg.task.get("target_x_min", self.start_x_min))
+        self.target_x_max = float(cfg.task.get("target_x_max", self.start_x_max))
+        if self.start_x_max < self.start_x_min:
+            raise ValueError(
+                f"start_x_max ({self.start_x_max}) must be >= start_x_min ({self.start_x_min})."
+            )
+        if self.target_x_max < self.target_x_min:
+            raise ValueError(
+                f"target_x_max ({self.target_x_max}) must be >= target_x_min ({self.target_x_min})."
+            )
+        if self.target_x_mode not in {"match_start", "range", "zero"}:
+            raise ValueError(
+                f"Unsupported target_x_mode={self.target_x_mode}. "
+                "Expected 'match_start', 'range', or 'zero'."
+            )
 
         self.milestone_segments = int(cfg.task.get("milestone_segments", 0))
         self.milestone_include_goal_segment = bool(cfg.task.get("milestone_include_goal_segment", False))
@@ -254,10 +275,19 @@ class forest_lc_gate(IsaacEnv):
         self.w_esdf = float(cfg.task.get("w_esdf", 1.5))
         self.w_yaw = float(cfg.task.get("w_yaw", 0.5))
         self.w_thrust = float(cfg.task.get("w_thrust", 0.0))
+        self.w_boundary = float(cfg.task.get("w_boundary", -5.0))
 
         self.terminate_z_min = float(cfg.task.get("terminate_z_min", 0.2))
         self.terminate_z_max = float(cfg.task.get("terminate_z_max", 5.0))
         self.terminate_v_norm = float(cfg.task.get("terminate_v_norm", 5.0))
+        self.boundary_x_limit = float(cfg.task.get("boundary_x_limit", 20.0))
+        self.boundary_y_limit = float(cfg.task.get("boundary_y_limit", 40.0))
+        self.boundary_x_soft_start = float(cfg.task.get("boundary_x_soft_start", 10.0))
+        self.boundary_y_soft_start = float(cfg.task.get("boundary_y_soft_start", 30.0))
+        if not (0.0 <= self.boundary_x_soft_start < self.boundary_x_limit):
+            raise ValueError("boundary_x_soft_start must be non-negative and smaller than boundary_x_limit.")
+        if not (0.0 <= self.boundary_y_soft_start < self.boundary_y_limit):
+            raise ValueError("boundary_y_soft_start must be non-negative and smaller than boundary_y_limit.")
 
         # ---------------- lidar preprocess cfg ----------------
         self.max_obs_dist = float(cfg.task.get("max_obs_dist", 10.0))
@@ -313,9 +343,12 @@ class forest_lc_gate(IsaacEnv):
 
         with torch.device(self.device):
             self.target_pos = torch.zeros(self.num_envs, 1, 3)
-            self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
-            self.target_pos[:, 0, 1] = 24.
-            self.target_pos[:, 0, 2] = 2.
+            if self.num_envs > 1:
+                self.target_pos[:, 0, 0] = torch.linspace(self.target_x_min, self.target_x_max, self.num_envs)
+            else:
+                self.target_pos[:, 0, 0] = 0.5 * (self.target_x_min + self.target_x_max)
+            self.target_pos[:, 0, 1] = self.target_y
+            self.target_pos[:, 0, 2] = self.flight_z
             self.start_pos = torch.zeros_like(self.target_pos)
 
         # pitch_bin_centers = torch.linspace(-90.0, 90.0, self.num_pitch_bins, device=self.device)
@@ -460,6 +493,7 @@ class forest_lc_gate(IsaacEnv):
             "reward_death", # 如果你加上了坠机惩罚的话
             "reward_thrust",
             "reward_milestone",
+            "reward_boundary",
             "action_sat",  # <==== 加入这行！
             "death_z_low",
             "death_z_high",
@@ -1164,6 +1198,7 @@ class forest_lc_gate(IsaacEnv):
             "reward_death": Unbounded(1),
             "reward_thrust": Unbounded(1),
             "reward_milestone": Unbounded(1),
+            "reward_boundary": Unbounded(1),
         }
         for i in range(self.num_milestones):
             stats_spec_dict[f"reward_milestone_{i + 1}"] = Unbounded(1)
@@ -1178,9 +1213,31 @@ class forest_lc_gate(IsaacEnv):
         self.drone._reset_idx(env_ids, self.training)
 
         pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
-        pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
-        pos[:, 0, 1] = -24.
-        pos[:, 0, 2] = 2.
+        if self.num_envs > 1:
+            start_x_all = torch.linspace(self.start_x_min, self.start_x_max, self.num_envs, device=self.device)
+            target_x_all = torch.linspace(self.target_x_min, self.target_x_max, self.num_envs, device=self.device)
+        else:
+            start_x_all = torch.full(
+                (self.num_envs,),
+                0.5 * (self.start_x_min + self.start_x_max),
+                device=self.device,
+            )
+            target_x_all = torch.full(
+                (self.num_envs,),
+                0.5 * (self.target_x_min + self.target_x_max),
+                device=self.device,
+            )
+        pos[:, 0, 0] = start_x_all[env_ids]
+        pos[:, 0, 1] = self.start_y
+        pos[:, 0, 2] = self.flight_z
+        if self.target_x_mode == "match_start":
+            self.target_pos[env_ids, 0, 0] = pos[:, 0, 0]
+        elif self.target_x_mode == "range":
+            self.target_pos[env_ids, 0, 0] = target_x_all[env_ids]
+        else:
+            self.target_pos[env_ids, 0, 0] = 0.0
+        self.target_pos[env_ids, 0, 1] = self.target_y
+        self.target_pos[env_ids, 0, 2] = self.flight_z
 
         rpy = self.init_rpy_dist.sample((*env_ids.shape, 1))
         rot = euler_to_quaternion(rpy)
@@ -2101,10 +2158,16 @@ class forest_lc_gate(IsaacEnv):
             torch.zeros_like(self.flip_counter),
         )
         flip_early = self.flip_counter >= self.flip_consecutive_steps
-        # ===================================================
-        # 2. 定义空气墙的范围
-        # 因为你的目标在 y=24，出生在 y=-24，可以给个适当的余量，比如 [-30, 30]
-        out_of_bounds = (torch.abs(x_pos) > 20.0) | (torch.abs(y_pos) > 30.0)
+        x_abs = torch.abs(x_pos)
+        y_abs = torch.abs(y_pos)
+        x_soft_span = max(self.boundary_x_limit - self.boundary_x_soft_start, 1e-6)
+        y_soft_span = max(self.boundary_y_limit - self.boundary_y_soft_start, 1e-6)
+        x_boundary_ratio = torch.relu(x_abs - self.boundary_x_soft_start) / x_soft_span
+        y_boundary_ratio = torch.relu(y_abs - self.boundary_y_soft_start) / y_soft_span
+        r_boundary = torch.square(x_boundary_ratio) + torch.square(y_boundary_ratio)
+
+        # Flight corridor: x in [-20, 20], y in [-40, 40] by default.
+        out_of_bounds = (x_abs >= self.boundary_x_limit) | (y_abs >= self.boundary_y_limit)
         misbehave = (
             (z < self.terminate_z_min) |
             (z > self.terminate_z_max) |
@@ -2153,6 +2216,7 @@ class forest_lc_gate(IsaacEnv):
             self.w_esdf * r_esdf +
             r_collision +
             r_death +
+            self.w_boundary * r_boundary +
             self.w_yaw * r_yaw +
             self.w_thrust * r_thrust+ 
             r_goal +
@@ -2180,6 +2244,7 @@ class forest_lc_gate(IsaacEnv):
         self.stats["reward_yaw"].add_(reward_scale * self.w_yaw * r_yaw.view(-1, 1))
         self.stats["reward_goal"].add_(reward_scale * r_goal.view(-1, 1))
         self.stats["reward_death"].add_(reward_scale * r_death.view(-1, 1))
+        self.stats["reward_boundary"].add_(reward_scale * self.w_boundary * r_boundary.view(-1, 1))
         # 第 694 行：此时 r_thrust 已经是严谨的 (150, 1) 了，直接计算即可
         self.stats["reward_thrust"].add_(reward_scale * self.w_thrust * r_thrust)
         self.stats["reward_milestone"].add_(reward_scale * stage_reward_total.view(-1, 1))

@@ -398,6 +398,46 @@ def _canonical_key(k: str) -> str:
     return ".".join(parts)
 
 
+def _legacy_gate_head_aliases(model_key: str):
+    """
+    Backward-compat for the old 3-sector lc-gate checkpoints.
+
+    Legacy checkpoints store gate heads as:
+      gate_head_R / gate_head_C / gate_head_L
+    while the newer grid-capable backbone stores them as:
+      gate_heads.0 / gate_heads.1 / gate_heads.2 / ...
+
+    The historical 3-bin feature order was [R, C, L], so map:
+      gate_heads.0 -> gate_head_R
+      gate_heads.1 -> gate_head_C
+      gate_heads.2 -> gate_head_L
+    """
+    mk_can = _canonical_key(model_key)
+    needle = ".gate_heads."
+    if needle not in mk_can:
+        return []
+
+    prefix, suffix = mk_can.split(needle, 1)
+    parts = suffix.split(".")
+    if len(parts) < 2 or not parts[0].isdigit():
+        return []
+
+    legacy_name_by_idx = {
+        0: "gate_head_R",
+        1: "gate_head_C",
+        2: "gate_head_L",
+    }
+    gate_idx = int(parts[0])
+    legacy_name = legacy_name_by_idx.get(gate_idx)
+    if legacy_name is None:
+        return []
+
+    tail = ".".join(parts[1:])
+    if prefix:
+        return [f"{prefix}.{legacy_name}.{tail}"]
+    return [f"{legacy_name}.{tail}"]
+
+
 def _suffix_match_score(model_key: str, ckpt_key: str) -> int:
     a = _canonical_key(model_key).split(".")
     b = _canonical_key(ckpt_key).split(".")
@@ -440,6 +480,12 @@ def _build_adapted_state_dict(model_state: dict, ckpt_state: dict):
             ck for ck in ckpt_by_canonical.get(mk_can, [])
             if ck not in used_ckpt_keys and ckpt_state[ck].shape == mv.shape
         ]
+        if not candidates:
+            for alias in _legacy_gate_head_aliases(mk):
+                candidates.extend([
+                    ck for ck in ckpt_by_canonical.get(alias, [])
+                    if ck not in used_ckpt_keys and ckpt_state[ck].shape == mv.shape
+                ])
         if len(candidates) == 1:
             adapted[mk] = ckpt_state[candidates[0]]
             used_ckpt_keys.add(candidates[0])
@@ -534,10 +580,19 @@ def _load_checkpoint_strictish(policy, checkpoint_path, device):
         _print_load_mismatch(missing_keys, unexpected_keys)
 
     # 关键：如果 actor/critic 还有参数没对上，直接报错，不继续假跑
+    def _is_noncritical_missing_key(k: str) -> bool:
+        k_can = _canonical_key(k)
+        # Spatial gate masks are deterministic geometry buffers derived from
+        # current FoV/grid settings, not learned checkpoint weights.
+        if "._sector_masks." in f".{k_can}.":
+            return True
+        return False
+
     critical_missing = [
         k for k in missing_keys
-        if k.startswith("actor.") or k.startswith("critic.")
+        if (k.startswith("actor.") or k.startswith("critic.")) and not _is_noncritical_missing_key(k)
     ]
+    ignored_missing = [k for k in missing_keys if _is_noncritical_missing_key(k)]
     if critical_missing:
         print(f"[!] 仍有关键层未匹配成功，样例: {critical_missing[:20]}")
         print(f"[!] 未消费的 checkpoint keys 样例: {unused_ckpt_keys[:20]}")
@@ -545,6 +600,8 @@ def _load_checkpoint_strictish(policy, checkpoint_path, device):
 
     print(f"[+] checkpoint 加载成功: {checkpoint_path}")
     print(f"[+] 匹配到的参数数: {len(adapted_state)} / {len(model_state)}")
+    if ignored_missing:
+        print(f"[Info] 忽略非学习型缺失 keys，共 {len(ignored_missing)} 个，样例: {ignored_missing[:10]}")
     if unused_ckpt_keys:
         print(f"[Info] 仍有未使用 checkpoint keys，共 {len(unused_ckpt_keys)} 个，样例: {unused_ckpt_keys[:10]}")
     return checkpoint

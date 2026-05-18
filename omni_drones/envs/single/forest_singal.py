@@ -331,6 +331,14 @@ class forest_singal(IsaacEnv):
             "reward_thrust",
             "reward_milestone",
             "action_sat",  # <==== 加入这行！
+            "death_z_low",
+            "death_z_high",
+            "death_overspeed",
+            "death_collision",
+            "death_contact",
+            "death_oob",
+            "death_flip",
+            "death_nan",
         ]
         for i in range(self.num_milestones):
             tracking_keys.append(f"reward_milestone_{i + 1}")
@@ -632,6 +640,14 @@ class forest_singal(IsaacEnv):
             "reward_death": Unbounded(1),
             "reward_thrust": Unbounded(1),
             "reward_milestone": Unbounded(1),
+            "death_z_low": Unbounded(1),
+            "death_z_high": Unbounded(1),
+            "death_overspeed": Unbounded(1),
+            "death_collision": Unbounded(1),
+            "death_contact": Unbounded(1),
+            "death_oob": Unbounded(1),
+            "death_flip": Unbounded(1),
+            "death_nan": Unbounded(1),
         }
         for i in range(self.num_milestones):
             stats_spec_dict[f"reward_milestone_{i + 1}"] = Unbounded(1)
@@ -1428,6 +1444,19 @@ class forest_singal(IsaacEnv):
         # ===============================================================
 
         hasnan = torch.isnan(self.drone_state).any(-1)
+
+        death_flags = {
+            "death_z_low": z < self.terminate_z_min,
+            "death_z_high": z > self.terminate_z_max,
+            "death_overspeed": v_norm > self.terminate_v_norm,
+            "death_collision": is_collision,
+            "death_contact": is_contact_collision,
+            "death_oob": out_of_bounds,
+            "death_flip": flip_early,
+            "death_nan": hasnan,
+        }
+        for key, flag in death_flags.items():
+            self.stats[key] = torch.maximum(self.stats[key], flag.float().view(-1, 1))
 
         terminated = misbehave | hasnan | reached_goal
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1)

@@ -25,8 +25,37 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-17-vlim-lcgate-tree_best_return_598.03.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-18-vlimlcgate-tree_best_return_2843.13.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
+
+
+def _parse_camera_risk_layout(raw_value):
+    text = str(raw_value or "").strip().lower()
+    if not text:
+        return None
+    if "x" in text:
+        parts = text.split("x", 1)
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            raise ValueError(
+                f"Invalid camera risk layout {raw_value!r}. Use forms like '3' or '3x3'."
+            )
+        rows = int(parts[0])
+        cols = int(parts[1])
+        if rows <= 0 or cols <= 0:
+            raise ValueError(
+                f"Invalid camera risk layout {raw_value!r}. Row/col counts must be positive."
+            )
+        return {"rows": rows, "cols": cols, "legacy_bins": None, "label": f"{rows}x{cols}"}
+    if text.isdigit():
+        bins = int(text)
+        if bins <= 0:
+            raise ValueError(
+                f"Invalid camera risk layout {raw_value!r}. Sector count must be positive."
+            )
+        return {"rows": 1, "cols": bins, "legacy_bins": bins, "label": text}
+    raise ValueError(
+        f"Invalid camera risk layout {raw_value!r}. Use forms like '3' or '3x3'."
+    )
 
 
 class CanLiDARGateBackbone(torch.nn.Module):
@@ -172,9 +201,13 @@ class CanLiDARGateBackbone(torch.nn.Module):
         sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
+        spatial_gate_flat = spatial_gate.reshape(b, 1, self.ku_h * self.ku_w)
         for i in range(total_sectors):
             gate_i = self.gate_heads[i](sector_features[:, i, :])
-            spatial_gate[:, :, :, self._sector_masks[i]] = gate_i.view(b, 1, 1, 1)
+            sector_mask = self._sector_masks[i].reshape(-1).to(device=x_ku_raw.device, dtype=torch.bool)
+            if bool(sector_mask.any()):
+                spatial_gate_flat[:, :, sector_mask] = gate_i.view(b, 1, 1)
+        spatial_gate = spatial_gate_flat.reshape(b, 1, self.ku_h, self.ku_w)
 
         lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
@@ -826,34 +859,58 @@ def write_results(output_dir, rows):
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-        xs = [x["target_speed_mps"] for x in summary]
-        labels = [f"sp={_finite_float(x.get('tree_spacing_m', x.get('obstacles_per_tile'))):g}m" for x in summary]
-        ys = [x["success_rate"] * 100.0 for x in summary]
+        # Group by obstacle density for per-density coloring
+        density_key = "tree_spacing_m"
+        density_values = sorted(set(_finite_float(x.get(density_key)) for x in summary if np.isfinite(_finite_float(x.get(density_key)))))
+        cmap = plt.get_cmap("tab10")
+        colors = [cmap(i % 10) for i in range(len(density_values))]
         fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=140)
-        ax.plot(xs, ys, marker="o", linewidth=2.0, color="#2563eb")
-        if len({x.get("obstacles_per_tile") for x in summary}) > 1:
-            for x, y, label in zip(xs, ys, labels):
-                ax.annotate(label, (x, y), textcoords="offset points", xytext=(4, 4), fontsize=8)
+        all_xs = []
+        for di, dens in enumerate(density_values):
+            group = [x for x in summary if abs(_finite_float(x.get(density_key)) - dens) < 1e-6]
+            group.sort(key=lambda x: x["target_speed_mps"])
+            xs = [x["target_speed_mps"] for x in group]
+            ys = [x["success_rate"] * 100.0 for x in group]
+            label = f"sp={dens:g}m"
+            ax.plot(xs, ys, marker="o", linewidth=2.0, color=colors[di], label=label)
+            all_xs.extend(xs)
+        if len(density_values) > 1:
+            ax.legend(fontsize=8, loc="best")
         ax.set_xlabel("Target speed (m/s)")
         ax.set_ylabel("Success rate (%)")
         ax.set_title("OmniDrones Cam+LiDAR Policy Real-Tree Sweep")
         ax.set_ylim(-2, 102)
-        ax.set_xlim(min(xs) - 0.5, max(xs) + 0.5)
+        if all_xs:
+            ax.set_xlim(min(all_xs) - 0.5, max(all_xs) + 0.5)
         ax.grid(True, alpha=0.35)
         fig.tight_layout()
         fig.savefig(output_dir / "success_rate.png")
         plt.close(fig)
 
         # ---- completion percentage chart ----
+        # Group by obstacle density for per-density coloring
+        density_key2 = "tree_spacing_m"
+        density_values2 = sorted(set(_finite_float(x.get(density_key2)) for x in summary if np.isfinite(_finite_float(x.get(density_key2)))))
+        cmap2 = plt.get_cmap("tab10")
+        colors2 = [cmap2(i % 10) for i in range(len(density_values2))]
         fig2, ax2 = plt.subplots(figsize=(7.2, 4.2), dpi=140)
-        xs2 = [x["target_speed_mps"] for x in summary]
-        ys2 = [x["avg_completion_pct"] for x in summary]
-        ax2.plot(xs2, ys2, marker="o", linewidth=2.0, color="#16a34a")
+        all_xs2 = []
+        for di, dens in enumerate(density_values2):
+            group = [x for x in summary if abs(_finite_float(x.get(density_key2)) - dens) < 1e-6]
+            group.sort(key=lambda x: x["target_speed_mps"])
+            xs2 = [x["target_speed_mps"] for x in group]
+            ys2 = [x["avg_completion_pct"] for x in group]
+            label = f"sp={dens:g}m"
+            ax2.plot(xs2, ys2, marker="o", linewidth=2.0, color=colors2[di], label=label)
+            all_xs2.extend(xs2)
+        if len(density_values2) > 1:
+            ax2.legend(fontsize=8, loc="best")
         ax2.set_xlabel("Target speed (m/s)")
         ax2.set_ylabel("Avg completion (%)")
         ax2.set_title("OmniDrones Cam+LiDAR Policy Real-Tree Sweep - Completion %")
         ax2.set_ylim(-2, 102)
-        ax2.set_xlim(min(xs2) - 0.5, max(xs2) + 0.5)
+        if all_xs2:
+            ax2.set_xlim(min(all_xs2) - 0.5, max(all_xs2) + 0.5)
         ax2.grid(True, alpha=0.35)
         fig2.tight_layout()
         fig2.savefig(output_dir / "completion_pct.png")
@@ -868,14 +925,28 @@ def write_results(output_dir, rows):
             metric_summary = [x for x in summary if np.isfinite(_finite_float(x.get(key)))]
             if not metric_summary:
                 continue
+            # Group by obstacle density for per-density coloring
+            density_key_m = "tree_spacing_m"
+            density_values_m = sorted(set(_finite_float(x.get(density_key_m)) for x in metric_summary if np.isfinite(_finite_float(x.get(density_key_m)))))
+            cmap_m = plt.get_cmap("tab10")
+            colors_m = [cmap_m(i % 10) for i in range(len(density_values_m))]
             fig_m, ax_m = plt.subplots(figsize=(7.2, 4.2), dpi=140)
-            xs_m = [x["target_speed_mps"] for x in metric_summary]
-            ys_m = [x[key] for x in metric_summary]
-            ax_m.plot(xs_m, ys_m, marker="o", linewidth=2.0, color=color)
+            all_xs_m = []
+            for di, dens in enumerate(density_values_m):
+                group = [x for x in metric_summary if abs(_finite_float(x.get(density_key_m)) - dens) < 1e-6]
+                group.sort(key=lambda x: x["target_speed_mps"])
+                xs_m = [x["target_speed_mps"] for x in group]
+                ys_m = [x[key] for x in group]
+                label = f"sp={dens:g}m"
+                ax_m.plot(xs_m, ys_m, marker="o", linewidth=2.0, color=colors_m[di], label=label)
+                all_xs_m.extend(xs_m)
+            if len(density_values_m) > 1:
+                ax_m.legend(fontsize=8, loc="best")
             ax_m.set_xlabel("Target speed (m/s)")
             ax_m.set_ylabel(ylabel)
             ax_m.set_title(f"OmniDrones Cam+LiDAR Policy Real-Tree Sweep - {title_suffix}")
-            ax_m.set_xlim(min(xs_m) - 0.5, max(xs_m) + 0.5)
+            if all_xs_m:
+                ax_m.set_xlim(min(all_xs_m) - 0.5, max(all_xs_m) + 0.5)
             ax_m.grid(True, alpha=0.35)
             fig_m.tight_layout()
             fig_m.savefig(output_dir / filename)
@@ -1027,15 +1098,15 @@ function resize(){ canvas.width = canvas.clientWidth * devicePixelRatio; canvas.
 addEventListener("resize", resize); resize();
 function worldToCanvas(p){
   const w = canvas.width, h = canvas.height;
-  const sx = w / 44, sy = h / 66, s = Math.min(sx, sy);
+  const sx = w / 44, sy = h / 86, s = Math.min(sx, sy);
   return [w/2 + p[0]*s, h/2 - p[1]*s];
 }
 function drawGrid(){
   ctx.clearRect(0,0,canvas.width,canvas.height);
   ctx.lineWidth = 1 * devicePixelRatio;
   ctx.strokeStyle = "#22303a";
-  for(let x=-20; x<=20; x+=4){ const a=worldToCanvas([x,-30]), b=worldToCanvas([x,30]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); }
-  for(let y=-30; y<=30; y+=4){ const a=worldToCanvas([-20,y]), b=worldToCanvas([20,y]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); }
+  for(let x=-20; x<=20; x+=4){ const a=worldToCanvas([x,-40]), b=worldToCanvas([x,40]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); }
+  for(let y=-40; y<=40; y+=4){ const a=worldToCanvas([-20,y]), b=worldToCanvas([20,y]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); }
 }
 function dot(p, r, color){ const q=worldToCanvas(p); ctx.fillStyle=color; ctx.beginPath(); ctx.arc(q[0], q[1], r*devicePixelRatio, 0, Math.PI*2); ctx.fill(); }
 function line(points, color, width){
@@ -1346,6 +1417,14 @@ def run_worker(args, hydra_overrides):
     if args.policy_task and not _has_override(hydra_overrides, "task"):
         overrides.append(f"task={args.policy_task}")
     overrides += list(hydra_overrides)
+    layout_override = _parse_camera_risk_layout(getattr(args, "camera_risk_layout", ""))
+    if layout_override is not None:
+        overrides += [
+            f"++task.camera_risk_num_rows={int(layout_override['rows'])}",
+            f"++task.camera_risk_num_cols={int(layout_override['cols'])}",
+        ]
+        if layout_override["legacy_bins"] is not None:
+            overrides.append(f"++task.camera_risk_num_bins={int(layout_override['legacy_bins'])}")
     overrides += [
         f"seed={int(args.worker_seed)}",
         f"eval_num_envs={int(args.eval_num_envs)}",
@@ -1361,9 +1440,18 @@ def run_worker(args, hydra_overrides):
         "task.show_depth_preview_window=false",
     ]
     if args.max_steps is not None:
-        overrides.append(f"max_steps={int(args.max_steps)}")
+        overrides.append(f"++max_steps={int(args.max_steps)}")
     if args.checkpoint_path:
         overrides.append(f"checkpoint_path={args.checkpoint_path}")
+
+    # 评估模式：仅保留 collision / contact / OOB / timeout 作为终止条件
+    overrides += [
+        "++task.terminate_z_min=-9999",
+        "++task.terminate_z_max=9999",
+        "++task.terminate_v_norm=99999",
+        "++task.flip_tilt_deg=180",
+        "++task.flip_consecutive_steps=99999",
+    ]
 
     with initialize_config_dir(version_base=None, config_dir=str(ZK_DIR), job_name="density_sweep_worker"):
         cfg = compose(config_name="play_camlidar", overrides=overrides)
@@ -1381,6 +1469,11 @@ def run_worker(args, hydra_overrides):
     else:
         args.max_steps = int(args.max_steps)
     cfg.max_steps = int(args.max_steps)
+    if "env" in cfg:
+        cfg.env.max_episode_length = int(args.max_steps)
+    if "task" in cfg:
+        with contextlib.suppress(Exception):
+            cfg.task.max_episode_length = int(args.max_steps)
 
     requested_visible = _resolve_requested_cuda_visible(cfg, hydra_overrides)
 
@@ -1418,6 +1511,11 @@ def run_worker(args, hydra_overrides):
         cfg.env.num_envs = int(args.eval_num_envs)
     if "task" in cfg and "env" in cfg.task:
         cfg.task.env.num_envs = int(args.eval_num_envs)
+    if layout_override is not None:
+        cfg.task.camera_risk_num_rows = int(layout_override["rows"])
+        cfg.task.camera_risk_num_cols = int(layout_override["cols"])
+        if layout_override["legacy_bins"] is not None:
+            cfg.task.camera_risk_num_bins = int(layout_override["legacy_bins"])
     cfg.cuda_visible_devices = requested_visible
     cfg.sim_gpu_index = logical_cuda_gpu
     cfg.sim.device = f"cuda:{logical_cuda_gpu}"
@@ -1458,12 +1556,15 @@ def run_worker(args, hydra_overrides):
             "trial": int(args.worker_trial),
             "trials": int(args.trials),
             "seed": int(args.worker_seed),
+            "camera_risk_layout": layout_override["label"] if layout_override is not None else "",
             "trajectory": trajectory,
             "obstacles": preview_obstacles,
         },
     )
 
     _preflight_runtime_checks(cfg, int(args.eval_num_envs))
+    if layout_override is not None:
+        print(f"[realtree sweep] camera risk layout override: {layout_override['label']}")
     simulation_app = None
     try:
         simulation_app = init_simulation_app(cfg)
@@ -1903,6 +2004,8 @@ def controller(args, hydra_overrides):
                     "--worker-result",
                     str(result_path),
                 ]
+                if str(getattr(args, "camera_risk_layout", "")).strip():
+                    cmd += ["--camera-risk-layout", str(args.camera_risk_layout)]
                 if args.max_steps is not None:
                     cmd += ["--max-steps", str(args.max_steps)]
                 if not args.tree_auto_upright:
@@ -2028,6 +2131,11 @@ def parse_args(argv):
         "--policy-task",
         default=DEFAULT_POLICY_TASK,
         help="Hydra task config used by the checkpoint; train_canlidargate_trees.py uses forest_lc_gate.",
+    )
+    parser.add_argument(
+        "--camera-risk-layout",
+        default="3",
+        help="Camera risk layout override. Use '3' for the legacy 3-sector version, or '3x3' for the grid version.",
     )
     parser.add_argument("--speed", type=float, default=3.0, help="Fixed eval vlim / target speed value in m/s")
     parser.add_argument("--speed-min", type=float, default=None, help="Minimum eval vlim for a speed sweep")
