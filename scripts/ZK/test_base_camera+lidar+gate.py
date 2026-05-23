@@ -204,9 +204,13 @@ class DualStreamBackbone(torch.nn.Module):
         sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
+        spatial_gate_flat = spatial_gate.reshape(b, 1, self.ku_h * self.ku_w)
         for i in range(total_sectors):
             gate_i = self.gate_heads[i](sector_features[:, i, :])
-            spatial_gate[:, :, :, self._sector_masks[i]] = gate_i.view(b, 1, 1, 1)
+            sector_mask = self._sector_masks[i].reshape(-1).to(device=x_ku_raw.device, dtype=torch.bool)
+            if bool(sector_mask.any()):
+                spatial_gate_flat[:, :, sector_mask] = gate_i.view(b, 1, 1)
+        spatial_gate = spatial_gate_flat.reshape(b, 1, self.ku_h, self.ku_w)
 
         x_ku_gated = x_ku_raw * spatial_gate
 
@@ -680,22 +684,13 @@ def main(cfg):
     obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
     lidar_dim = 3200
     ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-    state_dim = int(cfg.task.get("state_dim", 14))
-    if bool(cfg.task.get("observe_vlim", False)):
-        state_dim += 1
-    camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
-    if camera_risk_dim <= 0:
-        task_name_cfg = str(cfg.task.get("name", "<unknown>"))
-        raise ValueError(
-            f"Invalid camera_risk_dim={camera_risk_dim}. obs_dim={obs_dim}, state_dim={state_dim}, "
-            f"lidar_dim={lidar_dim}, task={task_name_cfg}. "
-            "This script expects observation=[state, lidar_ku(3200), camera_risk]. "
-            "Ensure use_camera_risk_observation=true and use_depth_ku_observation=false."
-        )
-    # Compute grid layout before expected_camera_risk_dim check
+
+    # Compute expected camera_risk_dim from config FIRST, then derive state_dim from observation.
+    # This avoids the hardcoded state_dim=14 default which is inconsistent with the
+    # environment's dynamic state_dim = 10 + action_dim + (1 if observe_vlim else 0).
     _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
     _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
-    _num_bins = int(cfg.task.get("camera_risk_num_bins", 5))
+    _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
     if _num_rows <= 0 and _num_cols <= 0:
         _grid_rows, _grid_cols = 1, _num_bins
     elif _num_rows <= 0:
@@ -708,13 +703,25 @@ def main(cfg):
     expected_camera_risk_dim = _grid_rows * _grid_cols * _features_per_sector
     if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
         expected_camera_risk_dim += 1
-    if camera_risk_dim != expected_camera_risk_dim:
-        logging.warning(
-            "camera_risk_dim=%d derived from observation, expected %d from config. "
-            "Using derived dimension to match the environment.",
-            camera_risk_dim,
-            expected_camera_risk_dim,
+
+    # Derive state_dim from observation layout, NOT from hardcoded default.
+    # obs = [state | lidar_ku(3200) | camera_risk]
+    state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
+    camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
+
+    if state_dim <= 0 or camera_risk_dim <= 0:
+        task_name_cfg = str(cfg.task.get("name", "<unknown>"))
+        raise ValueError(
+            f"Invalid observation layout: obs_dim={obs_dim}, state_dim={state_dim}, "
+            f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}, task={task_name_cfg}. "
+            "This script expects observation=[state, lidar_ku(3200), camera_risk]. "
+            "Ensure use_camera_risk_observation=true and use_depth_ku_observation=false."
         )
+
+    logging.info(
+        "Observation layout verified: state_dim=%d, lidar_dim=%d, camera_risk_dim=%d (expected=%d from %dx%d grid).",
+        state_dim, lidar_dim, camera_risk_dim, expected_camera_risk_dim, _grid_rows, _grid_cols,
+    )
     expected_feature_dim = 128
     camera_geom = _read_depth_camera_geometry_from_stage(base_env)
 
@@ -728,8 +735,42 @@ def main(cfg):
     _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
     lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
     lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
-    fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
-    fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
+
+    # Camera optical axis pitch in body frame (read from camera geometry).
+    # The camera is tilted; its FoV is NOT centered at body pitch=0.
+    # The optical axis in body frame is the negative of R's third column
+    # (camera -Z → body direction), or equivalently read from the stage transform.
+    cam_rot_lidar_from_camera = camera_geom.get("rot_lidar_from_camera")
+    if cam_rot_lidar_from_camera is not None:
+        # R maps P_cam -> P_body.  Camera optical axis = -Z in camera frame.
+        # In body frame: R @ [0,0,-1] = -R[:,2] (third column negated).
+        cam_rot = np.asarray(cam_rot_lidar_from_camera, dtype=np.float64)
+        optical_axis_body = -cam_rot[:, 2]  # camera -Z → body
+    else:
+        # Fallback: compute from YAML config.
+        pos_cfg = np.array(cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]), dtype=np.float64)
+        target_cfg = np.array(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]), dtype=np.float64)
+        fwd = target_cfg - pos_cfg
+        fwd = fwd / max(np.linalg.norm(fwd), 1e-12)
+        optical_axis_body = fwd
+    cam_pitch_rad = float(math.atan2(
+        optical_axis_body[2],
+        math.sqrt(optical_axis_body[0]**2 + optical_axis_body[1]**2)
+    ))
+
+    # Camera FoV pitch range in body frame, centered at cam_pitch_rad
+    cam_pitch_min = cam_pitch_rad - float(camera_v_fov_rad) / 2.0
+    cam_pitch_max = cam_pitch_rad + float(camera_v_fov_rad) / 2.0
+    fov_pitch_min = max(cam_pitch_min, lidar_pitch_min)
+    fov_pitch_max = min(cam_pitch_max, lidar_pitch_max)
+
+    logging.info(
+        "Camera pitch=%.2f°, FoV pitch range=[%.2f°, %.2f°] ∩ LiDAR=[%.2f°, %.2f°] → [%.2f°, %.2f°].",
+        math.degrees(cam_pitch_rad),
+        math.degrees(cam_pitch_min), math.degrees(cam_pitch_max),
+        math.degrees(lidar_pitch_min), math.degrees(lidar_pitch_max),
+        math.degrees(fov_pitch_min), math.degrees(fov_pitch_max),
+    )
 
     _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
     _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))

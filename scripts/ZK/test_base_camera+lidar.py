@@ -626,37 +626,43 @@ def main(cfg):
     obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
     lidar_dim = 3200
     ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-    expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
-        cfg.task.get("camera_risk_features_per_bin", 4)
-    )
+
+    # Compute expected camera_risk_dim from config, supporting both:
+    # - forest_lc:       camera_risk_num_bins (backward compat, 1 row × N cols)
+    # - forest_lc_gate:  camera_risk_num_rows × camera_risk_num_cols (2D grid)
+    _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+    _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+    _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
+    if _num_rows <= 0 and _num_cols <= 0:
+        _grid_rows, _grid_cols = 1, _num_bins
+    elif _num_rows <= 0:
+        _grid_rows, _grid_cols = 1, _num_cols
+    elif _num_cols <= 0:
+        _grid_rows, _grid_cols = _num_rows, 1
+    else:
+        _grid_rows, _grid_cols = _num_rows, _num_cols
+    _features_per_sector = int(cfg.task.get("camera_risk_features_per_bin", 4))
+    expected_camera_risk_dim = _grid_rows * _grid_cols * _features_per_sector
     if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
         expected_camera_risk_dim += 1
-    inferred_state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
-    configured_state_dim = cfg.task.get("state_dim", None)
-    if configured_state_dim is not None and int(configured_state_dim) != inferred_state_dim:
-        logging.warning(
-            "Configured state_dim=%d does not match inferred state_dim=%d from observation layout. "
-            "Using inferred value to keep [state, lidar_ku, camera_risk] split aligned.",
-            int(configured_state_dim),
-            inferred_state_dim,
-        )
-    state_dim = inferred_state_dim
+
+    # Derive state_dim from observation layout, NOT from hardcoded defaults.
+    state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
     camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
-    if camera_risk_dim <= 0:
+
+    if state_dim <= 0 or camera_risk_dim <= 0:
         task_name_cfg = str(cfg.task.get("name", "<unknown>"))
         raise ValueError(
-            f"Invalid camera_risk_dim={camera_risk_dim}. obs_dim={obs_dim}, state_dim={state_dim}, "
-            f"lidar_dim={lidar_dim}, task={task_name_cfg}. "
+            f"Invalid observation layout: obs_dim={obs_dim}, state_dim={state_dim}, "
+            f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}, task={task_name_cfg}. "
             "This script expects observation=[state, lidar_ku(3200), camera_risk]. "
             "Ensure use_camera_risk_observation=true and use_depth_ku_observation=false."
         )
-    if camera_risk_dim != expected_camera_risk_dim:
-        logging.warning(
-            "camera_risk_dim=%d derived from observation, expected %d from config. "
-            "Using derived dimension to match the environment.",
-            camera_risk_dim,
-            expected_camera_risk_dim,
-        )
+
+    logging.info(
+        "Observation layout verified: state_dim=%d, lidar_dim=%d, camera_risk_dim=%d (expected=%d from %dx%d grid).",
+        state_dim, lidar_dim, camera_risk_dim, expected_camera_risk_dim, _grid_rows, _grid_cols,
+    )
     expected_feature_dim = 128
     camera_risk_gate_alpha = float(cfg.task.get("camera_risk_gate_alpha", 0.2))
     camera_risk_fusion_mode = str(cfg.task.get("camera_risk_fusion_mode", "gate"))

@@ -38,7 +38,8 @@ depth_data_type: distance_to_camera
 depth_max_range: 10.0
 depth_yaw_center_deg: 0.0
 depth_camera_pos: [0.22, 0.0, 0.18]
-depth_camera_target: [2.0, 0.0, 0.18]
+# Camera tilted upward so its vertical FoV stays inside LiDAR pitch range [-7°, 52°].
+depth_camera_target: [2.0, 0.0, 0.95]
 # Explicit pinhole camera intrinsics. USD defaults are narrow for obstacle
 # avoidance, so keep the sensor FOV controlled by config instead.
 depth_camera_focal_length: 12.0
@@ -68,9 +69,10 @@ depth_preview_window_pos_x: 30
 depth_preview_window_pos_y: 30
 depth_preview_update_interval: 1
 
-# Camera-projected LiDAR disagreement risk: 3 个相机前方 FoV 扇区 (left/center/right) × 4 个特征，
-# 再额外拼接 stale ratio，作为轻量补盲观测。
-camera_risk_num_bins: 3  # front-left / front-center / front-right
+# Camera-projected LiDAR disagreement risk: rows split camera pitch, cols split yaw.
+# The default 4x4 grid produces 16 sectors x 4 features, then appends stale ratio.
+camera_risk_num_rows: 4
+camera_risk_num_cols: 4
 camera_risk_features_per_bin: 4
 camera_risk_add_stale_ratio: true
 camera_danger_dist: 0.5

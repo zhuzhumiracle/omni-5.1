@@ -1,0 +1,20 @@
+{
+  "obstacles_per_tile": 4,
+  "tree_spacing_m": 4.0,
+  "target_speed_mps": 2.0,
+  "tree_count": 90,
+  "trial": 1,
+  "seed": 0,
+  "success_rate": 0.48,
+  "success_count": 24,
+  "episode_count": 50,
+  "mean_return": 2148.880461730957,
+  "mean_episode_len": 3453.38,
+  "mean_completion_pct": 74.4,
+  "mean_arrival_time_s": 59.043,
+  "mean_path_length_m": 48.211,
+  "mean_speed_mps": 0.833,
+  "death_reason": "contact:6,out_of_bounds:20,success:23,timeout:1",
+  "result": "ok",
+  "duration_s": 836.288
+}

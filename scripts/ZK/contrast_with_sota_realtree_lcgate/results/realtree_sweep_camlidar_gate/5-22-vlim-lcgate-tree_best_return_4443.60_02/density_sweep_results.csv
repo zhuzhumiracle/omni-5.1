@@ -1,0 +1,4 @@
+obstacles_per_tile,tree_spacing_m,target_speed_mps,tree_count,trial,seed,success_rate,success_count,episode_count,mean_return,mean_episode_len,mean_completion_pct,mean_arrival_time_s,mean_path_length_m,mean_speed_mps,death_reason,result,duration_s
+4,4.0,5.0,90,1,0,0.42,21,50,344.89951904296873,1111.54,61.4,15.409,47.371,6090923.072,"contact:14,out_of_bounds:16,success:18,timeout:2",ok,304.098
+4,4.0,5.0,90,2,0,0.4,20,50,120.3000146484375,1249.7,60.8,16.269,46.954,3269263.541,"contact:10,out_of_bounds:19,success:18,timeout:3",ok,303.254
+4,4.0,5.0,90,3,0,0.38,19,50,123.30527557373047,1187.48,59.5,15.765,46.742,5980929.383,"contact:13,out_of_bounds:18,success:16,timeout:3",ok,298.746

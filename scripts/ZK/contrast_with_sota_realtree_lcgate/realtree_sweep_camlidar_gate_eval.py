@@ -25,7 +25,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-18-vlimlcgate-tree_best_return_2843.13.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-22-vlim-lcgate-tree_best_return_4443.60.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
 
 
@@ -277,8 +277,28 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
     _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
     lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
     lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
-    fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
-    fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
+    cam_pos_cfg = np.asarray(cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]), dtype=np.float64)
+    cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]), dtype=np.float64)
+    cam_axis = cam_target_cfg - cam_pos_cfg
+    cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
+    if float(np.linalg.norm(cam_axis)) <= 1e-9:
+        raise RuntimeError("depth_camera_pos and depth_camera_target must not coincide.")
+    cam_pitch_rad = math.atan2(float(cam_axis[2]), cam_xy_norm)
+    cam_pitch_min = cam_pitch_rad - camera_v_fov_rad / 2.0
+    cam_pitch_max = cam_pitch_rad + camera_v_fov_rad / 2.0
+    fov_pitch_min = max(cam_pitch_min, lidar_pitch_min)
+    fov_pitch_max = min(cam_pitch_max, lidar_pitch_max)
+    if fov_pitch_max <= fov_pitch_min:
+        raise RuntimeError(
+            "Camera vertical FoV does not overlap LiDAR pitch range: "
+            f"camera=[{math.degrees(cam_pitch_min):.2f}, {math.degrees(cam_pitch_max):.2f}]deg, "
+            f"lidar=[{math.degrees(lidar_pitch_min):.2f}, {math.degrees(lidar_pitch_max):.2f}]deg."
+        )
+    print(
+        "[lc-gate] pitch masks aligned to camera axis | "
+        f"pitch={math.degrees(cam_pitch_rad):.2f}deg "
+        f"overlap=[{math.degrees(fov_pitch_min):.2f}, {math.degrees(fov_pitch_max):.2f}]deg"
+    )
 
     actor_backbone = CanLiDARGateBackbone(
         state_dim=state_dim,
@@ -732,12 +752,12 @@ def surfel_cross_mesh(points, surfel_size=0.08):
 
 _DEATH_REASON_KEYS = [
     "death_z_low", "death_z_high", "death_overspeed",
-    "death_collision", "death_contact", "death_oob",
+    "death_contact", "death_oob",
     "death_flip", "death_nan",
 ]
 _DEATH_REASON_LABELS = [
     "z_low", "z_high", "overspeed",
-    "collision", "contact", "out_of_bounds",
+    "contact", "out_of_bounds",
     "flip", "nan",
 ]
 
@@ -1444,8 +1464,10 @@ def run_worker(args, hydra_overrides):
     if args.checkpoint_path:
         overrides.append(f"checkpoint_path={args.checkpoint_path}")
 
-    # 评估模式：仅保留 collision / contact / OOB / timeout 作为终止条件
+    # 评估模式：只用 IsaacSim 物理接触、OOB、timeout 判定失败；
+    # 禁用训练时的 LiDAR/距离阈值 collision 判定。
     overrides += [
+        "++task.collision_dist=-1.0",
         "++task.terminate_z_min=-9999",
         "++task.terminate_z_max=9999",
         "++task.terminate_v_norm=99999",
@@ -1674,27 +1696,34 @@ def run_worker(args, hydra_overrides):
                         if active.any():
                             path_lengths[active] += torch.norm(current_pos[active] - prev_positions[active], dim=-1)
                             prev_positions[active] = current_pos[active]
+                            ep_returns[active] += reward[active]
 
-                        # Capture final positions for envs that just finished
-                        just_finished = torch.logical_and(~finished, done)
+                        success_now = torch.zeros(num_envs_eval, dtype=torch.bool, device=base_env.device)
+                        first_success = torch.zeros(num_envs_eval, dtype=torch.bool, device=base_env.device)
+                        if "success" in stats_td.keys():
+                            success_now = (stats_td["success"].reshape(-1).float() >= 0.5).to(torch.bool)
+                            first_success = torch.logical_and(torch.logical_and(success_now, active), arrival_steps < 0)
+                            if first_success.any():
+                                arrival_steps[first_success] = step_count
+                            ep_success = torch.maximum(ep_success, success_now.to(torch.int32))
+
+                        # Capture final positions for envs that just finished.  Treat reaching the
+                        # goal as terminal for evaluation, even if the underlying env would keep
+                        # simulating and later report an out-of-bounds/contact death.
+                        just_finished = torch.logical_and(active, torch.logical_or(done, first_success))
                         if just_finished.any():
                             final_positions[just_finished] = current_pos[just_finished]
                             finish_steps[just_finished] = step_count
                             for e in torch.nonzero(just_finished, as_tuple=False).flatten().detach().cpu().tolist():
-                                try:
-                                    ep_death_reasons[int(e)] = _extract_death_reason_from_stats(stats_td, int(e))
-                                except Exception:
-                                    ep_death_reasons[int(e)] = "unknown"
+                                if bool(first_success[int(e)].item()) or bool(success_now[int(e)].item()):
+                                    ep_death_reasons[int(e)] = "success"
+                                else:
+                                    try:
+                                        ep_death_reasons[int(e)] = _extract_death_reason_from_stats(stats_td, int(e))
+                                    except Exception:
+                                        ep_death_reasons[int(e)] = "unknown"
 
-                        if active.any():
-                            ep_returns[active] += reward[active]
-                        finished = torch.logical_or(finished, done)
-                        if "success" in stats_td.keys():
-                            success_now = (stats_td["success"].reshape(-1).float() >= 0.5).to(torch.bool)
-                            first_success = torch.logical_and(success_now, arrival_steps < 0)
-                            if first_success.any():
-                                arrival_steps[first_success] = step_count
-                            ep_success = torch.maximum(ep_success, success_now.to(torch.int32))
+                        finished = torch.logical_or(finished, torch.logical_or(done, first_success))
 
                         if step % int(args.web_update_interval) == 0 or finished.all():
                             try:

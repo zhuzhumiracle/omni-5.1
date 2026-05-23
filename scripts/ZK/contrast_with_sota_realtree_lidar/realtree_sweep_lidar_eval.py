@@ -429,12 +429,12 @@ def surfel_cross_mesh(points, surfel_size=0.08):
 
 _DEATH_REASON_KEYS = [
     "death_z_low", "death_z_high", "death_overspeed",
-    "death_collision", "death_contact", "death_oob",
+    "death_contact", "death_oob",
     "death_flip", "death_nan",
 ]
 _DEATH_REASON_LABELS = [
     "z_low", "z_high", "overspeed",
-    "collision", "contact", "out_of_bounds",
+    "contact", "out_of_bounds",
     "flip", "nan",
 ]
 
@@ -476,12 +476,6 @@ def _infer_death_reason_from_env(base_env, env_idx):
             return "overspeed"
         if abs(float(pos[0].item())) > 20.0 or abs(float(pos[1].item())) > 30.0:
             return "out_of_bounds"
-
-        if hasattr(base_env, "lidar_scan"):
-            lidar_scan = base_env.lidar_scan.detach().reshape(int(base_env.num_envs), -1)[idx]
-            actual_dists = float(base_env.lidar_range) - lidar_scan
-            if bool((actual_dists < float(base_env.collision_dist)).any().item()):
-                return "collision"
 
         if bool(getattr(base_env, "reset_on_collision", False)):
             contact_force = base_env.drone.base_link.get_net_contact_forces()
@@ -1177,8 +1171,10 @@ def run_worker(args, hydra_overrides):
     if args.checkpoint_path:
         overrides.append(f"checkpoint_path={args.checkpoint_path}")
 
-    # 评估模式：仅保留 collision / contact / OOB / timeout 作为终止条件
+    # 评估模式：只用 IsaacSim 物理接触、OOB、timeout 判定失败；
+    # 禁用训练时的 LiDAR/距离阈值 collision 判定。
     overrides += [
+        "++task.collision_dist=-1.0",
         "++task.terminate_z_min=-9999",
         "++task.terminate_z_max=9999",
         "++task.terminate_v_norm=99999",

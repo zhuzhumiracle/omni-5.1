@@ -9,7 +9,7 @@ defaults:
 
 env:
   num_envs: 30
-  max_episode_length: 5000
+  max_episode_length: 10000
 
 # ../viewer:
 #   eye: [0., 8., 6.]
@@ -38,7 +38,9 @@ depth_data_type: distance_to_camera
 depth_max_range: 10.0
 depth_yaw_center_deg: 0.0
 depth_camera_pos: [0.22, 0.0, 0.18]
-depth_camera_target: [2.0, 0.0, 0.18]
+# Camera tilted upward ~23.4° so its vertical FOV (~±14°) lands within LiDAR pitch range [-7°, 52°].
+# tan(23.4°) ≈ 0.432; forward baseline ≈ 1.78 m → z offset ≈ 0.77 m above camera.
+depth_camera_target: [2.0, 0.0, 0.95]
 # Explicit pinhole camera intrinsics. USD defaults are narrow for obstacle
 # avoidance, so keep the sensor FOV controlled by config instead.
 depth_camera_focal_length: 12.0
@@ -112,42 +114,27 @@ topdown_lookat_z: 0.0
 reward_effort_weight: 0.1
 
 # ===== curriculum stage-1 (easy) =====
-goal_radius: 4 #7.0
-goal_bonus: 2000 #2000
+goal_radius: 7 #7.0
+goal_bonus: 3500 # final success must outweigh partial-progress shaping
 collision_dist: 0.25 #0.1 0.5 0.1
-collision_penalty: -5.0 #-30 -20
-
-# Start/goal corridor. Forest remains controlled by eval/train tree_map_size;
-# this only controls the drone task geometry.
-start_x_min: -5.0
-start_x_max: 5.0
-start_y: -24.0
-target_y: 24.0
-flight_z: 2.0
-target_x_mode: match_start # match_start | range | zero
-target_x_min: -5.0
-target_x_max: 5.0
-
-# Soft boundary penalty starts 10m before death. At/over the limit, episode terminates.
-boundary_x_limit: 20.0
-boundary_x_soft_start: 10.0
-boundary_y_limit: 40.0
-boundary_y_soft_start: 30.0
+collision_penalty: -40.0 #-30 -20 -5
+collision_speed_k: 80.0
+death_penalty: -2000.0
 
 # 分段里程碑奖励：按路程比例触发一次性奖励。
 # 当 milestone_segments=3 且 milestone_include_goal_segment=false 时，阈值为 1/3、2/3。
 milestone_segments: 10 #5
 milestone_include_goal_segment: false
-milestone_mid_reward: 700 #1000
+milestone_mid_reward: 1000 # keep milestones as hints, not the main objective
 # 每段奖励 = milestone_mid_reward * 对应百分比 / 100
 # 下面示例表示：第1段 100%，第2段 160%
-milestone_reward_percents: [50, 40, 30, 30, 20, 20, 20, 20, 20] #5个20
+milestone_reward_percents: [35, 15, 15, 15, 15, 15, 15, 15, 15]
 
 v_max: 10 #最新的报告好像显示最快的是8m/s，说是这个无人机的最高速度是15m/s，暂时设置成15，后续可以调整
 vlim: 10.0
 vlim_randomize: true
 vlim_train_min: 1.0
-vlim_train_max: 10.0
+vlim_train_max: 9.0
 observe_vlim: true
 normalize_velocity_rewards: true
 v_max_reward: 9.0
@@ -156,19 +143,21 @@ z_min: 1
 z_max: 6
 lambda_esdf: 0.8 #0.5
 k_esdf: 2.2 #1.6
+esdf_safe_dist: 0.5
+near_obstacle_slowdown_dist: 0.8
 
-w_forward: 10 # 3 30 6 10
-w_smooth: -0.5 #-0.5 --0.3
+w_forward: 15 # 3 30 6 10
+w_smooth: -0.3 #-0.5 --0.3
 w_max_speed: -0.5 #-0.1 -0.5
 w_z: -3 #-2
-w_esdf: 1.5 # 2 1
-w_yaw: 0.5 #0.3
+w_esdf: 8.0 # direct unsafe-distance penalty; r_esdf is negative inside safe band
+w_near_obstacle_speed: -1.0
+w_yaw: 0.5 #0.3 0.5
 w_thrust: -0.1
-w_boundary: -5.0
 # 延迟型时间惩罚：只惩罚“过了宽限期仍缺少路程进度”的拖延行为。
 # 30s episode 中 12s 后平滑启动，进度越高惩罚越弱，避免误伤慢速避障。
-w_time: 1.0
-time_penalty_grace_seconds: 12.0
+w_time: 2.0
+time_penalty_grace_seconds: 150.0
 time_penalty_power: 2.0
 time_penalty_progress_thresholds: [0.2, 0.4, 0.6]
 time_penalty_progress_discounts: [1.0, 0.5, 0.25, 0.0]

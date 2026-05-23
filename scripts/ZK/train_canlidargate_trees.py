@@ -1194,12 +1194,39 @@ def main(cfg):
             depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
             camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
             camera_v_fov_rad = 2.0 * math.atan(depth_h_cfg / (2.0 * fy))
-            # Effective pitch range = camera vFoV ∩ LiDAR vFoV
+            # Effective pitch range = tilted camera vFoV ∩ LiDAR vFoV.
+            # The environment builds camera-risk sectors from this same body-frame axis.
             _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
             lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
             lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
-            fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
-            fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
+            cam_pos_cfg = np.asarray(cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]), dtype=np.float64)
+            cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]), dtype=np.float64)
+            cam_axis = cam_target_cfg - cam_pos_cfg
+            cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
+            if float(np.linalg.norm(cam_axis)) <= 1e-9:
+                raise RuntimeError("depth_camera_pos and depth_camera_target must not coincide.")
+            cam_pitch_rad = math.atan2(float(cam_axis[2]), cam_xy_norm)
+            cam_pitch_min = cam_pitch_rad - camera_v_fov_rad / 2.0
+            cam_pitch_max = cam_pitch_rad + camera_v_fov_rad / 2.0
+            fov_pitch_min = max(cam_pitch_min, lidar_pitch_min)
+            fov_pitch_max = min(cam_pitch_max, lidar_pitch_max)
+            if fov_pitch_max <= fov_pitch_min:
+                raise RuntimeError(
+                    "Camera vertical FoV does not overlap LiDAR pitch range: "
+                    f"camera=[{math.degrees(cam_pitch_min):.2f}, {math.degrees(cam_pitch_max):.2f}]deg, "
+                    f"lidar=[{math.degrees(lidar_pitch_min):.2f}, {math.degrees(lidar_pitch_max):.2f}]deg."
+                )
+            logging.info(
+                "LC-gate pitch masks aligned to camera axis: pitch=%.2fdeg, "
+                "camera_vfov=[%.2f, %.2f]deg, lidar=[%.2f, %.2f]deg, overlap=[%.2f, %.2f]deg.",
+                math.degrees(cam_pitch_rad),
+                math.degrees(cam_pitch_min),
+                math.degrees(cam_pitch_max),
+                math.degrees(lidar_pitch_min),
+                math.degrees(lidar_pitch_max),
+                math.degrees(fov_pitch_min),
+                math.degrees(fov_pitch_max),
+            )
             expected_feature_dim = 128
 
             actor_backbone = DualStreamBackbone(

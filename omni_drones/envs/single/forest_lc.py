@@ -139,15 +139,42 @@ class forest_lc(IsaacEnv):
 
         # ---------- camera risk observation config ----------
         self.use_camera_risk_observation = bool(cfg.task.get("use_camera_risk_observation", False))
-        self.camera_risk_num_bins = int(cfg.task.get("camera_risk_num_bins", 5))
+        # rows split pitch, cols split yaw. Legacy camera_risk_num_bins remains
+        # a 1-row fallback for older forest_lc configs.
+        _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+        _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+        _num_bins = int(cfg.task.get("camera_risk_num_bins", 3))
+        if _num_rows <= 0 and _num_cols <= 0:
+            self.camera_risk_num_rows = 1
+            self.camera_risk_num_cols = _num_bins
+        elif _num_rows <= 0:
+            self.camera_risk_num_rows = 1
+            self.camera_risk_num_cols = _num_cols
+        elif _num_cols <= 0:
+            self.camera_risk_num_rows = _num_rows
+            self.camera_risk_num_cols = 1
+        else:
+            self.camera_risk_num_rows = _num_rows
+            self.camera_risk_num_cols = _num_cols
+        if self.camera_risk_num_rows <= 0 or self.camera_risk_num_cols <= 0:
+            raise ValueError(
+                "camera_risk_num_rows and camera_risk_num_cols must be positive; "
+                f"got rows={self.camera_risk_num_rows}, cols={self.camera_risk_num_cols}."
+            )
+        self.camera_risk_total_sectors = self.camera_risk_num_rows * self.camera_risk_num_cols
         self.camera_risk_features_per_bin = int(cfg.task.get("camera_risk_features_per_bin", 4))
+        if self.camera_risk_features_per_bin != 4:
+            raise ValueError(
+                "forest_lc camera risk emits four features per sector; "
+                f"got camera_risk_features_per_bin={self.camera_risk_features_per_bin}."
+            )
         self.camera_risk_add_stale_ratio = bool(cfg.task.get("camera_risk_add_stale_ratio", True))
         self.camera_danger_dist = float(cfg.task.get("camera_danger_dist", 3.0))
         self.camera_risk_min_valid_depth = float(cfg.task.get("camera_risk_min_valid_depth", 0.1))
 
         # camera_risk_dim 必须在 super().__init__ 之前计算，_set_specs 在 super 里会用到
         self.camera_risk_dim = (
-            self.camera_risk_num_bins * self.camera_risk_features_per_bin
+            self.camera_risk_total_sectors * self.camera_risk_features_per_bin
             + (1 if self.camera_risk_add_stale_ratio else 0)
         )
 
@@ -388,8 +415,16 @@ class forest_lc(IsaacEnv):
         # R maps column vector P_cam -> P_body: P_body = R @ P_cam + t.
         self._R_cam2body = torch.stack((_right, _up, -_forward), dim=1)
 
+        # Precompute camera optical axis pitch angle in body frame (radians).
+        _cam_forward_body = torch.nn.functional.normalize(_forward, dim=0)
+        self._cam_pitch_rad = float(torch.atan2(
+            _cam_forward_body[2],
+            torch.sqrt(_cam_forward_body[0] * _cam_forward_body[0] + _cam_forward_body[1] * _cam_forward_body[1])
+        ).item())
+
         # ---------- precompute camera ray directions (same for all envs) ----------
         if self.use_camera_risk_observation:
+            self._validate_camera_fov_inside_lidar()
             self._precompute_camera_ray_dirs()
             self._precompute_lidar_ray_bins()
 
@@ -416,6 +451,12 @@ class forest_lc(IsaacEnv):
         # camera risk cache: [E, 1, camera_risk_dim]
         self.camera_risk_cache = torch.zeros(
             (self.num_envs, 1, self.camera_risk_dim),
+            device=self.device,
+        )
+        # obstacle distance bin cache (k-frame fused, shared with camera-LiDAR risk)
+        self.obstacle_dist_bin_cache = torch.full(
+            (self.num_envs, self.downsampled_dim),
+            self.max_obs_dist,
             device=self.device,
         )
         self._depth_prev_frame = None
@@ -842,6 +883,37 @@ class forest_lc(IsaacEnv):
             float(v_ap),
         )
 
+    def _validate_camera_fov_inside_lidar(self):
+        """Ensure the depth camera vertical FoV is fully covered by Mid360 pitch FoV."""
+        lidar_pitch_min = float(self.cfg.task.lidar_vfov[0])
+        lidar_pitch_max = float(self.cfg.task.lidar_vfov[1])
+        camera_pitch = math.degrees(float(self._cam_pitch_rad))
+        camera_vfov = math.degrees(
+            2.0 * math.atan(self.depth_h / (2.0 * max(float(self.fy), 1e-6)))
+        )
+        camera_pitch_min = camera_pitch - camera_vfov / 2.0
+        camera_pitch_max = camera_pitch + camera_vfov / 2.0
+
+        tol_deg = 1e-3
+        if (
+            camera_pitch_min < lidar_pitch_min - tol_deg
+            or camera_pitch_max > lidar_pitch_max + tol_deg
+        ):
+            raise ValueError(
+                "Depth camera vertical FoV must be inside LiDAR pitch FoV for camera-risk fusion: "
+                f"camera=[{camera_pitch_min:.3f}, {camera_pitch_max:.3f}] deg, "
+                f"lidar=[{lidar_pitch_min:.3f}, {lidar_pitch_max:.3f}] deg. "
+                "Adjust depth_camera_target or camera intrinsics."
+            )
+
+        logging.info(
+            "[camera-risk] Camera vertical FoV [%.3f, %.3f] deg is inside LiDAR pitch FoV [%.3f, %.3f] deg.",
+            camera_pitch_min,
+            camera_pitch_max,
+            lidar_pitch_min,
+            lidar_pitch_max,
+        )
+
     def _precompute_lidar_ray_bins(self):
         """Precompute which LiDAR yaw-pitch bin each of the 20000 rays maps to."""
         ray_dirs = self.ray_dirs_local  # [P, 3]
@@ -862,22 +934,14 @@ class forest_lc(IsaacEnv):
 
     def _compute_lidar_dist_per_bin(self) -> torch.Tensor:
         """
-        Compute minimum LiDAR distance in each yaw-pitch bin for every env.
+        Return the k-frame fused minimum LiDAR distance in each yaw-pitch bin.
+        Uses the cached obstacle_dist_bin produced by _encode_lidar_observation,
+        which fuses the last k_hist frames' hit points transformed to the current body frame.
+
+        This is the SAME multi-frame fusion the policy sees — consistent with camera risk.
         Returns [E, downsampled_dim].
         """
-        E = self.num_envs
-        lidar_scan = self.lidar_scan_cache  # [E, 1, P]
-        lidar_dist = (self.lidar_range - lidar_scan.squeeze(1)).clamp(0.0, self.max_obs_dist)  # [E, P]
-
-        out = torch.full(
-            (E, self.downsampled_dim), self.max_obs_dist, device=self.device, dtype=torch.float32
-        )
-        env_offset = torch.arange(E, device=self.device).unsqueeze(1) * self.downsampled_dim  # [E, 1]
-        flat_idx = (env_offset + self._ray_lidar_bin.unsqueeze(0)).reshape(-1)  # [E*P]
-        lidar_flat = lidar_dist.reshape(-1)  # [E*P]
-        out_flat = out.view(-1)
-        out_flat.scatter_reduce_(0, flat_idx, lidar_flat, reduce="amin", include_self=True)
-        return out
+        return self.obstacle_dist_bin_cache
 
     def _project_depth_to_lidar_bins(self, depth_flat: torch.Tensor):
         """
@@ -957,7 +1021,8 @@ class forest_lc(IsaacEnv):
         Compute compact camera-LiDAR disagreement risk features.
         Called only when use_camera_risk_observation=True and depth is dirty.
 
-        Returns [E, 1, camera_risk_dim] where camera_risk_dim = num_bins * features_per_bin + stale.
+        Returns [E, 1, camera_risk_dim] where camera_risk_dim =
+        rows * cols * features_per_bin + stale.
         """
         E = self.num_envs
         depth_flat = self.depth_obs_cache  # [E, 1, H*W]
@@ -968,7 +1033,7 @@ class forest_lc(IsaacEnv):
         # ---- Step 2: LiDAR distance per bin ----
         lidar_dist_bin = self._compute_lidar_dist_per_bin()  # [E, downsampled_dim]
 
-        # ---- Step 3: build front-camera FoV sectors: right / center / left ----
+        # ---- Step 3: build front-camera FoV grid ----
         yaw_ids = torch.arange(self.num_yaw_bins, device=self.device, dtype=torch.float32)
         pitch_ids = torch.arange(self.num_pitch_bins, device=self.device, dtype=torch.float32)
 
@@ -987,11 +1052,15 @@ class forest_lc(IsaacEnv):
             self.depth_h / (2.0 * self.fy), device=self.device
         ))
 
-        # Intersect with LiDAR pitch range
+        # Intersect camera FoV with LiDAR pitch range.
+        # Camera FoV is centered at self._cam_pitch_rad (body-frame pitch of optical axis).
         lidar_pitch_min = math.radians(float(self.cfg.task.lidar_vfov[0]))
         lidar_pitch_max = math.radians(float(self.cfg.task.lidar_vfov[1]))
-        pitch_min = max(-float(v_fov) / 2.0, lidar_pitch_min)
-        pitch_max = min(float(v_fov) / 2.0, lidar_pitch_max)
+        cam_pitch = float(self._cam_pitch_rad)
+        cam_pitch_min = cam_pitch - float(v_fov) / 2.0
+        cam_pitch_max = cam_pitch + float(v_fov) / 2.0
+        pitch_min = max(cam_pitch_min, lidar_pitch_min)
+        pitch_max = min(cam_pitch_max, lidar_pitch_max)
 
         # [num_pitch_bins, num_yaw_bins] grids
         yaw_grid = yaw.unsqueeze(0).expand(self.num_pitch_bins, -1)
@@ -1005,12 +1074,29 @@ class forest_lc(IsaacEnv):
             (pitch_grid <= pitch_max)
         )
 
-        # Three front sectors — yaw>0 is left, yaw<0 is right
-        sector_masks = [
-            front_mask & (yaw_grid < -h_fov / 6.0),                                      # front-right
-            front_mask & (yaw_grid >= -h_fov / 6.0) & (yaw_grid <= h_fov / 6.0),          # front-center
-            front_mask & (yaw_grid > h_fov / 6.0),                                       # front-left
-        ]
+        num_rows = max(1, self.camera_risk_num_rows)
+        num_cols = max(1, self.camera_risk_num_cols)
+        sector_masks = []
+        for row_idx in range(num_rows):
+            pitch_lower = pitch_min + row_idx * (pitch_max - pitch_min) / num_rows
+            pitch_upper = pitch_min + (row_idx + 1) * (pitch_max - pitch_min) / num_rows
+            if row_idx == 0:
+                pitch_sector = pitch_grid <= pitch_upper
+            elif row_idx == num_rows - 1:
+                pitch_sector = pitch_grid > pitch_lower
+            else:
+                pitch_sector = (pitch_grid > pitch_lower) & (pitch_grid <= pitch_upper)
+
+            for col_idx in range(num_cols):
+                yaw_lower = -h_fov / 2.0 + col_idx * h_fov / num_cols
+                yaw_upper = -h_fov / 2.0 + (col_idx + 1) * h_fov / num_cols
+                if col_idx == 0:
+                    yaw_sector = yaw_grid <= yaw_upper
+                elif col_idx == num_cols - 1:
+                    yaw_sector = yaw_grid > yaw_lower
+                else:
+                    yaw_sector = (yaw_grid > yaw_lower) & (yaw_grid <= yaw_upper)
+                sector_masks.append(front_mask & pitch_sector & yaw_sector)
 
         sector_masks = [m.reshape(-1).unsqueeze(0).expand(E, -1) for m in sector_masks]
 
@@ -1029,6 +1115,7 @@ class forest_lc(IsaacEnv):
             n_bins = sector_mask.sum(dim=-1).clamp_min(1).float()
             both_valid = cam_valid_s & (d_lidar_s < self.max_obs_dist - 1e-6)
             n_both = both_valid.sum(dim=-1).clamp_min(1).float()
+            lidar_has_obs = sector_mask & (d_lidar_s < self.max_obs_dist - 1e-6)
 
             # 1. 相机在该前方区域内的有效覆盖率
             feat1 = cam_valid_s.sum(dim=-1).float() / n_bins
@@ -1038,12 +1125,11 @@ class forest_lc(IsaacEnv):
             diff[~both_valid] = 0.0
             feat2 = (diff.sum(dim=-1) / n_both) / self.depth_max_range
 
-            # 3. 相机看到比雷达更近的障碍
-            danger = both_valid & (d_cam_s < d_lidar_s - self.camera_danger_dist)
+            # 3. 相机看到比雷达更近的障碍；LiDAR no-hit bin 也属于补盲信号
+            danger = cam_valid_s & (d_cam_s < d_lidar_s - self.camera_danger_dist)
             feat3 = danger.sum(dim=-1).float() / n_bins
 
             # 4. 雷达看到障碍，但相机该区域无有效深度
-            lidar_has_obs = sector_mask & (d_lidar_s < self.max_obs_dist - 1e-6)
             blind = lidar_has_obs & (~cam_valid_s)
             feat4 = blind.sum(dim=-1).float() / n_bins
 
@@ -1203,6 +1289,7 @@ class forest_lc(IsaacEnv):
         self.encoded_lidar_cache[env_ids] = self.max_obs_dist
         self.lidar_scan_cache[env_ids] = 0.0
         self.depth_obs_cache[env_ids] = 0.0
+        self.obstacle_dist_bin_cache[env_ids] = self.max_obs_dist
         if self.use_camera_risk_observation:
             self.camera_risk_cache[env_ids] = 0.0
         self.lidar_dirty = True
@@ -1796,6 +1883,9 @@ class forest_lc(IsaacEnv):
         has_obstacle = obstacle_dist_bin < (self.max_obs_dist - 1e-6)
 
         d_unknown = observed_free_dist_bin.clamp(0.0, self.max_obs_dist)
+
+        # Cache the k-frame fused obstacle distance bin for camera-LiDAR risk computation.
+        self.obstacle_dist_bin_cache.copy_(obstacle_dist_bin)
 
         encoded_lidar = torch.where(
             has_obstacle,

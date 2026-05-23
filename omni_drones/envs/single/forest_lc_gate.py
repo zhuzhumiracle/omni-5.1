@@ -201,6 +201,7 @@ class forest_lc_gate(IsaacEnv):
         self.goal_radius = float(cfg.task.get("goal_radius", 2.0))
         self.goal_bonus = float(cfg.task.get("goal_bonus", 1000.0))
         self.collision_penalty = float(cfg.task.get("collision_penalty", -20.0))
+        self.death_penalty = float(cfg.task.get("death_penalty", -2000.0))
         # 速度相关碰撞惩罚系数: r_collision = -k * v
         # 默认使用原固定惩罚绝对值，保持量级连续可控
         self.collision_speed_k = float(cfg.task.get("collision_speed_k", abs(self.collision_penalty)))
@@ -275,7 +276,21 @@ class forest_lc_gate(IsaacEnv):
         self.w_esdf = float(cfg.task.get("w_esdf", 1.5))
         self.w_yaw = float(cfg.task.get("w_yaw", 0.5))
         self.w_thrust = float(cfg.task.get("w_thrust", 0.0))
-        self.w_boundary = float(cfg.task.get("w_boundary", -5.0))
+        self.w_boundary = float(cfg.task.get("w_boundary", -25.0))
+        self.w_time = float(cfg.task.get("w_time", 0.0))
+        self.w_near_obstacle_speed = float(cfg.task.get("w_near_obstacle_speed", -4.0))
+        self.esdf_safe_dist = float(cfg.task.get("esdf_safe_dist", max(1.0, self.collision_dist * 3.0)))
+        self.near_obstacle_slowdown_dist = float(
+            cfg.task.get("near_obstacle_slowdown_dist", max(self.esdf_safe_dist, self.collision_dist * 4.0))
+        )
+        self.time_penalty_grace_seconds = float(cfg.task.get("time_penalty_grace_seconds", 150.0))
+        self.time_penalty_power = float(cfg.task.get("time_penalty_power", 2.0))
+        self.time_penalty_progress_thresholds = [
+            float(x) for x in cfg.task.get("time_penalty_progress_thresholds", [0.2, 0.4, 0.6])
+        ]
+        self.time_penalty_progress_discounts = [
+            float(x) for x in cfg.task.get("time_penalty_progress_discounts", [1.0, 0.5, 0.25, 0.0])
+        ]
 
         self.terminate_z_min = float(cfg.task.get("terminate_z_min", 0.2))
         self.terminate_z_max = float(cfg.task.get("terminate_z_max", 5.0))
@@ -434,6 +449,15 @@ class forest_lc_gate(IsaacEnv):
         # R maps column vector P_cam -> P_body: P_body = R @ P_cam + t.
         self._R_cam2body = torch.stack((_right, _up, -_forward), dim=1)
 
+        # Precompute camera optical axis pitch angle in body frame (radians).
+        # Camera looks along -Z in its local frame; R maps this to body +forward direction.
+        # The pitch is the angle between the body forward projection onto XY plane and the actual forward.
+        _cam_forward_body = torch.nn.functional.normalize(_forward, dim=0)
+        self._cam_pitch_rad = float(torch.atan2(
+            _cam_forward_body[2],
+            torch.sqrt(_cam_forward_body[0] * _cam_forward_body[0] + _cam_forward_body[1] * _cam_forward_body[1])
+        ).item())
+
         # ---------- precompute camera ray directions (same for all envs) ----------
         if self.use_camera_risk_observation:
             self._precompute_camera_ray_dirs()
@@ -462,6 +486,13 @@ class forest_lc_gate(IsaacEnv):
         # camera risk cache: [E, 1, camera_risk_dim]
         self.camera_risk_cache = torch.zeros(
             (self.num_envs, 1, self.camera_risk_dim),
+            device=self.device,
+        )
+        # obstacle distance bin cache (k-frame fused, shared with camera-LiDAR risk)
+        # [E, downsampled_dim] -- same multi-frame fusion used by LiDAR encoding
+        self.obstacle_dist_bin_cache = torch.full(
+            (self.num_envs, self.downsampled_dim),
+            self.max_obs_dist,
             device=self.device,
         )
         self._depth_prev_frame = None
@@ -494,6 +525,8 @@ class forest_lc_gate(IsaacEnv):
             "reward_thrust",
             "reward_milestone",
             "reward_boundary",
+            "reward_time",
+            "reward_near_obstacle_speed",
             "action_sat",  # <==== 加入这行！
             "death_z_low",
             "death_z_high",
@@ -917,22 +950,14 @@ class forest_lc_gate(IsaacEnv):
 
     def _compute_lidar_dist_per_bin(self) -> torch.Tensor:
         """
-        Compute minimum LiDAR distance in each yaw-pitch bin for every env.
+        Return the k-frame fused minimum LiDAR distance in each yaw-pitch bin.
+        Uses the cached obstacle_dist_bin produced by _encode_lidar_observation,
+        which fuses the last k_hist frames' hit points transformed to the current body frame.
+
+        This is the SAME multi-frame fusion the policy sees — consistent with camera risk.
         Returns [E, downsampled_dim].
         """
-        E = self.num_envs
-        lidar_scan = self.lidar_scan_cache  # [E, 1, P]
-        lidar_dist = (self.lidar_range - lidar_scan.squeeze(1)).clamp(0.0, self.max_obs_dist)  # [E, P]
-
-        out = torch.full(
-            (E, self.downsampled_dim), self.max_obs_dist, device=self.device, dtype=torch.float32
-        )
-        env_offset = torch.arange(E, device=self.device).unsqueeze(1) * self.downsampled_dim  # [E, 1]
-        flat_idx = (env_offset + self._ray_lidar_bin.unsqueeze(0)).reshape(-1)  # [E*P]
-        lidar_flat = lidar_dist.reshape(-1)  # [E*P]
-        out_flat = out.view(-1)
-        out_flat.scatter_reduce_(0, flat_idx, lidar_flat, reduce="amin", include_self=True)
-        return out
+        return self.obstacle_dist_bin_cache
 
     def _project_depth_to_lidar_bins(self, depth_flat: torch.Tensor):
         """
@@ -1042,11 +1067,16 @@ class forest_lc_gate(IsaacEnv):
             self.depth_h / (2.0 * self.fy), device=self.device
         ))
 
-        # Intersect with LiDAR pitch range
+        # Intersect camera FoV with LiDAR pitch range.
+        # Camera FoV is centered at self._cam_pitch_rad (body-frame pitch of optical axis),
+        # NOT at pitch=0. This is critical when the camera is tilted (e.g. 23.4° upward).
         lidar_pitch_min = math.radians(float(self.cfg.task.lidar_vfov[0]))
         lidar_pitch_max = math.radians(float(self.cfg.task.lidar_vfov[1]))
-        pitch_min = max(-float(v_fov) / 2.0, lidar_pitch_min)
-        pitch_max = min(float(v_fov) / 2.0, lidar_pitch_max)
+        cam_pitch = float(self._cam_pitch_rad)
+        cam_pitch_min = cam_pitch - float(v_fov) / 2.0
+        cam_pitch_max = cam_pitch + float(v_fov) / 2.0
+        pitch_min = max(cam_pitch_min, lidar_pitch_min)
+        pitch_max = min(cam_pitch_max, lidar_pitch_max)
 
         # [num_pitch_bins, num_yaw_bins] grids
         yaw_grid = yaw.unsqueeze(0).expand(self.num_pitch_bins, -1)
@@ -1092,7 +1122,8 @@ class forest_lc_gate(IsaacEnv):
             cam_valid_s = cam_valid_bin & sector_mask
 
             n_bins = sector_mask.sum(dim=-1).clamp_min(1).float()
-            both_valid = cam_valid_s & (d_lidar_s < self.max_obs_dist - 1e-6)
+            lidar_has_obs = sector_mask & (d_lidar_s < self.max_obs_dist - 1e-6)
+            both_valid = cam_valid_s & lidar_has_obs
             n_both = both_valid.sum(dim=-1).clamp_min(1).float()
 
             # 1. 相机在该前方区域内的有效覆盖率
@@ -1103,12 +1134,13 @@ class forest_lc_gate(IsaacEnv):
             diff[~both_valid] = 0.0
             feat2 = (diff.sum(dim=-1) / n_both) / self.depth_max_range
 
-            # 3. 相机看到比雷达更近的障碍
-            danger = both_valid & (d_cam_s < d_lidar_s - self.camera_danger_dist)
+            # 3. 相机看到比雷达更近的障碍。
+            # 对 LiDAR no-hit bin，d_lidar_s 保持 max_obs_dist；这些 camera-only
+            # 障碍正是 camera risk 需要补给稀疏 LiDAR 的信号。
+            danger = cam_valid_s & (d_cam_s < d_lidar_s - self.camera_danger_dist)
             feat3 = danger.sum(dim=-1).float() / n_bins
 
             # 4. 雷达看到障碍，但相机该区域无有效深度
-            lidar_has_obs = sector_mask & (d_lidar_s < self.max_obs_dist - 1e-6)
             blind = lidar_has_obs & (~cam_valid_s)
             feat4 = blind.sum(dim=-1).float() / n_bins
 
@@ -1199,6 +1231,17 @@ class forest_lc_gate(IsaacEnv):
             "reward_thrust": Unbounded(1),
             "reward_milestone": Unbounded(1),
             "reward_boundary": Unbounded(1),
+            "reward_time": Unbounded(1),
+            "reward_near_obstacle_speed": Unbounded(1),
+            "action_sat": Unbounded(1),
+            "death_z_low": Unbounded(1),
+            "death_z_high": Unbounded(1),
+            "death_overspeed": Unbounded(1),
+            "death_collision": Unbounded(1),
+            "death_contact": Unbounded(1),
+            "death_oob": Unbounded(1),
+            "death_flip": Unbounded(1),
+            "death_nan": Unbounded(1),
         }
         for i in range(self.num_milestones):
             stats_spec_dict[f"reward_milestone_{i + 1}"] = Unbounded(1)
@@ -1279,6 +1322,7 @@ class forest_lc_gate(IsaacEnv):
         self.encoded_lidar_cache[env_ids] = self.max_obs_dist
         self.lidar_scan_cache[env_ids] = 0.0
         self.depth_obs_cache[env_ids] = 0.0
+        self.obstacle_dist_bin_cache[env_ids] = self.max_obs_dist
         if self.use_camera_risk_observation:
             self.camera_risk_cache[env_ids] = 0.0
         self.lidar_dirty = True
@@ -1858,6 +1902,11 @@ class forest_lc_gate(IsaacEnv):
 
         d_unknown = observed_free_dist_bin.clamp(0.0, self.max_obs_dist)
 
+        # Cache the k-frame fused obstacle distance bin for camera-LiDAR risk computation.
+        # This ensures _compute_lidar_dist_per_bin uses the SAME multi-frame fusion that
+        # the policy sees, instead of a stale single-frame snapshot.
+        self.obstacle_dist_bin_cache.copy_(obstacle_dist_bin)
+
         encoded_lidar = torch.where(
             has_obstacle,
             obstacle_dist_bin,      # [0, max_obs_dist]
@@ -2109,8 +2158,38 @@ class forest_lc_gate(IsaacEnv):
         # 计算误差
         r_thrust = torch.abs(t_val - g_val)
 
-        #r_esdf = -self.lambda_esdf * torch.exp(-self.k_esdf * (d ** 2))
-        r_esdf = self.lambda_esdf * (1.0 - torch.exp(-self.k_esdf * (d ** 2)))
+        # Penalize the unsafe band directly. The previous positive ESDF bonus
+        # rewarded "being far from trees", but it did not give a sharp enough
+        # gradient for slowing down near trunks.
+        safe_dist = max(float(self.esdf_safe_dist), float(self.collision_dist) + 1e-3)
+        unsafe_ratio = torch.relu(safe_dist - d) / safe_dist
+        r_esdf = -self.lambda_esdf * torch.square(unsafe_ratio)
+
+        slowdown_dist = max(float(self.near_obstacle_slowdown_dist), safe_dist + 1e-3)
+        near_obstacle_ratio = torch.relu(slowdown_dist - d) / slowdown_dist
+        speed_ratio_for_safety = v_norm / speed_ref
+        r_near_obstacle_speed = torch.square(near_obstacle_ratio) * torch.square(speed_ratio_for_safety)
+
+        if self.num_milestones > 0:
+            progress_ratio = ((self.init_goal_dist - curr_dist) / self.init_goal_dist).clamp(0.0, 1.0)
+        else:
+            progress_ratio = torch.zeros_like(curr_dist)
+
+        elapsed_seconds = self.progress_buf.unsqueeze(-1).to(curr_dist.dtype) * float(self.dt)
+        time_over = torch.relu(elapsed_seconds - float(self.time_penalty_grace_seconds))
+        time_denom = max(float(self.time_penalty_grace_seconds), 1e-6)
+        r_time = -torch.pow(time_over / time_denom, float(self.time_penalty_power))
+        if len(self.time_penalty_progress_discounts) > 0:
+            progress_discount = torch.full_like(r_time, float(self.time_penalty_progress_discounts[0]))
+            for idx, threshold in enumerate(self.time_penalty_progress_thresholds):
+                discount_idx = min(idx + 1, len(self.time_penalty_progress_discounts) - 1)
+                progress_discount = torch.where(
+                    progress_ratio >= float(threshold),
+                    torch.full_like(progress_discount, float(self.time_penalty_progress_discounts[discount_idx])),
+                    progress_discount,
+                )
+            r_time = r_time * progress_discount
+
         is_collision = d < self.collision_dist
         if self.reset_on_collision:
             contact_force = self.drone.base_link.get_net_contact_forces()
@@ -2125,7 +2204,6 @@ class forest_lc_gate(IsaacEnv):
         r_collision = -self.collision_speed_k * v_norm * collision_mask
 
         if self.num_milestones > 0:
-            progress_ratio = ((self.init_goal_dist - curr_dist) / self.init_goal_dist).clamp(0.0, 1.0)
             stage_reward_parts = []
             stage_reward_total = torch.zeros_like(curr_dist)
             for i in range(self.num_milestones):
@@ -2177,8 +2255,9 @@ class forest_lc_gate(IsaacEnv):
             out_of_bounds|
             flip_early  # 加入翻滚判定
         )
-        # 核心改动 1：增加死亡惩罚！死一次扣 1000 分，让它不敢轻易死
-        r_death = misbehave.float() * -1000#-1000             
+        # Death must dominate partial progress; otherwise the agent can collect
+        # milestones and still learn to accept a crash.
+        r_death = misbehave.float() * self.death_penalty
         x_body = self.drone.heading[..., :3]
         # r_yaw = (x_body * vel_direction).sum(-1)
 
@@ -2205,15 +2284,41 @@ class forest_lc_gate(IsaacEnv):
         # align_goal = (x_body * goal_dir).sum(-1)
 
         # r_yaw = 0.4 * align_vel + 0.6 * align_goal
-        move_dir = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
-        x_body = self.drone.heading[..., :3]
-        r_yaw = (x_body * move_dir).sum(-1)      
+        
+        
+        # move_dir = v / v_norm.unsqueeze(-1).clamp_min(1e-6)
+        # goal_dir = self.target_pos - curr_pos
+        # goal_dir = goal_dir / goal_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        # x_body = self.drone.heading[..., :3]
+        # speed_mask = (v_norm > 0.3).float()
+        # align_move = (x_body * move_dir).sum(-1)
+        # align_goal = (x_body * goal_dir).sum(-1)
+        # r_yaw = speed_mask * align_move + (1.0 - speed_mask) * align_goal
+        
+        v_xy = v[..., :2]
+        v_xy_norm = v_xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        move_dir_xy = v_xy / v_xy_norm
+
+        goal_vec_xy = (self.target_pos - curr_pos)[..., :2]
+        goal_dir_xy = goal_vec_xy / goal_vec_xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        heading_xy = self.drone.heading[..., :2]
+        heading_xy = heading_xy / heading_xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        speed_mask = torch.sigmoid((v_xy_norm.squeeze(-1) - 4.0) / 0.1)
+
+        align_move = (heading_xy * move_dir_xy).sum(-1)
+        align_goal = (heading_xy * goal_dir_xy).sum(-1)
+
+        r_yaw = speed_mask * align_move + (1.0 - speed_mask) * align_goal
         reward = (
             self.w_forward * r_forward +
             self.w_smooth * r_smoothness +
             self.w_max_speed * r_max_speed +
             self.w_z * r_z +
             self.w_esdf * r_esdf +
+            self.w_near_obstacle_speed * r_near_obstacle_speed +
+            self.w_time * r_time +
             r_collision +
             r_death +
             self.w_boundary * r_boundary +
@@ -2245,6 +2350,10 @@ class forest_lc_gate(IsaacEnv):
         self.stats["reward_goal"].add_(reward_scale * r_goal.view(-1, 1))
         self.stats["reward_death"].add_(reward_scale * r_death.view(-1, 1))
         self.stats["reward_boundary"].add_(reward_scale * self.w_boundary * r_boundary.view(-1, 1))
+        self.stats["reward_time"].add_(reward_scale * self.w_time * r_time.view(-1, 1))
+        self.stats["reward_near_obstacle_speed"].add_(
+            reward_scale * self.w_near_obstacle_speed * r_near_obstacle_speed.view(-1, 1)
+        )
         # 第 694 行：此时 r_thrust 已经是严谨的 (150, 1) 了，直接计算即可
         self.stats["reward_thrust"].add_(reward_scale * self.w_thrust * r_thrust)
         self.stats["reward_milestone"].add_(reward_scale * stage_reward_total.view(-1, 1))
@@ -2254,7 +2363,7 @@ class forest_lc_gate(IsaacEnv):
 
         # 更新已有的基础统计数据 (记得删掉之前重复的 self.stats["return"] += reward)
         # self.stats["return"].add_(reward.view(-1, 1))
-        self.stats["safety"].add_(r_esdf.view(-1, 1))
+        self.stats["safety"].add_((1.0 - unsafe_ratio).clamp(0.0, 1.0).view(-1, 1))
         self.stats["action_smoothness"].add_(action_diff.norm(dim=-1))
         
         

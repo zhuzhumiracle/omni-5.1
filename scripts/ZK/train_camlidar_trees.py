@@ -439,8 +439,14 @@ class DualStreamBackbone(torch.nn.Module):
         self.camera_risk_dim = int(camera_risk_dim)
         self.camera_risk_gate_alpha = float(camera_risk_gate_alpha)
         self.camera_risk_fusion_mode = str(camera_risk_fusion_mode).lower()
+        if self.camera_risk_fusion_mode not in {"gate", "concat"}:
+            raise ValueError(
+                f"camera_risk_fusion_mode must be 'gate' or 'concat', got {camera_risk_fusion_mode}"
+            )
 
         self.ku_value_max = float(ku_value_max)
+        if self.ku_value_max <= 0.0:
+            raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
         self.ku_unknown_value = self.ku_value_max
         self.ku_h = 40
         self.ku_w = 80
@@ -891,18 +897,47 @@ def main(cfg):
         obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
         lidar_dim = 3200
         ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-        expected_camera_risk_dim = int(cfg.task.get("camera_risk_num_bins", 5)) * int(
-            cfg.task.get("camera_risk_features_per_bin", 4)
-        )
-        if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
-            expected_camera_risk_dim += 1
+
+        # Prefer dimensions owned by the environment; forest_lc and forest_lc_gate
+        # expose different camera-risk layouts even though both append it to obs.
+        expected_camera_risk_dim = getattr(base_env, "camera_risk_dim", None)
+        if expected_camera_risk_dim is None:
+            num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+            num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+            num_bins = int(cfg.task.get("camera_risk_num_bins", 5))
+            if num_rows <= 0 and num_cols <= 0:
+                grid_rows, grid_cols = 1, num_bins
+            elif num_rows <= 0:
+                grid_rows, grid_cols = 1, num_cols
+            elif num_cols <= 0:
+                grid_rows, grid_cols = num_rows, 1
+            else:
+                grid_rows, grid_cols = num_rows, num_cols
+            expected_camera_risk_dim = (
+                grid_rows
+                * grid_cols
+                * int(cfg.task.get("camera_risk_features_per_bin", 4))
+            )
+            if bool(cfg.task.get("camera_risk_add_stale_ratio", True)):
+                expected_camera_risk_dim += 1
+        expected_camera_risk_dim = int(expected_camera_risk_dim)
         state_dim = int(obs_dim - lidar_dim - expected_camera_risk_dim)
-        camera_risk_dim = int(obs_dim - state_dim - lidar_dim)
+        camera_risk_dim = expected_camera_risk_dim
 
         if state_dim <= 0 or camera_risk_dim <= 0:
             raise RuntimeError(
                 f"Invalid observation split: obs_dim={obs_dim}, state_dim={state_dim}, "
                 f"lidar_dim={lidar_dim}, camera_risk_dim={camera_risk_dim}"
+            )
+
+        env_state_dim = getattr(base_env, "state_dim", None)
+        if env_state_dim is not None and int(env_state_dim) != state_dim:
+            raise RuntimeError(
+                "Observation split does not match environment state layout: "
+                f"obs_dim={obs_dim}, split_state_dim={state_dim}, "
+                f"env_state_dim={int(env_state_dim)}, lidar_dim={lidar_dim}, "
+                f"camera_risk_dim={camera_risk_dim}. "
+                "This script expects observation=[state, lidar_ku(3200), camera_risk]."
             )
 
         camera_risk_gate_alpha = float(cfg.task.get("camera_risk_gate_alpha", 0.2))

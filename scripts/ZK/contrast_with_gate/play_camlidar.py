@@ -219,9 +219,13 @@ class DualStreamBackbone(torch.nn.Module):
         sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
+        spatial_gate_flat = spatial_gate.reshape(b, 1, self.ku_h * self.ku_w)
         for i in range(total_sectors):
             gate_i = self.gate_heads[i](sector_features[:, i, :])
-            spatial_gate[:, :, :, self._sector_masks[i]] = gate_i.view(b, 1, 1, 1)
+            sector_mask = self._sector_masks[i].reshape(-1).to(device=x_ku_raw.device, dtype=torch.bool)
+            if bool(sector_mask.any()):
+                spatial_gate_flat[:, :, sector_mask] = gate_i.view(b, 1, 1)
+        spatial_gate = spatial_gate_flat.reshape(b, 1, self.ku_h, self.ku_w)
 
         lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
@@ -390,8 +394,28 @@ def _inject_camlidar_backbone(policy, base_env, env, cfg):
     _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
     lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
     lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
-    fov_pitch_min = max(-camera_v_fov_rad / 2.0, lidar_pitch_min)
-    fov_pitch_max = min(camera_v_fov_rad / 2.0, lidar_pitch_max)
+    cam_pos_cfg = np.asarray(cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]), dtype=np.float64)
+    cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]), dtype=np.float64)
+    cam_axis = cam_target_cfg - cam_pos_cfg
+    cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
+    if float(np.linalg.norm(cam_axis)) <= 1e-9:
+        raise RuntimeError("depth_camera_pos and depth_camera_target must not coincide.")
+    cam_pitch_rad = math.atan2(float(cam_axis[2]), cam_xy_norm)
+    cam_pitch_min = cam_pitch_rad - camera_v_fov_rad / 2.0
+    cam_pitch_max = cam_pitch_rad + camera_v_fov_rad / 2.0
+    fov_pitch_min = max(cam_pitch_min, lidar_pitch_min)
+    fov_pitch_max = min(cam_pitch_max, lidar_pitch_max)
+    if fov_pitch_max <= fov_pitch_min:
+        raise RuntimeError(
+            "Camera vertical FoV does not overlap LiDAR pitch range: "
+            f"camera=[{math.degrees(cam_pitch_min):.2f}, {math.degrees(cam_pitch_max):.2f}]deg, "
+            f"lidar=[{math.degrees(lidar_pitch_min):.2f}, {math.degrees(lidar_pitch_max):.2f}]deg."
+        )
+    print(
+        "[lc-gate] pitch masks aligned to camera axis | "
+        f"pitch={math.degrees(cam_pitch_rad):.2f}deg "
+        f"overlap=[{math.degrees(fov_pitch_min):.2f}, {math.degrees(fov_pitch_max):.2f}]deg"
+    )
 
     actor_backbone = DualStreamBackbone(
         state_dim=state_dim,
