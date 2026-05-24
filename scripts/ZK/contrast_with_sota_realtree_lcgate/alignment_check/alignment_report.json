@@ -1,0 +1,266 @@
+{
+  "camera_geometry": {
+    "prim_path": "/World/envs/env_0/Hummingbird_0/base_link/DepthCamera",
+    "relative_transform_source": "omni.usd.get_local_transform_matrix",
+    "intrinsic_matrix": [
+      [
+        91.62491085614059,
+        0.0,
+        80.0
+      ],
+      [
+        0.0,
+        91.62491085614059,
+        48.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "near_clip": 0.05000000074505806,
+    "far_clip": 10.0,
+    "camera_pos_base": [
+      0.2199999988079071,
+      0.0,
+      0.18000006675720215
+    ],
+    "rotation_convention": "row-vector",
+    "row_err_deg": 1.7075472925031877e-06,
+    "col_err_deg": 91.38415074189899,
+    "optical_axis_base": [
+      0.9178062704404178,
+      6.4673138273548075e-09,
+      0.3970285253483064
+    ]
+  },
+  "fov": {
+    "h_deg": 82.25004683932704,
+    "v_deg": 55.297837997644564,
+    "overlap_deg": [
+      -4.256369241275881,
+      51.04146875636869
+    ]
+  },
+  "sector_meta": {
+    "ku_h": 40,
+    "ku_w": 80,
+    "num_rows": 3,
+    "num_cols": 3,
+    "camera_h_fov_rad": 1.4355341272658124,
+    "camera_h_fov_deg": 82.25004683932704,
+    "fov_pitch_min_deg": -4.256369241275881,
+    "fov_pitch_max_deg": 51.04146875636869,
+    "fov_total_pixels": 216,
+    "fov_pct_of_sphere": 6.75,
+    "lidar_pitch_min_deg": -90.0,
+    "lidar_pitch_max_deg": 90.0,
+    "sectors": [
+      {
+        "row": 0,
+        "col": 0,
+        "pitch_deg": [
+          -4.256369241275881,
+          14.17624342460564
+        ],
+        "yaw_deg": [
+          -41.12502341966352,
+          -13.70834113988784
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 0,
+        "col": 1,
+        "pitch_deg": [
+          -4.256369241275881,
+          14.17624342460564
+        ],
+        "yaw_deg": [
+          -13.70834113988784,
+          13.70834113988784
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 0,
+        "col": 2,
+        "pitch_deg": [
+          -4.256369241275881,
+          14.17624342460564
+        ],
+        "yaw_deg": [
+          13.70834113988784,
+          41.12502341966352
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 1,
+        "col": 0,
+        "pitch_deg": [
+          14.17624342460564,
+          32.608856090487166
+        ],
+        "yaw_deg": [
+          -41.12502341966352,
+          -13.70834113988784
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 1,
+        "col": 1,
+        "pitch_deg": [
+          14.17624342460564,
+          32.608856090487166
+        ],
+        "yaw_deg": [
+          -13.70834113988784,
+          13.70834113988784
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 1,
+        "col": 2,
+        "pitch_deg": [
+          14.17624342460564,
+          32.608856090487166
+        ],
+        "yaw_deg": [
+          13.70834113988784,
+          41.12502341966352
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 2,
+        "col": 0,
+        "pitch_deg": [
+          32.608856090487166,
+          51.04146875636868
+        ],
+        "yaw_deg": [
+          -41.12502341966352,
+          -13.70834113988784
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 2,
+        "col": 1,
+        "pitch_deg": [
+          32.608856090487166,
+          51.04146875636868
+        ],
+        "yaw_deg": [
+          -13.70834113988784,
+          13.70834113988784
+        ],
+        "pixel_count": 24
+      },
+      {
+        "row": 2,
+        "col": 2,
+        "pitch_deg": [
+          32.608856090487166,
+          51.04146875636868
+        ],
+        "yaw_deg": [
+          13.70834113988784,
+          41.12502341966352
+        ],
+        "pixel_count": 24
+      }
+    ]
+  },
+  "pixel_projection": {
+    "num_test_rows": 3,
+    "num_test_cols": 3,
+    "pixel_results": [
+      {
+        "u_px": 39,
+        "v_px": 23,
+        "yaw_deg": 28.392,
+        "pitch_deg": 34.71,
+        "ku_row": 27,
+        "ku_col": 6,
+        "sector": "(2,2)"
+      },
+      {
+        "u_px": 79,
+        "v_px": 23,
+        "yaw_deg": 0.385,
+        "pitch_deg": 38.216,
+        "ku_row": 28,
+        "ku_col": 0,
+        "sector": "(2,1)"
+      },
+      {
+        "u_px": 119,
+        "v_px": 23,
+        "yaw_deg": -27.793,
+        "pitch_deg": 34.86,
+        "ku_row": 27,
+        "ku_col": 73,
+        "sector": "(2,0)"
+      },
+      {
+        "u_px": 39,
+        "v_px": 47,
+        "yaw_deg": 25.63,
+        "pitch_deg": 21.597,
+        "ku_row": 24,
+        "ku_col": 5,
+        "sector": "(1,2)"
+      },
+      {
+        "u_px": 79,
+        "v_px": 47,
+        "yaw_deg": 0.341,
+        "pitch_deg": 23.705,
+        "ku_row": 25,
+        "ku_col": 0,
+        "sector": "(1,1)"
+      },
+      {
+        "u_px": 119,
+        "v_px": 47,
+        "yaw_deg": -25.072,
+        "pitch_deg": 21.688,
+        "ku_row": 24,
+        "ku_col": 74,
+        "sector": "(1,0)"
+      },
+      {
+        "u_px": 39,
+        "v_px": 71,
+        "yaw_deg": 23.33,
+        "pitch_deg": 8.417,
+        "ku_row": 21,
+        "ku_col": 5,
+        "sector": "(0,2)"
+      },
+      {
+        "u_px": 79,
+        "v_px": 71,
+        "yaw_deg": 0.307,
+        "pitch_deg": 9.154,
+        "ku_row": 22,
+        "ku_col": 0,
+        "sector": "(0,1)"
+      },
+      {
+        "u_px": 119,
+        "v_px": 71,
+        "yaw_deg": -22.81,
+        "pitch_deg": 8.449,
+        "ku_row": 21,
+        "ku_col": 74,
+        "sector": "(0,0)"
+      }
+    ]
+  }
+}

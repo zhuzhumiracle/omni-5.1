@@ -53,7 +53,7 @@ DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tr
 
 
 # ============================================================
-# Real-tree mesh utilities
+# Real-tree mesh utilities 定义树木应该怎么随机的放置
 # ============================================================
 def tree_positions_jittered_grid(map_size=60.0, spacing=4.0, seed=0, clear_radius=2.0):
     """Poisson-like jittered grid positions matching YOPO's tree_dist intent."""
@@ -81,7 +81,7 @@ def tree_positions_jittered_grid(map_size=60.0, spacing=4.0, seed=0, clear_radiu
             positions.append((px, py))
     return np.asarray(positions, dtype=np.float32)
 
-
+#定义旋转矩阵的计算方法
 def _rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
@@ -91,7 +91,7 @@ def _rotation_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
     rz = np.asarray([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float32)
     return (rz @ ry @ rx).astype(np.float32)
 
-
+# 这是 OBJ 文件面索引解析器，把一个面片中的顶点编号字符串转换成 0-based 的数组索引。
 def _parse_face_index(token: str, vertex_count: int) -> int:
     """Parse OBJ face token like '12', '12/3/4', or '-1/2/3' into 0-based index."""
     raw = token.split("/", 1)[0]
@@ -104,7 +104,23 @@ def _parse_face_index(token: str, vertex_count: int) -> int:
         idx = idx - 1
     return idx
 
-
+# tree_mesh.obj 文件
+#       │
+#       ▼
+# ┌─────────────────────────────┐
+# │ 1. 逐行解析 v / f 行        │
+# │    v 行 → vertices 列表     │
+# │    f 行 → 扇形三角化 → faces │
+# ├─────────────────────────────┤
+# │ 2. 转 numpy 数组            │
+# ├─────────────────────────────┤
+# │ 3. 清洗非有限顶点 (NaN/Inf) │
+# ├─────────────────────────────┤
+# │ 4. max_faces 降采样（可选） │
+# ├─────────────────────────────┤
+# │ 输出: vertices[N,3]         │
+# │       faces[M,3]            │
+# └─────────────────────────────┘
 def read_obj_mesh(path: str | Path, *, max_faces: int = 0) -> Tuple[np.ndarray, np.ndarray]:
     """Read vertices and triangulated faces from a simple OBJ mesh."""
     path = Path(path).expanduser().resolve()
@@ -113,21 +129,30 @@ def read_obj_mesh(path: str | Path, *, max_faces: int = 0) -> Tuple[np.ndarray, 
 
     vertices = []
     faces = []
+
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
+
             if not line or line.startswith("#"):
                 continue
+
             if line.startswith("v "):
                 parts = line.split()
                 if len(parts) >= 4:
-                    vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                    vertices.append([
+                        float(parts[1]),
+                        float(parts[2]),
+                        float(parts[3])
+                    ])
+
             elif line.startswith("f "):
                 parts = line.split()[1:]
                 if len(parts) < 3:
                     continue
+
                 poly = [_parse_face_index(tok, len(vertices)) for tok in parts]
-                # Fan triangulation for polygons.
+
                 for j in range(1, len(poly) - 1):
                     faces.append([poly[0], poly[j], poly[j + 1]])
 
@@ -138,23 +163,24 @@ def read_obj_mesh(path: str | Path, *, max_faces: int = 0) -> Tuple[np.ndarray, 
     faces = np.asarray(faces, dtype=np.int32)
 
     finite = np.isfinite(vertices).all(axis=1)
+
     if not finite.all():
-        # Keep only finite vertices and remap faces.
         old_to_new = -np.ones(vertices.shape[0], dtype=np.int32)
         old_to_new[np.where(finite)[0]] = np.arange(int(finite.sum()), dtype=np.int32)
+
         face_mask = finite[faces].all(axis=1)
         faces = old_to_new[faces[face_mask]]
         vertices = vertices[finite]
 
+    if vertices.shape[0] == 0 or faces.shape[0] == 0:
+        raise RuntimeError(f"OBJ has no valid vertices/faces after filtering: {path}")
+
     if int(max_faces) > 0 and faces.shape[0] > int(max_faces):
-        # Deterministic uniform face sampling. This is not a geometric decimator,
-        # but it is useful for making training scenes light enough.
         idx = np.linspace(0, faces.shape[0] - 1, int(max_faces), dtype=np.int64)
         faces = faces[idx]
 
     return vertices.astype(np.float32), faces.astype(np.int32)
-
-
+# 这个函数把从 OBJ 文件读出来的树模型归一化到统一坐标系，方便后续批量放置和旋转缩放。
 def normalize_tree_mesh(
     vertices: np.ndarray,
     *,
@@ -186,6 +212,28 @@ def normalize_tree_mesh(
     return v.astype(np.float32)
 
 
+# tree_mesh.obj (单个树模型文件)
+#         │
+#         ▼
+# read_obj_mesh()           → 读取 OBJ，返回 base_vertices + base_faces
+#         │
+#         ▼
+# normalize_tree_mesh()     → 摆正/居中/接地
+#         │
+#         ▼
+# tree_positions_jittered_grid() → 计算每棵树放在哪里 (px, py)
+#         │
+#         ▼
+#   ┌─────────────────────────────────────────┐
+#   │ for 每棵树:                               │
+#   │   ① 随机 scale (大小)                     │
+#   │   ② 随机 roll/pitch/yaw (姿态)            │
+#   │   ③ 旋转 + 缩放 + 平移                    │
+#   │   ④ 合并到 all_vertices / all_faces       │
+#   └─────────────────────────────────────────┘
+#         │
+#         ▼
+#   输出: [vertices, faces, positions]  ← 整片森林的一个大 mesh
 def make_combined_tree_forest_mesh(
     tree_obj_path: str | Path,
     *,
@@ -411,6 +459,27 @@ def patched_realtree_forest(
 
 # ============================================================
 # DualStreamBackbone
+# 观测 obs (一维向量)
+#   │
+#   ├─ state[:16]          ──→ state_encoder     ──→ state_z  [64]
+#   │
+#   ├─ lidar_ku[16:3216]   ──→ ku_encoder (CNN)  ──→ lidar_z  [128]
+#   │                            ku_global_head
+#   │
+#   └─ camera_risk[3216:]  ──→ camera_risk_enc   ──→ camera_z [64]
+#                                 │
+#                                 │    ┌──────────────────────┐
+#                                 └────│  camera_gate (Sigmoid)│
+#                                      │  [lidar_z, camera_z] │
+#                                      │         ↓            │
+#                                      │  gate ∈ [0,1]^128    │
+#                                      └──────┬───────────────┘
+#                                             ↓
+#                                lidar_z *= (1 - α·gate)   ← Gate 调制
+
+#   state_z [64] ─┬─→ concat ──→ fusion_mlp ──→ [128]
+#   lidar_z [128] ─┤            Linear(256→256→128)
+#   camera_z [64] ─┘                 + ELU
 # ============================================================
 class DualStreamBackbone(torch.nn.Module):
     """

@@ -25,7 +25,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-22-vlim-lcgate-tree_best_return_4443.60.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-24-vlim-lcgate-tree_best_return_4728.99.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
 
 
@@ -1705,7 +1705,7 @@ def run_worker(args, hydra_overrides):
                             first_success = torch.logical_and(torch.logical_and(success_now, active), arrival_steps < 0)
                             if first_success.any():
                                 arrival_steps[first_success] = step_count
-                            ep_success = torch.maximum(ep_success, success_now.to(torch.int32))
+                            ep_success = torch.maximum(ep_success, first_success.to(torch.int32))
 
                         # Capture final positions for envs that just finished.  Treat reaching the
                         # goal as terminal for evaluation, even if the underlying env would keep
@@ -1779,7 +1779,7 @@ def run_worker(args, hydra_overrides):
                     completion_pct = torch.clamp(
                         (1.0 - final_dist / start_dist.clamp_min(1e-6)) * 100.0, 0.0, 100.0
                     )
-                    success_mask = ep_success.bool()
+                    success_mask = arrival_steps >= 0
                     sim_dt = float(getattr(base_env, "dt", 0.02))
                     arrival_times = arrival_steps.to(torch.float32) * sim_dt
                     episode_speeds_tensor = path_lengths / arrival_times.clamp_min(1e-6)

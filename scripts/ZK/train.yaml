@@ -26,21 +26,21 @@ vulkan_gpu_id: 1    # Vulkan render GPU (must have a display for headless=false)
 # ── YOPO tree mesh obstacle config (used by train_camlidar_trees.py) ──
 tree:
   obj_path: /home/descfly/visualandlidar/base/omni-5.1/YOPO/Simulator/src/pointcloud/tree_mesh.obj
-  map_size: 40.0
+  map_size: 80.0
   spacing: 4.0     # tree spacing in meters
   scale_min: 0.4   # minimum tree scale
   scale_max: 0.8   # maximum tree scale
   tilt_deg: 10.0   # maximum random tilt in degrees
-  clear_radius: 2.0  # clear radius around start/target
+  clear_radius: 8.0  # clear radius around start/target
 
 # 训练初始化模式：
 
 # - scratch: 从头开始训练
 # - goodpt: 从已有 checkpoint 继续训练
-init_mode: scratch
+init_mode: goodpt
 # 可填 .pt 文件，或填写目录（优先 checkpoint_final.pt，否则选最新修改的 .pt）
 # 相对路径按本脚本所在目录 OmniDrones/scripts/ZK 解析
-goodpt_path: goodpt/5-22-vlim-lcgate-tree_best_return_4443.60.pt
+goodpt_path: goodpt/5-24-vlim-lcgate-tree_best_return_4728.99.pt
 
 viewer:
   resolution: [1080, 780] # 可视化窗口分辨率

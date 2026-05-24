@@ -99,6 +99,9 @@ class forest_lc_gate(IsaacEnv):
         self.depth_max_range = float(cfg.task.get("depth_max_range", cfg.task.get("lidar_range", 10.0)))
         self.depth_data_type = str(cfg.task.get("depth_data_type", "distance_to_camera"))
         self.depth_prim_name = str(cfg.task.get("depth_prim_name", "DepthCamera"))
+        self.hide_drone_meshes_from_depth_camera = bool(
+            cfg.task.get("hide_drone_meshes_from_depth_camera", True)
+        )
 
         # ---------- camera risk observation config ----------
         self.use_camera_risk_observation = bool(cfg.task.get("use_camera_risk_observation", False))
@@ -209,8 +212,8 @@ class forest_lc_gate(IsaacEnv):
         self.collision_force_threshold = float(cfg.task.get("collision_force_threshold", 1.0))
         self.flip_tilt_deg = float(cfg.task.get("flip_tilt_deg", 80.0))
         self.flip_consecutive_steps = int(cfg.task.get("flip_consecutive_steps", 10))
-        self.start_x_min = float(cfg.task.get("start_x_min", -5.0))
-        self.start_x_max = float(cfg.task.get("start_x_max", 5.0))
+        self.start_x_min = float(cfg.task.get("start_x_min", -2.0))
+        self.start_x_max = float(cfg.task.get("start_x_max", 2.0))
         self.start_y = float(cfg.task.get("start_y", -24.0))
         self.target_y = float(cfg.task.get("target_y", 24.0))
         self.flight_z = float(cfg.task.get("flight_z", 2.0))
@@ -279,6 +282,19 @@ class forest_lc_gate(IsaacEnv):
         self.w_boundary = float(cfg.task.get("w_boundary", -25.0))
         self.w_time = float(cfg.task.get("w_time", 0.0))
         self.w_near_obstacle_speed = float(cfg.task.get("w_near_obstacle_speed", -4.0))
+
+        # ---- 速度跟踪奖励 ----
+        self.speed_track_reward = bool(cfg.task.get("speed_track_reward", True))
+        self.speed_track_tol = float(cfg.task.get("speed_track_tol", 1.0))
+        self.w_speed_track = float(cfg.task.get("w_speed_track", 1.0))
+        self.speed_under_penalty = float(cfg.task.get("speed_under_penalty", 3.0))
+        self.speed_over_penalty = float(cfg.task.get("speed_over_penalty", 1.0))
+        self.speed_track_max_penalty = float(cfg.task.get("speed_track_max_penalty", 10.0))
+        self.use_speed_ratio_min = bool(cfg.task.get("use_speed_ratio_min", False))
+        self.speed_ratio_min = float(cfg.task.get("speed_ratio_min", 0.5))
+        self.use_risk_adaptive_speed = bool(cfg.task.get("use_risk_adaptive_speed", False))
+        self.risk_speed_vmin = float(cfg.task.get("risk_speed_vmin", 2.0))
+
         self.esdf_safe_dist = float(cfg.task.get("esdf_safe_dist", max(1.0, self.collision_dist * 3.0)))
         self.near_obstacle_slowdown_dist = float(
             cfg.task.get("near_obstacle_slowdown_dist", max(self.esdf_safe_dist, self.collision_dist * 4.0))
@@ -293,11 +309,11 @@ class forest_lc_gate(IsaacEnv):
         ]
 
         self.terminate_z_min = float(cfg.task.get("terminate_z_min", 0.2))
-        self.terminate_z_max = float(cfg.task.get("terminate_z_max", 5.0))
+        self.terminate_z_max = float(cfg.task.get("terminate_z_max", 6.0))
         self.terminate_v_norm = float(cfg.task.get("terminate_v_norm", 5.0))
-        self.boundary_x_limit = float(cfg.task.get("boundary_x_limit", 20.0))
-        self.boundary_y_limit = float(cfg.task.get("boundary_y_limit", 40.0))
-        self.boundary_x_soft_start = float(cfg.task.get("boundary_x_soft_start", 10.0))
+        self.boundary_x_limit = float(cfg.task.get("boundary_x_limit", 25.0))
+        self.boundary_y_limit = float(cfg.task.get("boundary_y_limit", 35.0))
+        self.boundary_x_soft_start = float(cfg.task.get("boundary_x_soft_start", 20.0))
         self.boundary_y_soft_start = float(cfg.task.get("boundary_y_soft_start", 30.0))
         if not (0.0 <= self.boundary_x_soft_start < self.boundary_x_limit):
             raise ValueError("boundary_x_soft_start must be non-negative and smaller than boundary_x_limit.")
@@ -329,6 +345,8 @@ class forest_lc_gate(IsaacEnv):
         self.lidar._initialize_impl()
         self.lidar_resolution = (self.num_lidar_points, 1)
         self.drone.initialize(track_contact_forces=self.reset_on_collision)
+        if self.hide_drone_meshes_from_depth_camera:
+            self._hide_drone_render_geometry()
         self.depth_camera.initialize(
             f"/World/envs/env_.*/{self.drone.name}_0/base_link/{self.depth_prim_name}"
         )
@@ -527,7 +545,13 @@ class forest_lc_gate(IsaacEnv):
             "reward_boundary",
             "reward_time",
             "reward_near_obstacle_speed",
+            "reward_speed_track",
             "action_sat",  # <==== 加入这行！
+            "actual_speed",
+            "vlim_episode",
+            "target_speed",
+            "speed_ratio",
+            "speed_error",
             "death_z_low",
             "death_z_high",
             "death_overspeed",
@@ -544,6 +568,42 @@ class forest_lc_gate(IsaacEnv):
         for key in tracking_keys:
             self.stats[key] = torch.zeros(self.num_envs, 1, device=self.device)
         # ===============================================================
+
+    def _hide_drone_render_geometry(self) -> int:
+        """Hide drone geometry from RTX/depth rendering while preserving physics."""
+        try:
+            import omni.usd  # type: ignore
+            from pxr import UsdGeom
+        except Exception as exc:
+            logging.warning("Could not import USD APIs to hide drone render geometry: %s", exc)
+            return 0
+
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            logging.warning("USD stage unavailable; drone render geometry remains visible to cameras.")
+            return 0
+
+        hidden = 0
+        root_suffix = f"/{self.drone.name}_0"
+        for prim in stage.Traverse():
+            path = str(prim.GetPath())
+            if not path.startswith("/World/envs/env_") or root_suffix not in path:
+                continue
+            if f"/{self.depth_prim_name}" in path:
+                continue
+            if not prim.IsA(UsdGeom.Gprim):
+                continue
+            imageable = UsdGeom.Imageable(prim)
+            imageable.MakeInvisible()
+            hidden += 1
+
+        if hidden == 0:
+            logging.warning(
+                "No drone render geometry was hidden. Depth cameras may still see other drones."
+            )
+        else:
+            logging.info("Hidden %d drone render geometry prim(s) from depth cameras.", hidden)
+        return hidden
 
     # --------------------------------------------------------------------- #
     # def _update_history_seen_mask(self):
@@ -1233,7 +1293,13 @@ class forest_lc_gate(IsaacEnv):
             "reward_boundary": Unbounded(1),
             "reward_time": Unbounded(1),
             "reward_near_obstacle_speed": Unbounded(1),
+            "reward_speed_track": Unbounded(1),
             "action_sat": Unbounded(1),
+            "actual_speed": Unbounded(1),
+            "vlim_episode": Unbounded(1),
+            "target_speed": Unbounded(1),
+            "speed_ratio": Unbounded(1),
+            "speed_error": Unbounded(1),
             "death_z_low": Unbounded(1),
             "death_z_high": Unbounded(1),
             "death_overspeed": Unbounded(1),
@@ -1347,6 +1413,11 @@ class forest_lc_gate(IsaacEnv):
             )
             speed_ratio = (actions[..., 3:4] + 1.0) / 2.0
             speed_ratio = torch.nan_to_num(speed_ratio, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+            # 可选：强制最低 speed_ratio，防止策略在高速场景下故意慢飞
+            if self.use_speed_ratio_min:
+                speed_ratio = self.speed_ratio_min + (1.0 - self.speed_ratio_min) * speed_ratio
+
             yaw = torch.tanh(actions[..., 4:5])
             yaw = torch.nan_to_num(yaw, nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -2311,6 +2382,52 @@ class forest_lc_gate(IsaacEnv):
         align_goal = (heading_xy * goal_dir_xy).sum(-1)
 
         r_yaw = speed_mask * align_move + (1.0 - speed_mask) * align_goal
+
+        # ==============================================================
+        # Speed tracking reward
+        # 目标：actual_speed 尽量接近 vlim_episode（方案 A）
+        # 或 尽量接近 risk-adaptive v_ref_safe（方案 B）
+        # ==============================================================
+        if self.speed_track_reward:
+            actual_speed = v_norm                        # 真实线速度，[num_envs]
+            v_ref = speed_ref                           # 方案 A：跟踪原始 vlim
+
+            # ---- 方案 B 预留：风险自适应速度参考 ----
+            if self.use_risk_adaptive_speed:
+                risk = near_obstacle_ratio.clamp(0.0, 1.0)
+                v_ref = self.risk_speed_vmin + (1.0 - risk) * (speed_ref - self.risk_speed_vmin)
+
+            tol = self.speed_track_tol                  # ±1 m/s
+            abs_err = torch.abs(actual_speed - v_ref)
+            norm_err = abs_err / tol
+
+            # 区间内：err=0 时奖励 1，err=tol 时降至 0
+            r_inside = 1.0 - norm_err.pow(2)
+            r_inside = torch.clamp(r_inside, min=0.0, max=1.0)
+
+            # 区间外惩罚
+            under_excess = torch.clamp(v_ref - actual_speed - tol, min=0.0)
+            over_excess = torch.clamp(actual_speed - v_ref - tol, min=0.0)
+            r_outside = -(
+                self.speed_under_penalty * (under_excess / tol).pow(2)
+                + self.speed_over_penalty * (over_excess / tol).pow(2)
+            )
+
+            inside = abs_err <= tol
+            r_speed_track = torch.where(inside, r_inside, r_outside)
+
+            # 硬限幅，防止 PPO 不稳定
+            r_speed_track = torch.clamp(
+                r_speed_track,
+                min=-self.speed_track_max_penalty,
+                max=1.0,
+            )
+        else:
+            r_speed_track = torch.zeros_like(r_yaw)
+            actual_speed = v_norm
+            v_ref = speed_ref
+            abs_err = torch.zeros_like(v_norm)
+
         reward = (
             self.w_forward * r_forward +
             self.w_smooth * r_smoothness +
@@ -2323,7 +2440,8 @@ class forest_lc_gate(IsaacEnv):
             r_death +
             self.w_boundary * r_boundary +
             self.w_yaw * r_yaw +
-            self.w_thrust * r_thrust+ 
+            self.w_thrust * r_thrust +
+            self.w_speed_track * r_speed_track +
             r_goal +
             stage_reward_total
             
@@ -2354,6 +2472,18 @@ class forest_lc_gate(IsaacEnv):
         self.stats["reward_near_obstacle_speed"].add_(
             reward_scale * self.w_near_obstacle_speed * r_near_obstacle_speed.view(-1, 1)
         )
+        # ---- 速度跟踪统计 ----
+        target_speed = self.current_target_vel.norm(dim=-1)
+        if self.velocity_action_dim >= 5:
+            speed_ratio_stat = self.current_actions[..., 3:4].squeeze(-1)
+        else:
+            speed_ratio_stat = (target_speed / v_ref.clamp_min(1e-6)).clamp(0.0, 1.0)
+        self.stats["reward_speed_track"].add_(reward_scale * self.w_speed_track * r_speed_track.view(-1, 1))
+        self.stats["actual_speed"] = actual_speed.detach().clone().view(-1, 1)
+        self.stats["vlim_episode"] = v_ref.detach().clone().view(-1, 1)
+        self.stats["target_speed"] = target_speed.detach().clone().view(-1, 1)
+        self.stats["speed_ratio"] = speed_ratio_stat.detach().clone().view(-1, 1)
+        self.stats["speed_error"] = abs_err.detach().clone().view(-1, 1)
         # 第 694 行：此时 r_thrust 已经是严谨的 (150, 1) 了，直接计算即可
         self.stats["reward_thrust"].add_(reward_scale * self.w_thrust * r_thrust)
         self.stats["reward_milestone"].add_(reward_scale * stage_reward_total.view(-1, 1))

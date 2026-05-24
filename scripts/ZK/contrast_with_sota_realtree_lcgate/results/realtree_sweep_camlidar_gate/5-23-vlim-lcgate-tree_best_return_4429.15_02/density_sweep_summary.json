@@ -1,0 +1,40 @@
+[
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 90,
+    "trials": 3,
+    "seeds": [
+      0
+    ],
+    "success_count": 128,
+    "episode_count": 150,
+    "success_rate": 0.8533333333333334,
+    "mean_return": 5369.340822550455,
+    "mean_episode_len": 3517.3866666666668,
+    "avg_completion_pct": 77.8,
+    "mean_arrival_time_s": 70.894,
+    "mean_path_length_m": 44.447,
+    "mean_speed_mps": 949669.72
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 90,
+    "trials": 3,
+    "seeds": [
+      0
+    ],
+    "success_count": 127,
+    "episode_count": 150,
+    "success_rate": 0.8466666666666667,
+    "mean_return": 2917.5275551350915,
+    "mean_episode_len": 1893.9066666666668,
+    "avg_completion_pct": 77.2,
+    "mean_arrival_time_s": 36.617,
+    "mean_path_length_m": 45.155,
+    "mean_speed_mps": 1693152.328
+  }
+]

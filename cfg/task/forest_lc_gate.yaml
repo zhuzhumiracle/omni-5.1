@@ -9,7 +9,7 @@ defaults:
 
 env:
   num_envs: 30
-  max_episode_length: 10000
+  max_episode_length: 7500
 
 # ../viewer:
 #   eye: [0., 8., 6.]
@@ -50,6 +50,9 @@ depth_camera_clip_far: 10.0
 sync_depth_to_lidar: true
 depth_update_interval: 5
 depth_prim_name: DepthCamera
+# Hide drone visual meshes from RTX/depth rendering so parallel drones do not
+# appear as camera obstacles. Physics/contact remains unchanged.
+hide_drone_meshes_from_depth_camera: true
 # KU 编码归一化上界（与环境编码范围保持一致，默认 [0, 20]）
 ku_value_max: 20.0
 # 深度链路调试开关：用于验证多环境相机批次和帧更新
@@ -148,23 +151,47 @@ near_obstacle_slowdown_dist: 0.8
 
 w_forward: 15 # 3 30 6 10
 w_smooth: -0.3 #-0.5 --0.3
-w_max_speed: -0.5 #-0.1 -0.5
+w_max_speed: 0 #-0.1 -0.5
 w_z: -3 #-2
 w_esdf: 8.0 # direct unsafe-distance penalty; r_esdf is negative inside safe band
-w_near_obstacle_speed: -1.0
+w_near_obstacle_speed: 0 # 额外惩罚：当无人机进入 near_obstacle_slowdown_dist 范围内时，根据距离线性增加速度惩罚，最大惩罚为 w_near_obstacle_speed。
 w_yaw: 0.5 #0.3 0.5
 w_thrust: -0.1
 # 延迟型时间惩罚：只惩罚“过了宽限期仍缺少路程进度”的拖延行为。
 # 30s episode 中 12s 后平滑启动，进度越高惩罚越弱，避免误伤慢速避障。
-w_time: 2.0
+w_time: 0 # 2.0
 time_penalty_grace_seconds: 150.0
 time_penalty_power: 2.0
 time_penalty_progress_thresholds: [0.2, 0.4, 0.6]
 time_penalty_progress_discounts: [1.0, 0.5, 0.25, 0.0]
 
+# ============================================================
+# Speed tracking reward —— 强制实际速度接近 vlim_episode
+# ============================================================
+speed_track_reward: true          # 是否启用速度跟随奖励
+speed_track_tol: 1.0              # 允许误差 ±1 m/s
+
+w_speed_track: 1.0                # 速度奖励总权重
+speed_under_penalty: 3.0          # 低于 vlim-1 时的惩罚系数（高）
+speed_over_penalty: 1.0           # 高于 vlim+1 时的惩罚系数（低）
+speed_track_max_penalty: 10.0     # 单项速度惩罚硬限幅，防止 PPO 炸
+
+# 动作映射约束（先不启用，等速度奖励拉不起来再开）
+use_speed_ratio_min: false
+speed_ratio_min: 0.5              # 最低 speed_ratio，强制最低目标速度
+
+# 风险自适应降速（方案 B 用，当前方案 A 先不开）
+use_risk_adaptive_speed: false
+risk_speed_vmin: 2.0              # 高障碍密度区域的最低允许速度
+
 terminate_z_min: 0.4
 terminate_z_max: 10
 terminate_v_norm: 15 #8
+
+boundary_x_limit: 35
+boundary_y_limit: 40
+boundary_x_soft_start: 25
+boundary_y_soft_start: 30
 
 sim:
   device: "cuda:1"

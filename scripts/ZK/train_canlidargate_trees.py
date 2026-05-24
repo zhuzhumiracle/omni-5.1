@@ -56,7 +56,7 @@ DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tr
 # ============================================================
 # Real-tree mesh utilities
 # ============================================================
-def tree_positions_jittered_grid(map_size=60.0, spacing=4.0, seed=0, clear_radius=2.0):
+def tree_positions_jittered_grid(map_size=80.0, spacing=4.0, seed=0, clear_radius=8.0):
     """Poisson-like jittered grid positions matching YOPO's tree_dist intent."""
     rng = np.random.default_rng(int(seed))
     map_size = float(map_size)
@@ -67,7 +67,7 @@ def tree_positions_jittered_grid(map_size=60.0, spacing=4.0, seed=0, clear_radiu
     half = 0.5 * map_size
     coords = np.arange(-half + 0.5 * spacing, half, spacing, dtype=np.float32)
     positions = []
-    jitter = min(0.35 * spacing, 0.5 * max(spacing - 0.8, 0.0))
+    jitter = min(0.2 * spacing, 0.5 * max(spacing - 2, 0.0))
 
     # Keep start, goal, and map center relatively clean.
     clear_points = np.asarray([[0.0, -24.0], [0.0, 24.0], [0.0, 0.0]], dtype=np.float32)
@@ -412,7 +412,24 @@ def patched_realtree_forest(
 
 # ============================================================
 # Camera geometry + spatial-gate DualStreamBackbone
-# ============================================================
+# USD Stage 中的相机 Prim
+#         │
+#         ▼
+# _read_depth_camera_geometry_from_stage()
+#         │
+#         ├── 读取相机位姿（相对于 base_link）
+#         │     ├── omni.usd.get_local_transform_matrix
+#         │     └── 备选: getRelativeTransform
+#         │
+#         ├── 读取内参（焦距、光圈、偏移）
+#         │     └── 计算 fx, fy, cx, cy
+#         │
+#         ├── 验证旋转矩阵 convention
+#         │     ├── _expected_row_camera_rotation_from_view()
+#         │     └── _select_camera_rotation_convention()
+#         │
+#         └── 返回: {intrinsic_matrix, near/far_clip, prim_path}
+# # ============================================================
 def _normalize_np(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     norm = float(np.linalg.norm(vec))
     if norm <= eps:
@@ -447,7 +464,12 @@ def _rotation_error_deg(candidate: np.ndarray, reference: np.ndarray) -> float:
     cos_angle = max(-1.0, min(1.0, 0.5 * (trace_val - 1.0)))
     return float(np.degrees(np.arccos(cos_angle)))
 
-
+# Isaac Sim 给的旋转矩阵本身没问题，但它不告诉你矩阵的行列约定（row-vector vs column-vector）。
+# 这段检测代码的作用就是：拿 YAML 配置里算出的"期望朝向"当标准答案，自动判断原始矩阵是哪种写法，
+# 并转成统一的行向量约定，确保后面所有坐标系计算都是对的。没有这步，
+# 相机和 LiDAR 的空间对齐就会在不知不觉中错位。
+# 行列约定就是"三个方向向量在矩阵里是按行摆还是按列摆"的区别。同一种物理旋转，两种摆法得到的矩阵互为转置。代码不知道 USD 按哪种摆，所以两种都试，哪个对就用哪个。这里用的是行向量约定（向量在左边 @ 矩阵）。它假设矩阵的第0行是右方向、第1行是上方向、第2行是前方向。
+#看了一下日志这一块是正确的
 def _select_camera_rotation_convention(
     rot_raw: np.ndarray,
     expected_row_rot: np.ndarray,
@@ -458,7 +480,7 @@ def _select_camera_rotation_convention(
         return rot_raw.T.copy(), "column-vector-transposed", row_err_deg, col_err_deg
     return rot_raw.copy(), "row-vector", row_err_deg, col_err_deg
 
-
+# _read_depth_camera_geometry_from_stage 就是从仿真器里把深度相机的"眼睛参数"（内参、外参、裁剪距离）完整读出来，和配置文件对齐，自动修正矩阵约定的差异，打包成字典交给下游。没有它，相机和 LiDAR 的融合就是瞎的。
 def _read_depth_camera_geometry_from_stage(base_env):
     try:
         import omni.usd  # type: ignore
@@ -534,13 +556,18 @@ def _read_depth_camera_geometry_from_stage(base_env):
                 pos_err,
                 rot_err,
             )
-    except ImportError:
-        pass
+    except Exception as exc:
+        logging.warning(
+            "Failed to use official getRelativeTransform; using local transform fallback: %s",
+            exc,
+        )
 
     fx_px = float(base_env.depth_w) * float(focal_length) / float(horizontal_aperture)
     fy_px = float(base_env.depth_h) * float(focal_length) / float(vertical_aperture)
-    cx_px = 0.5 * float(base_env.depth_w) + float(horizontal_aperture_offset) * fx_px
-    cy_px = 0.5 * float(base_env.depth_h) + float(vertical_aperture_offset) * fy_px
+    # Aperture offset is a physical shift (same unit as aperture); convert to pixels
+    # via the image-plane scale factor W / horizontal_aperture, NOT fx_px.
+    cx_px = 0.5 * float(base_env.depth_w) + float(horizontal_aperture_offset) * float(base_env.depth_w) / float(horizontal_aperture)
+    cy_px = 0.5 * float(base_env.depth_h) + float(vertical_aperture_offset) * float(base_env.depth_h) / float(vertical_aperture)
     intrinsic_matrix = [
         [fx_px, 0.0, cx_px],
         [0.0, fy_px, cy_px],
@@ -558,9 +585,20 @@ def _read_depth_camera_geometry_from_stage(base_env):
         expected_rot,
     )
 
+    best_err = min(row_err_deg, col_err_deg)
+    if best_err > 5.0:
+        logging.warning(
+            "Depth camera rotation differs from expected config by %.3f deg. "
+            "Please verify depth_camera_pos / depth_camera_target in YAML and USD camera transform. "
+            "row_err=%.3f deg, col_err=%.3f deg",
+            best_err,
+            row_err_deg,
+            col_err_deg,
+        )
+
     optical_axis_camera = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-    optical_axis_lidar = optical_axis_camera @ cam_rot_np
-    optical_axis_lidar = optical_axis_lidar / max(np.linalg.norm(optical_axis_lidar), 1e-12)
+    optical_axis_base = optical_axis_camera @ cam_rot_np
+    optical_axis_base = optical_axis_base / max(np.linalg.norm(optical_axis_base), 1e-12)
 
     logging.info(
         "Depth camera geometry %s via %s | fx=%.3f fy=%.3f fov_x=%.3f deg convention=%s row_err=%.3f col_err=%.3f axis=%s",
@@ -572,7 +610,7 @@ def _read_depth_camera_geometry_from_stage(base_env):
         rotation_convention,
         row_err_deg,
         col_err_deg,
-        tuple(float(v) for v in optical_axis_lidar.tolist()),
+        tuple(float(v) for v in optical_axis_base.tolist()),
     )
 
     near_clip = None
@@ -587,6 +625,12 @@ def _read_depth_camera_geometry_from_stage(base_env):
         "intrinsic_matrix": intrinsic_matrix,
         "near_clip": near_clip,
         "far_clip": far_clip,
+        "camera_pos_base": cam_pos_np.tolist(),
+        "camera_rot_base": cam_rot_np.tolist(),
+        "rotation_convention": rotation_convention,
+        "row_err_deg": row_err_deg,
+        "col_err_deg": col_err_deg,
+        "optical_axis_base": optical_axis_base.tolist(),
     }
 
 
@@ -596,6 +640,24 @@ class DualStreamBackbone(torch.nn.Module):
     相机前方 FoV 被均分为 num_rows (pitch) × num_cols (yaw) 个 2D 扇区，
     每扇区独立计算 gate，在像素级调制对应 LiDAR KU 区域。
     扇区布局由 camera_risk_num_rows / camera_risk_num_cols 单一控制。
+    obs (原始观测)
+  │
+  ├── [0 : state_dim]           → 无人机状态 (位置/速度/姿态/目标等)
+  │                                  ↓
+  │                            state_encoder (MLP) → 64维
+  │
+  ├── [state_dim : ...+3200]   → LiDAR-KU (40×80 2D距离图)
+  │                                  ↓
+  │                            ku_encoder (CNN) → 128维
+  │                            × spatial_gate ← 相机门控
+  │
+  └── [剩余 : camera_risk_dim] → camera_risk (每扇区的风险特征)
+                                     ↓
+                               gate_heads (逐扇区 MLP → sigmoid) → 门控值
+                                     ↓
+                               调制 LiDAR-KU 各区域权重
+                                     ↓
+                               cat(state_z, lidar_z) → fusion_mlp → 128维特征
     """
 
     def __init__(
@@ -995,6 +1057,41 @@ def _suppress_noisy_isaac_warnings():
 
 # ============================================================
 # Main training
+# init_simulation_app(cfg)          ← 启动 Isaac Sim
+#   ↓
+# patched_realtree_forest(...)      ← 注入真实树 OBJ 网格到场景
+#   ↓
+# IsaacEnv.REGISTRY["forest_lc_gate"] ← 创建环境
+#   ↓
+# TransformedEnv(...)               ← 包装观测/动作变换
+#   ↓
+# ALGOS["ppo"](...)                 ← 创建 PPO 策略
+#   ↓
+# _read_depth_camera_geometry_from_stage(base_env)  ← 从 USD 读相机参数
+#   ↓
+# DualStreamBackbone(...)           ← 构建三输入 backbone
+#   ↓
+# 替换 actor.module[0] 和 critic.module[0]  ← 注入 backbone
+#   ↓
+# 重新初始化权重 + Adam 优化器
+
+
+# Isaac Sim 环境
+#   ↓ reset/step
+# 观测 [state + LiDAR-KU(3200) + camera_risk(13)]
+#   ↓
+# DualStreamBackbone.forward()
+#   ├── state → state_encoder → 64维
+#   ├── LiDAR-KU × spatial_gate → ku_encoder → 128维
+#   └── camera_risk → gate_heads → 逐扇区门控
+#   ↓ concat → fusion_mlp → 128维特征
+#   ↓
+# PPO actor head → 动作均值/标准差
+# PPO critic head → 价值估计
+#   ↓
+# 环境 step → reward, done, next_obs
+#   ↓
+# SyncDataCollector 收集 rollout → policy.train_op() PPO更新
 # ============================================================
 @hydra.main(version_base=None, config_path="", config_name="train")
 def main(cfg):
@@ -1039,12 +1136,12 @@ def main(cfg):
     # Tree config.
     tree_cfg = cfg.get("tree", {})
     tree_obj_path = str(tree_cfg.get("obj_path", str(DEFAULT_TREE_OBJ)))
-    tree_map_size = float(tree_cfg.get("map_size", 60.0))
+    tree_map_size = float(tree_cfg.get("map_size", 80.0))
     tree_spacing = float(tree_cfg.get("spacing", 6.0))
     tree_scale_min = float(tree_cfg.get("scale_min", 0.35))
     tree_scale_max = float(tree_cfg.get("scale_max", 0.6))
     tree_tilt_deg = float(tree_cfg.get("tilt_deg", 5.0))
-    tree_clear_radius = float(tree_cfg.get("clear_radius", 6.0))
+    tree_clear_radius = float(tree_cfg.get("clear_radius", 8.0))
     tree_seed = int(tree_cfg.get("seed", cfg.seed))
     tree_max_faces_per_tree = int(tree_cfg.get("max_faces_per_tree", 20000))
     tree_auto_upright = bool(tree_cfg.get("auto_upright", True))

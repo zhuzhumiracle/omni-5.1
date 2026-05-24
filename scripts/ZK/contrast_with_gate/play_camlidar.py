@@ -973,7 +973,7 @@ def main(cfg):
         except Exception as exc:
             print(f"[Warning] base_env.close() 失败: {exc}")
 
-    max_steps = int(cfg.get("max_steps", 1500))
+    max_steps = int(cfg.get("max_steps", 7500))
     num_episodes = int(cfg.get("num_episodes", 3))
     print_every = int(cfg.get("print_every", 20))
     final_eval_rounds = max(1, int(cfg.get("final_eval_rounds", 1)))
