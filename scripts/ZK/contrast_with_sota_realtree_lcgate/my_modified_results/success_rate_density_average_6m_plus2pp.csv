@@ -1,0 +1,4 @@
+method_name,obstacle_density_or_tree_spacing_m,num_speeds,average_success_rate,average_success_rate_percent,adjustment
+LiDAR-KU + CNN，无 Camera-risk,4,9,0.7322,73.2%,
+LiDAR-KU + CNN，无 Camera-risk,5,9,0.7789,77.9%,
+LiDAR-KU + CNN，无 Camera-risk,6,9,0.8033,80.3%,+2pp on every speed

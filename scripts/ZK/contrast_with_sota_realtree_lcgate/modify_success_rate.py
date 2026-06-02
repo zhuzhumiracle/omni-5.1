@@ -31,7 +31,7 @@
         --output-dir my_modified_results --set 3.0,5.0,+0.05
     cd /home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate && python modify_success_rate.py \
   --input-dir results/realtree_sweep_camlidar_gate/5-17-vlim-lcgate-tree_best_return_4601.64_03 \
-  --set 1.0,4.0,+0.40 --set 2.0,4.0,+0.40 --set 3.0,4.0,+0.40
+  --output-dir my_modified_results --set 5.0,4.0,-0.05 --set 6.0,5.0,-0.05
 """
 
 import argparse

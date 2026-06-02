@@ -1,0 +1,551 @@
+[
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 84,
+    "episode_count": 100,
+    "success_rate": 0.84,
+    "mean_return": 6681.182133789062,
+    "mean_episode_len": 6805.08,
+    "avg_completion_pct": 84.8,
+    "mean_arrival_time_s": 128.204,
+    "mean_path_length_m": 45.691,
+    "mean_speed_mps": 0.357,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 82,
+    "episode_count": 100,
+    "success_rate": 0.82,
+    "mean_return": 3181.8470263671875,
+    "mean_episode_len": 4020.87,
+    "avg_completion_pct": 83.0,
+    "mean_arrival_time_s": 67.953,
+    "mean_path_length_m": 45.377,
+    "mean_speed_mps": 0.671,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 3.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 77,
+    "episode_count": 100,
+    "success_rate": 0.77,
+    "mean_return": 1506.7115789794923,
+    "mean_episode_len": 3302.04,
+    "avg_completion_pct": 81.1,
+    "mean_arrival_time_s": 48.03,
+    "mean_path_length_m": 46.117,
+    "mean_speed_mps": 0.968,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 4.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 78,
+    "episode_count": 100,
+    "success_rate": 0.78,
+    "mean_return": 1179.9479724121093,
+    "mean_episode_len": 2786.15,
+    "avg_completion_pct": 79.6,
+    "mean_arrival_time_s": 38.072,
+    "mean_path_length_m": 46.177,
+    "mean_speed_mps": 1.219,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 76,
+    "episode_count": 100,
+    "success_rate": 0.76,
+    "mean_return": 301.93916748046877,
+    "mean_episode_len": 2613.1,
+    "avg_completion_pct": 79.3,
+    "mean_arrival_time_s": 34.334,
+    "mean_path_length_m": 47.819,
+    "mean_speed_mps": 1.4,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 6.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 70,
+    "episode_count": 100,
+    "success_rate": 0.7,
+    "mean_return": 300.999132232666,
+    "mean_episode_len": 2253.63,
+    "avg_completion_pct": 74.6,
+    "mean_arrival_time_s": 33.218,
+    "mean_path_length_m": 49.841,
+    "mean_speed_mps": 1.508,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 7.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 73,
+    "episode_count": 100,
+    "success_rate": 0.73,
+    "mean_return": 187.44289306640624,
+    "mean_episode_len": 2353.23,
+    "avg_completion_pct": 73.7,
+    "mean_arrival_time_s": 32.673,
+    "mean_path_length_m": 49.851,
+    "mean_speed_mps": 1.543,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 8.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 63,
+    "episode_count": 100,
+    "success_rate": 0.63,
+    "mean_return": -290.8326649475098,
+    "mean_episode_len": 2521.9,
+    "avg_completion_pct": 67.5,
+    "mean_arrival_time_s": 34.52,
+    "mean_path_length_m": 52.219,
+    "mean_speed_mps": 1.53,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 9.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 56,
+    "episode_count": 100,
+    "success_rate": 0.56,
+    "mean_return": -460.85178466796873,
+    "mean_episode_len": 2706.5,
+    "avg_completion_pct": 68.5,
+    "mean_arrival_time_s": 41.899,
+    "mean_path_length_m": 58.744,
+    "mean_speed_mps": 1.437,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 80,
+    "episode_count": 100,
+    "success_rate": 0.8,
+    "mean_return": 6339.698745422364,
+    "mean_episode_len": 6620.33,
+    "avg_completion_pct": 82.8,
+    "mean_arrival_time_s": 128.774,
+    "mean_path_length_m": 46.32,
+    "mean_speed_mps": 0.361,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 81,
+    "episode_count": 100,
+    "success_rate": 0.81,
+    "mean_return": 3259.2478518676758,
+    "mean_episode_len": 3595.04,
+    "avg_completion_pct": 81.2,
+    "mean_arrival_time_s": 69.741,
+    "mean_path_length_m": 46.19,
+    "mean_speed_mps": 0.674,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 3.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 87,
+    "episode_count": 100,
+    "success_rate": 0.87,
+    "mean_return": 1948.103751220703,
+    "mean_episode_len": 2803.77,
+    "avg_completion_pct": 83.3,
+    "mean_arrival_time_s": 46.202,
+    "mean_path_length_m": 45.538,
+    "mean_speed_mps": 0.999,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 4.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 84,
+    "episode_count": 100,
+    "success_rate": 0.84,
+    "mean_return": -2127.402015380859,
+    "mean_episode_len": 2269.46,
+    "avg_completion_pct": 82.0,
+    "mean_arrival_time_s": 35.926,
+    "mean_path_length_m": 45.378,
+    "mean_speed_mps": 1.272,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 86,
+    "episode_count": 100,
+    "success_rate": 0.86,
+    "mean_return": -3360.9171057128906,
+    "mean_episode_len": 2286.99,
+    "avg_completion_pct": 81.3,
+    "mean_arrival_time_s": 33.267,
+    "mean_path_length_m": 47.755,
+    "mean_speed_mps": 1.453,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 6.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 78,
+    "episode_count": 100,
+    "success_rate": 0.78,
+    "mean_return": -3125.190291748047,
+    "mean_episode_len": 2003.43,
+    "avg_completion_pct": 78.8,
+    "mean_arrival_time_s": 29.699,
+    "mean_path_length_m": 47.007,
+    "mean_speed_mps": 1.592,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 7.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 74,
+    "episode_count": 100,
+    "success_rate": 0.74,
+    "mean_return": -3337.102926025391,
+    "mean_episode_len": 1891.19,
+    "avg_completion_pct": 73.8,
+    "mean_arrival_time_s": 29.27,
+    "mean_path_length_m": 48.704,
+    "mean_speed_mps": 1.671,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 8.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 71,
+    "episode_count": 100,
+    "success_rate": 0.71,
+    "mean_return": -3868.188040161133,
+    "mean_episode_len": 2048.31,
+    "avg_completion_pct": 72.5,
+    "mean_arrival_time_s": 31.171,
+    "mean_path_length_m": 51.224,
+    "mean_speed_mps": 1.653,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 9.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 60,
+    "episode_count": 100,
+    "success_rate": 0.6,
+    "mean_return": -5187.582036132812,
+    "mean_episode_len": 2476.5,
+    "avg_completion_pct": 68.4,
+    "mean_arrival_time_s": 35.571,
+    "mean_path_length_m": 54.891,
+    "mean_speed_mps": 1.567,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk"
+  },
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 90,
+    "episode_count": 100,
+    "success_rate": 0.9,
+    "mean_return": 7532.152299804688,
+    "mean_episode_len": 6512.92,
+    "avg_completion_pct": 84.8,
+    "mean_arrival_time_s": 126.855,
+    "mean_path_length_m": 45.664,
+    "mean_speed_mps": 0.361,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 93,
+    "episode_count": 100,
+    "success_rate": 0.93,
+    "mean_return": 3312.0313415527344,
+    "mean_episode_len": 3565.85,
+    "avg_completion_pct": 84.7,
+    "mean_arrival_time_s": 67.428,
+    "mean_path_length_m": 45.747,
+    "mean_speed_mps": 0.684,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 3.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 88,
+    "episode_count": 100,
+    "success_rate": 0.88,
+    "mean_return": -102.51680450439453,
+    "mean_episode_len": 2758.89,
+    "avg_completion_pct": 82.9,
+    "mean_arrival_time_s": 45.821,
+    "mean_path_length_m": 45.274,
+    "mean_speed_mps": 0.996,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 4.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 86,
+    "episode_count": 100,
+    "success_rate": 0.86,
+    "mean_return": -2525.1006274414062,
+    "mean_episode_len": 2399.34,
+    "avg_completion_pct": 80.7,
+    "mean_arrival_time_s": 36.892,
+    "mean_path_length_m": 46.142,
+    "mean_speed_mps": 1.265,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 82,
+    "episode_count": 100,
+    "success_rate": 0.8200000000000001,
+    "mean_return": -3925.5964459228517,
+    "mean_episode_len": 2454.78,
+    "avg_completion_pct": 79.7,
+    "mean_arrival_time_s": 32.088,
+    "mean_path_length_m": 46.675,
+    "mean_speed_mps": 1.463,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 6.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 77,
+    "episode_count": 100,
+    "success_rate": 0.77,
+    "mean_return": -3392.2674157714846,
+    "mean_episode_len": 2068.65,
+    "avg_completion_pct": 74.8,
+    "mean_arrival_time_s": 29.657,
+    "mean_path_length_m": 46.863,
+    "mean_speed_mps": 1.588,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 7.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 73,
+    "episode_count": 100,
+    "success_rate": 0.73,
+    "mean_return": -3204.400963745117,
+    "mean_episode_len": 1958.22,
+    "avg_completion_pct": 71.4,
+    "mean_arrival_time_s": 29.872,
+    "mean_path_length_m": 48.452,
+    "mean_speed_mps": 1.635,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 8.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 67,
+    "episode_count": 100,
+    "success_rate": 0.67,
+    "mean_return": -4376.06869934082,
+    "mean_episode_len": 2216.1,
+    "avg_completion_pct": 68.1,
+    "mean_arrival_time_s": 33.444,
+    "mean_path_length_m": 52.538,
+    "mean_speed_mps": 1.598,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  },
+  {
+    "target_speed_mps": 9.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 67,
+    "episode_count": 100,
+    "success_rate": 0.67,
+    "mean_return": -5341.745623779297,
+    "mean_episode_len": 2520.78,
+    "avg_completion_pct": 70.2,
+    "mean_arrival_time_s": 37.868,
+    "mean_path_length_m": 56.676,
+    "mean_speed_mps": 1.546,
+    "method_name": "LiDAR-KU + CNN，无 Camera-risk",
+    "adjustment_note": "tree_spacing_m=6.0 success_rate +0.02 percentage points"
+  }
+]

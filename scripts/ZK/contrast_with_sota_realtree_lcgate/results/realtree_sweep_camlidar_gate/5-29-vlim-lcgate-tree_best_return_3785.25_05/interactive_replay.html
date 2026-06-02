@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Realtree Drone Replay</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101315;
+      --panel: rgba(18, 22, 24, 0.88);
+      --panel-strong: rgba(18, 22, 24, 0.96);
+      --text: #eef3f4;
+      --muted: #a9b4b7;
+      --line: rgba(255, 255, 255, 0.14);
+      --cyan: #55d6d2;
+      --amber: #f4b84a;
+      --red: #ff6b5a;
+      --green: #77d47f;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    #scene {
+      position: fixed;
+      inset: 0;
+    }
+
+    .hud {
+      position: fixed;
+      left: 16px;
+      top: 16px;
+      width: min(420px, calc(100vw - 32px));
+      padding: 14px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      border-radius: 8px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.34);
+    }
+
+    .title {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      margin-bottom: 10px;
+    }
+
+    h1 {
+      font-size: 15px;
+      line-height: 1.2;
+      margin: 0;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .status {
+      color: var(--green);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      min-width: 0;
+    }
+
+    .metric .label {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 3px;
+    }
+
+    .metric .value {
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    button, select {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      height: 32px;
+      padding: 0 10px;
+      font: inherit;
+      font-size: 13px;
+    }
+
+    button:hover, select:hover {
+      background: rgba(255, 255, 255, 0.13);
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--cyan);
+    }
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+
+    .legend {
+      position: fixed;
+      right: 16px;
+      top: 16px;
+      width: min(300px, calc(100vw - 32px));
+      padding: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .legend b {
+      color: var(--text);
+    }
+
+    .swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+
+    .footer {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      right: 16px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      pointer-events: none;
+      color: rgba(238, 243, 244, 0.68);
+      font-size: 12px;
+    }
+
+    .pill {
+      pointer-events: auto;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      background: var(--panel-strong);
+      border-radius: 6px;
+    }
+
+    @media (max-width: 760px) {
+      .legend {
+        display: none;
+      }
+      .grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .footer {
+        display: none;
+      }
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./static/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <section class="hud">
+    <div class="title">
+      <h1>Realtree Drone Replay</h1>
+      <div class="status" id="load-status">loading</div>
+    </div>
+
+    <div class="grid">
+      <div class="metric"><div class="label">Step</div><div class="value" id="m-step">0 / 0</div></div>
+      <div class="metric"><div class="label">Speed</div><div class="value" id="m-speed">0.00 m/s</div></div>
+      <div class="metric"><div class="label">Altitude</div><div class="value" id="m-alt">0.00 m</div></div>
+      <div class="metric"><div class="label">Trees</div><div class="value" id="m-trees">0</div></div>
+    </div>
+
+    <div class="controls">
+      <button id="play">Play</button>
+      <input id="timeline" type="range" min="0" max="1" value="0" step="1" aria-label="timeline">
+      <select id="speed">
+        <option value="0.35">0.35x</option>
+        <option value="0.7">0.7x</option>
+        <option value="1" selected>1x</option>
+        <option value="1.5">1.5x</option>
+        <option value="2.5">2.5x</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <button id="free-view">Free</button>
+      <button id="follow-view">Follow</button>
+      <button id="top-view">Top</button>
+      <button id="side-view">Side</button>
+    </div>
+
+    <div class="note" id="source-note">
+      Hummingbird source: <code>OmniDrones/omni_drones/robots/assets/usd/hummingbird.usd</code>.
+      Current replay JSON has no quaternion/attitude samples, so this first HTML estimates yaw/pitch from the trajectory.
+    </div>
+  </section>
+
+  <aside class="legend">
+    <b>Mouse</b><br>
+    Left drag: rotate view<br>
+    Wheel: zoom<br>
+    Right drag: pan<br><br>
+    <span class="swatch" style="background:#55d6d2"></span>trajectory<br>
+    <span class="swatch" style="background:#f4b84a"></span>current drone<br>
+    <span class="swatch" style="background:#ff6b5a"></span>target<br>
+    <span class="swatch" style="background:#2f8f57"></span>tree field
+  </aside>
+
+  <div class="footer">
+    <div class="pill">Open through a local HTTP server so the page can read live_state.json.</div>
+    <div class="pill" id="coord">x 0.00, y 0.00, z 0.00</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from './static/OrbitControls.js';
+
+    const canvas = document.getElementById('scene');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101315);
+    scene.fog = new THREE.Fog(0x101315, 65, 140);
+
+    const camera = new THREE.PerspectiveCamera(55, 1, 0.05, 260);
+    camera.up.set(0, 0, 1);
+    camera.position.set(18, -44, 28);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.screenSpacePanning = false;
+    controls.target.set(0, 0, 2);
+
+    scene.add(new THREE.HemisphereLight(0xcfe8ff, 0x26311f, 1.65));
+    const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+    sun.position.set(-18, -26, 55);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -75;
+    sun.shadow.camera.right = 75;
+    sun.shadow.camera.top = 75;
+    sun.shadow.camera.bottom = -75;
+    scene.add(sun);
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(90, 90, 32, 32),
+      new THREE.MeshStandardMaterial({ color: 0x1d241f, roughness: 0.95, metalness: 0.0 })
+    );
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(90, 18, 0x56645f, 0x303936);
+    grid.rotation.x = Math.PI / 2;
+    grid.material.opacity = 0.35;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const treeGroup = new THREE.Group();
+    const trajGroup = new THREE.Group();
+    scene.add(treeGroup, trajGroup);
+
+    const targetMarker = new THREE.Group();
+    const targetMat = new THREE.MeshStandardMaterial({ color: 0xff6b5a, emissive: 0x2b0805, roughness: 0.55 });
+    const targetSphere = new THREE.Mesh(new THREE.SphereGeometry(0.45, 24, 16), targetMat);
+    targetSphere.castShadow = true;
+    targetMarker.add(targetSphere);
+    const targetRing = new THREE.Mesh(
+      new THREE.TorusGeometry(1.2, 0.045, 8, 48),
+      new THREE.MeshBasicMaterial({ color: 0xff6b5a })
+    );
+    targetRing.rotation.x = Math.PI / 2;
+    targetMarker.add(targetRing);
+    scene.add(targetMarker);
+
+    const drone = buildHummingbirdApprox();
+    scene.add(drone);
+
+    const ui = {
+      status: document.getElementById('load-status'),
+      play: document.getElementById('play'),
+      timeline: document.getElementById('timeline'),
+      speed: document.getElementById('speed'),
+      step: document.getElementById('m-step'),
+      speedMetric: document.getElementById('m-speed'),
+      alt: document.getElementById('m-alt'),
+      trees: document.getElementById('m-trees'),
+      coord: document.getElementById('coord'),
+      free: document.getElementById('free-view'),
+      follow: document.getElementById('follow-view'),
+      top: document.getElementById('top-view'),
+      side: document.getElementById('side-view'),
+    };
+
+    let samples = [];
+    let velocities = [];
+    let sampleIndex = 0;
+    let playing = true;
+    let viewMode = 'free';
+    let lastTime = performance.now();
+
+    init();
+
+    async function init() {
+      try {
+        const response = await fetch('./live_state.json', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        samples = normalizeTrajectory(data.trajectory || []);
+        if (samples.length < 2) throw new Error('trajectory needs at least two points');
+        velocities = computeSpeeds(samples);
+        buildTrees(data.obstacles || []);
+        buildTrajectory(samples);
+        if (Array.isArray(data.target)) {
+          targetMarker.position.set(data.target[0], data.target[1], data.target[2] || 0);
+        }
+        ui.timeline.max = String(samples.length - 1);
+        ui.trees.textContent = String((data.obstacles || []).length);
+        ui.status.textContent = 'ready';
+        frameAt(0);
+      } catch (error) {
+        ui.status.textContent = 'load failed';
+        console.error(error);
+      }
+    }
+
+    function normalizeTrajectory(raw) {
+      return raw
+        .filter((p) => Array.isArray(p) && p.length >= 3)
+        .map((p) => new THREE.Vector3(Number(p[0]), Number(p[1]), Number(p[2])));
+    }
+
+    function computeSpeeds(points) {
+      const result = [0];
+      for (let i = 1; i < points.length; i++) {
+        result.push(points[i].distanceTo(points[i - 1]));
+      }
+      return result;
+    }
+
+    function buildTrees(obstacles) {
+      const trunkGeo = new THREE.CylinderGeometry(0.09, 0.13, 3.0, 8);
+      const crownGeo = new THREE.ConeGeometry(0.75, 3.6, 9);
+      const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5b4631, roughness: 0.9 });
+      const crownMat = new THREE.MeshStandardMaterial({ color: 0x2f8f57, roughness: 0.86 });
+
+      const trunkMesh = new THREE.InstancedMesh(trunkGeo, trunkMat, obstacles.length);
+      const crownMesh = new THREE.InstancedMesh(crownGeo, crownMat, obstacles.length);
+      trunkMesh.castShadow = true;
+      crownMesh.castShadow = true;
+      trunkMesh.receiveShadow = true;
+      crownMesh.receiveShadow = true;
+
+      const dummy = new THREE.Object3D();
+      obstacles.forEach((o, i) => {
+        const x = Number(o.x || 0);
+        const y = Number(o.y || 0);
+        const footprint = Math.max(0.55, Number(o.width || 0.8));
+        const height = 4.8 + ((Math.sin(x * 12.9898 + y * 78.233) + 1) * 0.5) * 3.5;
+
+        dummy.position.set(x, y, height * 0.22);
+        dummy.scale.set(footprint, footprint, height / 3.0);
+        dummy.rotation.set(0, 0, 0);
+        dummy.updateMatrix();
+        trunkMesh.setMatrixAt(i, dummy.matrix);
+
+        dummy.position.set(x, y, height * 0.68);
+        dummy.scale.set(footprint * 1.25, footprint * 1.25, height / 3.6);
+        dummy.rotation.z = (i % 17) * 0.37;
+        dummy.updateMatrix();
+        crownMesh.setMatrixAt(i, dummy.matrix);
+      });
+
+      treeGroup.add(trunkMesh, crownMesh);
+    }
+
+    function buildTrajectory(points) {
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x55d6d2, linewidth: 2 });
+      const geom = new THREE.BufferGeometry().setFromPoints(points);
+      trajGroup.add(new THREE.Line(geom, lineMat));
+
+      const dotGeo = new THREE.SphereGeometry(0.07, 10, 8);
+      const dotMat = new THREE.MeshBasicMaterial({ color: 0x55d6d2 });
+      const dotMesh = new THREE.InstancedMesh(dotGeo, dotMat, points.length);
+      const dummy = new THREE.Object3D();
+      points.forEach((p, i) => {
+        dummy.position.copy(p);
+        dummy.updateMatrix();
+        dotMesh.setMatrixAt(i, dummy.matrix);
+      });
+      trajGroup.add(dotMesh);
+    }
+
+    function buildHummingbirdApprox() {
+      const group = new THREE.Group();
+      group.name = 'Hummingbird source-derived approximate model';
+      group.userData.sourceUsd = 'OmniDrones/omni_drones/robots/assets/usd/hummingbird.usd';
+      group.userData.sourceYaml = 'OmniDrones/omni_drones/robots/assets/usd/hummingbird.yaml';
+
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0xf4b84a, metalness: 0.25, roughness: 0.52 });
+      const armMat = new THREE.MeshStandardMaterial({ color: 0xd9e3e5, metalness: 0.2, roughness: 0.62 });
+      const rotorMat = new THREE.MeshStandardMaterial({ color: 0x171b1d, metalness: 0.35, roughness: 0.5 });
+      const frontMat = new THREE.MeshStandardMaterial({ color: 0x55d6d2, emissive: 0x092827, roughness: 0.35 });
+
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.18, 0.10), bodyMat);
+      body.castShadow = true;
+      group.add(body);
+
+      const nose = new THREE.Mesh(new THREE.ConeGeometry(0.075, 0.18, 18), frontMat);
+      nose.rotation.y = Math.PI / 2;
+      nose.position.x = 0.21;
+      nose.castShadow = true;
+      group.add(nose);
+
+      const armLength = 0.34;
+      const armRadius = 0.016;
+      const armGeo = new THREE.CylinderGeometry(armRadius, armRadius, armLength, 12);
+      const armX = new THREE.Mesh(armGeo, armMat);
+      armX.rotation.z = Math.PI / 2;
+      armX.castShadow = true;
+      const armY = new THREE.Mesh(armGeo, armMat);
+      armY.rotation.x = Math.PI / 2;
+      armY.castShadow = true;
+      group.add(armX, armY);
+
+      const rotorGeo = new THREE.TorusGeometry(0.072, 0.007, 8, 32);
+      const bladeGeo = new THREE.BoxGeometry(0.19, 0.018, 0.006);
+      const rotorPositions = [
+        [0.17, 0, 0.02],
+        [0, 0.17, 0.02],
+        [-0.17, 0, 0.02],
+        [0, -0.17, 0.02],
+      ];
+      group.userData.rotors = [];
+      rotorPositions.forEach((pos, i) => {
+        const rotor = new THREE.Group();
+        rotor.position.set(pos[0], pos[1], pos[2]);
+        const ring = new THREE.Mesh(rotorGeo, rotorMat);
+        const bladeA = new THREE.Mesh(bladeGeo, rotorMat);
+        const bladeB = new THREE.Mesh(bladeGeo, rotorMat);
+        bladeB.rotation.z = Math.PI / 2;
+        ring.castShadow = bladeA.castShadow = bladeB.castShadow = true;
+        rotor.add(ring, bladeA, bladeB);
+        rotor.userData.direction = i % 2 === 0 ? -1 : 1;
+        group.userData.rotors.push(rotor);
+        group.add(rotor);
+      });
+
+      const axisX = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.34, 8), new THREE.MeshBasicMaterial({ color: 0xff6b5a }));
+      axisX.rotation.z = Math.PI / 2;
+      axisX.position.x = 0.17;
+      group.add(axisX);
+
+      group.scale.setScalar(2.4);
+      return group;
+    }
+
+    function frameAt(index) {
+      if (!samples.length) return;
+      sampleIndex = Math.max(0, Math.min(samples.length - 1, Math.round(index)));
+      const p = samples[sampleIndex];
+      const next = samples[Math.min(samples.length - 1, sampleIndex + 1)];
+      const prev = samples[Math.max(0, sampleIndex - 1)];
+      const direction = next.clone().sub(prev);
+      if (direction.lengthSq() < 1e-8) direction.set(1, 0, 0);
+
+      const yaw = Math.atan2(direction.y, direction.x);
+      const horizontal = Math.hypot(direction.x, direction.y);
+      const pitch = -Math.atan2(direction.z, Math.max(horizontal, 1e-6));
+      const turn = estimateTurn(sampleIndex);
+      const roll = THREE.MathUtils.clamp(-turn * 0.75, -0.55, 0.55);
+
+      drone.position.copy(p);
+      drone.rotation.set(0, 0, 0);
+      drone.rotateZ(yaw);
+      drone.rotateY(pitch);
+      drone.rotateX(roll);
+
+      for (const rotor of drone.userData.rotors || []) {
+        rotor.rotation.z += rotor.userData.direction * 0.7;
+      }
+
+      ui.timeline.value = String(sampleIndex);
+      ui.step.textContent = `${sampleIndex + 1} / ${samples.length}`;
+      ui.speedMetric.textContent = `${velocities[sampleIndex].toFixed(2)} sample`;
+      ui.alt.textContent = `${p.z.toFixed(2)} m`;
+      ui.coord.textContent = `x ${p.x.toFixed(2)}, y ${p.y.toFixed(2)}, z ${p.z.toFixed(2)}`;
+
+      if (viewMode === 'follow') {
+        const camOffset = new THREE.Vector3(-5, -7, 4.2).applyAxisAngle(new THREE.Vector3(0, 0, 1), yaw);
+        camera.position.lerp(p.clone().add(camOffset), 0.18);
+        controls.target.lerp(p, 0.25);
+      }
+    }
+
+    function estimateTurn(i) {
+      if (i < 2 || i >= samples.length - 2) return 0;
+      const a = samples[i].clone().sub(samples[i - 2]);
+      const b = samples[i + 2].clone().sub(samples[i]);
+      a.z = 0;
+      b.z = 0;
+      if (a.lengthSq() < 1e-8 || b.lengthSq() < 1e-8) return 0;
+      a.normalize();
+      b.normalize();
+      return Math.atan2(a.x * b.y - a.y * b.x, a.dot(b));
+    }
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.05, (now - lastTime) / 1000);
+      lastTime = now;
+      if (playing && samples.length) {
+        const speed = Number(ui.speed.value || 1);
+        frameAt(sampleIndex + dt * speed * 18);
+        if (sampleIndex >= samples.length - 1) {
+          playing = false;
+          ui.play.textContent = 'Play';
+        }
+      }
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    function resize() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+
+    ui.play.addEventListener('click', () => {
+      playing = !playing;
+      ui.play.textContent = playing ? 'Pause' : 'Play';
+      if (playing && sampleIndex >= samples.length - 1) frameAt(0);
+    });
+    ui.timeline.addEventListener('input', () => {
+      playing = false;
+      ui.play.textContent = 'Play';
+      frameAt(Number(ui.timeline.value));
+    });
+    ui.free.addEventListener('click', () => { viewMode = 'free'; });
+    ui.follow.addEventListener('click', () => { viewMode = 'follow'; });
+    ui.top.addEventListener('click', () => {
+      viewMode = 'free';
+      const p = samples[sampleIndex] || new THREE.Vector3();
+      camera.position.set(p.x, p.y, p.z + 58);
+      controls.target.copy(p);
+    });
+    ui.side.addEventListener('click', () => {
+      viewMode = 'free';
+      const p = samples[sampleIndex] || new THREE.Vector3();
+      camera.position.set(p.x + 28, p.y - 44, p.z + 16);
+      controls.target.copy(p);
+    });
+
+    window.addEventListener('resize', resize);
+    resize();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>

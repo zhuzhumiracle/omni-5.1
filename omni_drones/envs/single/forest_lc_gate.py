@@ -289,7 +289,7 @@ class forest_lc_gate(IsaacEnv):
         self.w_speed_track = float(cfg.task.get("w_speed_track", 1.0))
         self.speed_under_penalty = float(cfg.task.get("speed_under_penalty", 3.0))
         self.speed_over_penalty = float(cfg.task.get("speed_over_penalty", 1.0))
-        self.speed_track_max_penalty = float(cfg.task.get("speed_track_max_penalty", 10.0))
+        self.speed_track_max_penalty = float(cfg.task.get("speed_track_max_penalty", 0.0))
         self.use_speed_ratio_min = bool(cfg.task.get("use_speed_ratio_min", False))
         self.speed_ratio_min = float(cfg.task.get("speed_ratio_min", 0.5))
         self.use_risk_adaptive_speed = bool(cfg.task.get("use_risk_adaptive_speed", False))
@@ -310,7 +310,7 @@ class forest_lc_gate(IsaacEnv):
 
         self.terminate_z_min = float(cfg.task.get("terminate_z_min", 0.2))
         self.terminate_z_max = float(cfg.task.get("terminate_z_max", 6.0))
-        self.terminate_v_norm = float(cfg.task.get("terminate_v_norm", 5.0))
+        self.terminate_v_norm = float(cfg.task.get("terminate_v_norm", 15.0))
         self.boundary_x_limit = float(cfg.task.get("boundary_x_limit", 25.0))
         self.boundary_y_limit = float(cfg.task.get("boundary_y_limit", 35.0))
         self.boundary_x_soft_start = float(cfg.task.get("boundary_x_soft_start", 20.0))
@@ -339,6 +339,8 @@ class forest_lc_gate(IsaacEnv):
 
         self.vlim_episode = torch.full((self.num_envs, 1, 1), self.vlim, device=self.device)
         self.prev_pos = torch.zeros((self.num_envs, 1, 3), device=self.device)
+        self.actual_speed_sum = torch.zeros((self.num_envs, 1), device=self.device)
+        self.actual_speed_count = torch.zeros((self.num_envs, 1), device=self.device)
         self.steps_since_reset = torch.zeros((self.num_envs, 1, 1), dtype=torch.int32, device=self.device)
         self.flip_counter = torch.zeros((self.num_envs, 1), dtype=torch.int32, device=self.device)
 
@@ -366,6 +368,7 @@ class forest_lc_gate(IsaacEnv):
 
         self.last_actions = torch.zeros(self.num_envs, 1, self.action_dim, device=self.device)
         self.current_actions = torch.zeros_like(self.last_actions)
+        self.last_rotor_cmds = torch.zeros(self.num_envs, 4, device=self.device)
         self.last_target_vel = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.current_target_vel = torch.zeros_like(self.last_target_vel)
 
@@ -546,7 +549,8 @@ class forest_lc_gate(IsaacEnv):
             "reward_time",
             "reward_near_obstacle_speed",
             "reward_speed_track",
-            "action_sat",  # <==== 加入这行！
+            "action_sat",
+            "rotor_sat",  # 控制器输出的 rotor command 饱和度
             "actual_speed",
             "vlim_episode",
             "target_speed",
@@ -570,10 +574,19 @@ class forest_lc_gate(IsaacEnv):
         # ===============================================================
 
     def _hide_drone_render_geometry(self) -> int:
-        """Hide drone geometry from RTX/depth rendering while preserving physics."""
+        """Hide drone render geometry from RTX/depth sensors while preserving physics.
+
+        Physics collision filtering and USD visibility are separate paths in Isaac Sim.
+        The depth camera uses RTX/Replicator rendering, so cloned drone meshes must be
+        hidden at the USD Imageable level.  Hummingbird assets can be referenced and
+        rendered through instance proxies; USD does not allow authoring visibility on
+        those proxy prims directly, so this routine hides the nearest writable
+        non-proxy Imageable ancestor instead.  The depth camera prim and its
+        ancestors are kept visible so sensor render products stay valid.
+        """
         try:
             import omni.usd  # type: ignore
-            from pxr import UsdGeom
+            from pxr import Usd, UsdGeom
         except Exception as exc:
             logging.warning("Could not import USD APIs to hide drone render geometry: %s", exc)
             return 0
@@ -583,26 +596,117 @@ class forest_lc_gate(IsaacEnv):
             logging.warning("USD stage unavailable; drone render geometry remains visible to cameras.")
             return 0
 
-        hidden = 0
         root_suffix = f"/{self.drone.name}_0"
-        for prim in stage.Traverse():
+
+        def iter_prims(include_instance_proxies: bool = False):
+            if not include_instance_proxies:
+                yield from stage.Traverse()
+                return
+            try:
+                yield from Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies())
+            except Exception as exc:
+                logging.warning(
+                    "USD instance-proxy traversal failed while hiding drone geometry: %s. "
+                    "Falling back to regular stage traversal.",
+                    exc,
+                )
+                yield from stage.Traverse()
+
+        camera_paths = []
+        for prim in iter_prims(False):
             path = str(prim.GetPath())
             if not path.startswith("/World/envs/env_") or root_suffix not in path:
                 continue
-            if f"/{self.depth_prim_name}" in path:
-                continue
-            if not prim.IsA(UsdGeom.Gprim):
-                continue
-            imageable = UsdGeom.Imageable(prim)
-            imageable.MakeInvisible()
-            hidden += 1
+            if f"/{self.depth_prim_name}" in path or prim.IsA(UsdGeom.Camera):
+                camera_paths.append(path)
 
+        def is_depth_camera_related(path: str) -> bool:
+            for camera_path in camera_paths:
+                if path == camera_path:
+                    return True
+                if path.startswith(camera_path + "/"):
+                    return True
+                if camera_path.startswith(path + "/"):
+                    return True
+            return False
+
+        hidden_paths = set()
+        failed_paths = []
+        proxy_fallbacks = 0
+
+        def find_writable_imageable_target(prim):
+            nonlocal proxy_fallbacks
+            try:
+                if not prim.IsInstanceProxy():
+                    return prim
+                proxy_fallbacks += 1
+            except Exception:
+                return prim
+
+            parent = prim.GetParent()
+            while parent and parent.IsValid():
+                parent_path = str(parent.GetPath())
+                if not parent_path.startswith("/World/envs/env_") or root_suffix not in parent_path:
+                    return None
+                if is_depth_camera_related(parent_path):
+                    return None
+                try:
+                    if not parent.IsInstanceProxy() and parent.IsA(UsdGeom.Imageable):
+                        return parent
+                except Exception:
+                    return None
+                parent = parent.GetParent()
+            return None
+
+        def hide_imageable(prim) -> bool:
+            target = find_writable_imageable_target(prim)
+            try:
+                if not target or not target.IsValid() or not target.IsA(UsdGeom.Imageable):
+                    return False
+                target_path = str(target.GetPath())
+                if is_depth_camera_related(target_path):
+                    return False
+                if target_path in hidden_paths:
+                    return True
+                imageable = UsdGeom.Imageable(target)
+                imageable.MakeInvisible()
+                # Author the explicit token too; this makes the authored state
+                # obvious in USD inspection and helps RTX/Hydra pick up changes.
+                imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+                hidden_paths.add(target_path)
+                return True
+            except Exception as exc:
+                failed_paths.append((str(target.GetPath()) if target else str(prim.GetPath()), str(exc)))
+                return False
+
+        for prim in iter_prims(True):
+            path = str(prim.GetPath())
+            if not path.startswith("/World/envs/env_") or root_suffix not in path:
+                continue
+            if is_depth_camera_related(path):
+                continue
+            hide_imageable(prim)
+
+        hidden = len(hidden_paths)
         if hidden == 0:
             logging.warning(
                 "No drone render geometry was hidden. Depth cameras may still see other drones."
             )
         else:
-            logging.info("Hidden %d drone render geometry prim(s) from depth cameras.", hidden)
+            logging.info(
+                "Hidden %d drone render Imageable prim(s) from RTX/depth cameras "
+                "(camera_paths=%d, proxy_fallbacks=%d).",
+                hidden,
+                len(camera_paths),
+                proxy_fallbacks,
+            )
+        if failed_paths:
+            preview = "; ".join(f"{path}: {err}" for path, err in failed_paths[:5])
+            logging.warning(
+                "Failed to hide %d drone render prim(s); first failures: %s",
+                len(failed_paths),
+                preview,
+            )
         return hidden
 
     # --------------------------------------------------------------------- #
@@ -1295,6 +1399,7 @@ class forest_lc_gate(IsaacEnv):
             "reward_near_obstacle_speed": Unbounded(1),
             "reward_speed_track": Unbounded(1),
             "action_sat": Unbounded(1),
+            "rotor_sat": Unbounded(1),
             "actual_speed": Unbounded(1),
             "vlim_episode": Unbounded(1),
             "target_speed": Unbounded(1),
@@ -1356,9 +1461,12 @@ class forest_lc_gate(IsaacEnv):
 
         self.prev_pos[env_ids] = pos
         self.stats[env_ids] = 0.
+        self.actual_speed_sum[env_ids] = 0.0
+        self.actual_speed_count[env_ids] = 0.0
         self.last_actions[env_ids] = 0.0
         self.current_actions[env_ids] = 0.0
         self.last_target_vel[env_ids] = 0.0
+        self.last_rotor_cmds[env_ids] = 0.0
         self.current_target_vel[env_ids] = 0.0
         if self.vlim_randomize and self.training:
             self.vlim_episode[env_ids] = torch.empty(len(env_ids), 1, 1, device=self.device).uniform_(
@@ -1516,6 +1624,7 @@ class forest_lc_gate(IsaacEnv):
             self.last_actions.copy_(self.current_actions)
             self.last_target_vel.copy_(self.current_target_vel)
             self.effort = self.drone.apply_action(rotor_cmds)
+            self.last_rotor_cmds = rotor_cmds.clone()
             self.current_actions = action_exec.clone()
             self.current_target_vel = target_vel_world.clone()
             return
@@ -1537,6 +1646,7 @@ class forest_lc_gate(IsaacEnv):
         self.last_target_vel.copy_(self.current_target_vel)
 
         self.effort = self.drone.apply_action(actions)
+        self.last_rotor_cmds = actions.clone()
         self.current_actions = actions.clone()
         self.current_target_vel.zero_()
 
@@ -2065,65 +2175,77 @@ class forest_lc_gate(IsaacEnv):
 
             if bool(self.cfg.task.get("follow_camera", False)):
                 eye_offset = torch.as_tensor(
-                    self.cfg.task.get("follow_camera_eye_offset", [6.0, 0.0, 2.0]),
+                    self.cfg.task.get("follow_camera_eye_offset", [4.0, 0.0, 1.2]),
                     dtype=torch.float32,
                     device=self.device,
                 )
                 lookat_offset = torch.as_tensor(
-                    self.cfg.task.get("follow_camera_lookat_offset", [2.0, 0.0, 0.5]),
+                    self.cfg.task.get("follow_camera_lookat_offset", [1.0, 0.0, 0.15]),
                     dtype=torch.float32,
                     device=self.device,
                 )
 
-                drone_pos, _ = self.drone.get_world_poses(clone=True)
+                drone_pos, drone_quat = self.drone.get_world_poses(clone=True)
+                follow_env_idx = int(self.cfg.task.get("follow_camera_env_index", 0))
                 if drone_pos.ndim >= 3:
-                    drone_pos = drone_pos[0, 0]
+                    follow_env_idx = max(0, min(follow_env_idx, drone_pos.shape[0] - 1))
+                    drone_pos = drone_pos[follow_env_idx, 0]
+                    drone_quat = drone_quat[follow_env_idx, 0]
                 else:
-                    drone_pos = drone_pos[0]
+                    follow_env_idx = max(0, min(follow_env_idx, drone_pos.shape[0] - 1))
+                    drone_pos = drone_pos[follow_env_idx]
+                    drone_quat = drone_quat[follow_env_idx]
 
-                if hasattr(self.drone, "heading"):
+                if drone_quat is not None and torch.isfinite(drone_quat).all():
+                    drone_quat_b = drone_quat.reshape(1, 4)
+
+                    def rotate_body_axis(axis):
+                        axis_b = torch.tensor(axis, dtype=torch.float32, device=self.device).reshape(1, 3)
+                        return quat_rotate(drone_quat_b, axis_b).reshape(3)
+
+                    forward = rotate_body_axis([1.0, 0.0, 0.0])
+                    right = rotate_body_axis([0.0, 1.0, 0.0])
+                    up_axis = rotate_body_axis([0.0, 0.0, 1.0])
+                elif hasattr(self.drone, "heading"):
                     heading = self.drone.heading
                     if heading.ndim >= 3:
-                        forward = heading[0, 0, :3]
+                        follow_env_idx = max(0, min(follow_env_idx, heading.shape[0] - 1))
+                        forward = heading[follow_env_idx, 0, :3]
                     elif heading.ndim == 2:
-                        forward = heading[0, :3]
+                        follow_env_idx = max(0, min(follow_env_idx, heading.shape[0] - 1))
+                        forward = heading[follow_env_idx, :3]
                     else:
                         forward = heading[:3]
+                    up_axis = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+                    right = torch.cross(up_axis, forward, dim=0)
                 else:
                     forward = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-
-                # 使用无人机自身的 up 向量 (机体 Z 轴在世界系的方向),
-                # 而非硬编码的世界 Z, 这样在俯仰/横滚时相机偏移仍然正确
-                if hasattr(self.drone, "up"):
-                    drone_up = self.drone.up
-                    if drone_up.ndim >= 3:
-                        drone_up = drone_up[0, 0, :3]
-                    elif drone_up.ndim == 2:
-                        drone_up = drone_up[0, :3]
-                    else:
-                        drone_up = drone_up[:3]
+                    right = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                    up_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+                if float(torch.linalg.norm(forward).detach().cpu().item()) < 1e-5:
+                    forward = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
                 else:
-                    drone_up = torch.tensor([0.0, 0.0, 1.0], device=self.device)
-
-                forward = forward / torch.linalg.norm(forward).clamp_min(1e-6)
-                drone_up = drone_up / torch.linalg.norm(drone_up).clamp_min(1e-6)
-                # 机体 Y = 机体 Z × 机体 X (right = up × forward)
-                right = torch.cross(drone_up, forward, dim=0)
-                right = right / torch.linalg.norm(right).clamp_min(1e-6)
-                # 重新正交化: up = forward × right (X × Y = Z)
-                up = torch.cross(forward, right, dim=0)
+                    forward = forward / torch.linalg.norm(forward).clamp_min(1e-6)
+                if float(torch.linalg.norm(right).detach().cpu().item()) < 1e-5:
+                    right = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=self.device)
+                else:
+                    right = right / torch.linalg.norm(right).clamp_min(1e-6)
+                if float(torch.linalg.norm(up_axis).detach().cpu().item()) < 1e-5:
+                    up_axis = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+                else:
+                    up_axis = up_axis / torch.linalg.norm(up_axis).clamp_min(1e-6)
 
                 eye = (
                     drone_pos
                     - forward * eye_offset[0]
                     + right * eye_offset[1]
-                    + up * eye_offset[2]
+                    + up_axis * eye_offset[2]
                 )
                 target = (
                     drone_pos
                     + forward * lookat_offset[0]
                     + right * lookat_offset[1]
-                    + up * lookat_offset[2]
+                    + up_axis * lookat_offset[2]
                 )
                 eye = eye.detach().cpu().numpy()
                 target = target.detach().cpu().numpy()
@@ -2384,44 +2506,49 @@ class forest_lc_gate(IsaacEnv):
         r_yaw = speed_mask * align_move + (1.0 - speed_mask) * align_goal
 
         # ==============================================================
-        # Speed tracking reward
-        # 目标：actual_speed 尽量接近 vlim_episode（方案 A）
-        # 或 尽量接近 risk-adaptive v_ref_safe（方案 B）
+        # Speed tracking reward —— 连续梯度，无 tolerance 死区
+        # 惩罚 = -w * (速度亏缺比)²，其中亏缺比 = max(0, v_ref - actual) / v_ref
+        # - actual = v_ref 时 → 惩罚 = 0
+        # - actual = 0   时 → 惩罚 = -w（最大）
+        # - 永远不给正奖励，避免 vlim_randomize 正负抵消
+        # - 除以 v_ref 归一化，确保各 vlim 环境下梯度量级一致
         # ==============================================================
         if self.speed_track_reward:
             actual_speed = v_norm                        # 真实线速度，[num_envs]
-            v_ref = speed_ref                           # 方案 A：跟踪原始 vlim
+            v_ref = speed_ref                           # 目标速度 = vlim_episode
 
-            # ---- 方案 B 预留：风险自适应速度参考 ----
+            # ---- 风险自适应速度参考 ----
             if self.use_risk_adaptive_speed:
                 risk = near_obstacle_ratio.clamp(0.0, 1.0)
                 v_ref = self.risk_speed_vmin + (1.0 - risk) * (speed_ref - self.risk_speed_vmin)
 
-            tol = self.speed_track_tol                  # ±1 m/s
-            abs_err = torch.abs(actual_speed - v_ref)
-            norm_err = abs_err / tol
-
-            # 区间内：err=0 时奖励 1，err=tol 时降至 0
-            r_inside = 1.0 - norm_err.pow(2)
-            r_inside = torch.clamp(r_inside, min=0.0, max=1.0)
-
-            # 区间外惩罚
-            under_excess = torch.clamp(v_ref - actual_speed - tol, min=0.0)
-            over_excess = torch.clamp(actual_speed - v_ref - tol, min=0.0)
-            r_outside = -(
-                self.speed_under_penalty * (under_excess / tol).pow(2)
-                + self.speed_over_penalty * (over_excess / tol).pow(2)
+            # 连续亏缺比：[0, 1]，actual=v_ref 时为 0
+            speed_deficit = torch.clamp(
+                (v_ref - actual_speed) / v_ref.clamp_min(1e-6),
+                min=0.0,
             )
 
-            inside = abs_err <= tol
-            r_speed_track = torch.where(inside, r_inside, r_outside)
-
-            # 硬限幅，防止 PPO 不稳定
-            r_speed_track = torch.clamp(
-                r_speed_track,
-                min=-self.speed_track_max_penalty,
-                max=1.0,
+            # 超速保护（同样用比例）
+            speed_excess = torch.clamp(
+                (actual_speed - v_ref) / v_ref.clamp_min(1e-6),
+                min=0.0,
             )
+
+            # 二次惩罚，无死区、无正奖励
+            r_speed_track = -(
+                self.speed_under_penalty * speed_deficit.pow(2)
+                + self.speed_over_penalty * speed_excess.pow(2)
+            )
+
+            # 硬限幅（设 0 则不限）
+            if self.speed_track_max_penalty > 0:
+                r_speed_track = torch.clamp(
+                    r_speed_track,
+                    min=-self.speed_track_max_penalty,
+                    max=0.0,
+                )
+
+            abs_err = torch.abs(actual_speed - v_ref)  # 仅用于 wandb 统计
         else:
             r_speed_track = torch.zeros_like(r_yaw)
             actual_speed = v_norm
@@ -2479,7 +2606,10 @@ class forest_lc_gate(IsaacEnv):
         else:
             speed_ratio_stat = (target_speed / v_ref.clamp_min(1e-6)).clamp(0.0, 1.0)
         self.stats["reward_speed_track"].add_(reward_scale * self.w_speed_track * r_speed_track.view(-1, 1))
-        self.stats["actual_speed"] = actual_speed.detach().clone().view(-1, 1)
+        actual_speed_sample = actual_speed.detach().view(-1, 1)
+        self.actual_speed_sum.add_(actual_speed_sample)
+        self.actual_speed_count.add_(torch.ones_like(actual_speed_sample))
+        self.stats["actual_speed"] = self.actual_speed_sum / self.actual_speed_count.clamp_min(1.0)
         self.stats["vlim_episode"] = v_ref.detach().clone().view(-1, 1)
         self.stats["target_speed"] = target_speed.detach().clone().view(-1, 1)
         self.stats["speed_ratio"] = speed_ratio_stat.detach().clone().view(-1, 1)
@@ -2503,6 +2633,9 @@ class forest_lc_gate(IsaacEnv):
         # 计算当前这一步 4 个电机的动作饱和度均值，然后累加到总和中
         step_sat_rate = (self.current_actions.abs() > 0.95).float().mean(dim=-1)
         self.stats["action_sat"].add_(step_sat_rate.view(-1, 1))
+        # 记录控制器输出的 rotor command 饱和度（4 个电机，看实际推力）
+        rotor_sat_rate = (self.last_rotor_cmds.abs() > 0.95).float().mean(dim=-1)
+        self.stats["rotor_sat"].add_(rotor_sat_rate.view(-1, 1))
         # ===============================================================
 
         hasnan = torch.isnan(self.drone_state).any(-1)
@@ -2540,6 +2673,7 @@ class forest_lc_gate(IsaacEnv):
         # 2. 将累加的饱和次数除以当前存活的步数 (progress_buf)
         # clamp(min=1) 是为了防止除以 0（虽然第一步结束 progress_buf 就是 1 了，但防患于未然）
         stats_out["action_sat"] = stats_out["action_sat"] / self.progress_buf.unsqueeze(1).clamp(min=1)
+        stats_out["rotor_sat"] = stats_out["rotor_sat"] / self.progress_buf.unsqueeze(1).clamp(min=1)
         # ==============================================================
         return TensorDict(
             {

@@ -25,7 +25,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-24-vlim-lcgate-tree_best_return_4728.99.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/5-29-vlim-lcgate-tree_best_return_3785.25.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
 
 

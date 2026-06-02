@@ -104,8 +104,8 @@ velocity_yaw_speed_threshold: 0.2
 # 固定俯视相机参数（仅影响可视化）
 # 主视口跟随第 0 个无人机；关闭时才使用下面的固定俯视参数。
 follow_camera: true
-follow_camera_eye_offset: [6.0, 0.0, 2.0]
-follow_camera_lookat_offset: [2.0, 0.0, 0.5]
+follow_camera_eye_offset: [4.0, 0.0, 1.2]
+follow_camera_lookat_offset: [1.0, 0.0, 0.15]
 # 棋盘中心（世界坐标）
 topdown_center_xyz: [0.0, 0.0, 0.0]
 # 相机绝对高度（世界坐标 z）
@@ -144,7 +144,7 @@ v_max_reward: 9.0
 v_max_reward_ratio: 1.0
 z_min: 1
 z_max: 6
-lambda_esdf: 0.8 #0.5
+lambda_esdf: 200 #0.5 0.8 100
 k_esdf: 2.2 #1.6
 esdf_safe_dist: 0.5
 near_obstacle_slowdown_dist: 0.8
@@ -152,7 +152,7 @@ near_obstacle_slowdown_dist: 0.8
 w_forward: 15 # 3 30 6 10
 w_smooth: -0.3 #-0.5 --0.3
 w_max_speed: 0 #-0.1 -0.5
-w_z: -3 #-2
+w_z: -20 #-2 -3
 w_esdf: 8.0 # direct unsafe-distance penalty; r_esdf is negative inside safe band
 w_near_obstacle_speed: 0 # 额外惩罚：当无人机进入 near_obstacle_slowdown_dist 范围内时，根据距离线性增加速度惩罚，最大惩罚为 w_near_obstacle_speed。
 w_yaw: 0.5 #0.3 0.5
@@ -172,9 +172,9 @@ speed_track_reward: true          # 是否启用速度跟随奖励
 speed_track_tol: 1.0              # 允许误差 ±1 m/s
 
 w_speed_track: 1.0                # 速度奖励总权重
-speed_under_penalty: 3.0          # 低于 vlim-1 时的惩罚系数（高）
+speed_under_penalty: 20.0          # 低于 vlim-1 时的惩罚系数（高）
 speed_over_penalty: 1.0           # 高于 vlim+1 时的惩罚系数（低）
-speed_track_max_penalty: 10.0     # 单项速度惩罚硬限幅，防止 PPO 炸
+speed_track_max_penalty: 200.0     # 单项速度惩罚硬限幅，防止 PPO 炸
 
 # 动作映射约束（先不启用，等速度奖励拉不起来再开）
 use_speed_ratio_min: false

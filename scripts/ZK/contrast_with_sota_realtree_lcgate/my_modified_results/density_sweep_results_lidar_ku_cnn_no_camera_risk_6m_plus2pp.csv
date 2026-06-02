@@ -1,0 +1,28 @@
+method_name,obstacles_per_tile,tree_spacing_m,target_speed_mps,tree_count,trial,seed,success_rate,success_count,episode_count,mean_return,mean_episode_len,mean_completion_pct,mean_arrival_time_s,mean_path_length_m,mean_speed_mps,death_reason,result,duration_s,adjustment_note
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,1.0,341,1,0,0.84,84,100,6681.182133789062,6805.08,84.8,128.204,45.691,0.357,"success:89,timeout:11",ok,1363.676,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,2.0,341,1,0,0.82,82,100,3181.8470263671875,4020.87,83.0,67.953,45.377,0.671,"contact:3,success:87,timeout:10",ok,1321.879,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,3.0,341,1,0,0.77,77,100,1506.7115789794923,3302.04,81.1,48.03,46.117,0.968,"contact:6,success:82,timeout:12",ok,1294.664,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,4.0,341,1,0,0.78,78,100,1179.9479724121093,2786.15,79.6,38.072,46.177,1.219,"contact:6,out_of_bounds:1,success:83,timeout:10",ok,1289.341,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,5.0,341,1,0,0.76,76,100,301.93916748046877,2613.1,79.3,34.334,47.819,1.4,"contact:7,out_of_bounds:5,success:81,timeout:7",ok,1255.844,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,6.0,341,1,0,0.7,70,100,300.999132232666,2253.63,74.6,33.218,49.841,1.508,"contact:13,out_of_bounds:10,success:75,timeout:2",ok,1266.695,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,7.0,341,1,0,0.73,73,100,187.44289306640624,2353.23,73.7,32.673,49.851,1.543,"contact:14,out_of_bounds:5,success:78,timeout:3",ok,1287.161,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,8.0,341,1,0,0.63,63,100,-290.8326649475098,2521.9,67.5,34.52,52.219,1.53,"contact:13,out_of_bounds:15,success:68,timeout:4",ok,1327.659,
+LiDAR-KU + CNN，无 Camera-risk,4,4.0,9.0,341,1,0,0.56,56,100,-460.85178466796873,2706.5,68.5,41.899,58.744,1.437,"contact:28,out_of_bounds:6,success:61,timeout:5",ok,1300.484,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,1.0,216,1,1,0.8,80,100,6339.698745422364,6620.33,82.8,128.774,46.32,0.361,"contact:7,success:85,timeout:8",ok,1268.263,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,2.0,216,1,1,0.81,81,100,3259.2478518676758,3595.04,81.2,69.741,46.19,0.674,"contact:10,out_of_bounds:2,success:86,timeout:2",ok,1208.075,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,3.0,216,1,1,0.87,87,100,1948.103751220703,2803.77,83.3,46.202,45.538,0.999,"contact:2,success:92,timeout:6",ok,1223.117,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,4.0,216,1,1,0.84,84,100,-2127.402015380859,2269.46,82.0,35.926,45.378,1.272,"contact:5,out_of_bounds:1,success:89,timeout:5",ok,1208.67,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,5.0,216,1,1,0.86,86,100,-3360.9171057128906,2286.99,81.3,33.267,47.755,1.453,"contact:2,out_of_bounds:2,success:91,timeout:5",ok,1210.819,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,6.0,216,1,1,0.78,78,100,-3125.190291748047,2003.43,78.8,29.699,47.007,1.592,"contact:9,out_of_bounds:6,success:83,timeout:2",ok,1194.653,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,7.0,216,1,1,0.74,74,100,-3337.102926025391,1891.19,73.8,29.27,48.704,1.671,"contact:12,out_of_bounds:7,success:79,timeout:2",ok,1209.565,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,8.0,216,1,1,0.71,71,100,-3868.188040161133,2048.31,72.5,31.171,51.224,1.653,"contact:12,out_of_bounds:10,success:76,timeout:2",ok,1232.146,
+LiDAR-KU + CNN，无 Camera-risk,5,5.0,9.0,216,1,1,0.6,60,100,-5187.582036132812,2476.5,68.4,35.571,54.891,1.567,"contact:24,out_of_bounds:7,success:65,timeout:4",ok,1257.099,
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,1.0,146,1,2,0.9,90,100,7532.152299804688,6512.92,84.8,126.855,45.664,0.361,"contact:2,success:93,timeout:5",ok,1249.056,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,2.0,146,1,2,0.93,93,100,3312.0313415527344,3565.85,84.7,67.428,45.747,0.684,"contact:1,success:96,timeout:3",ok,1218.789,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,3.0,146,1,2,0.88,88,100,-102.51680450439453,2758.89,82.9,45.821,45.274,0.996,"contact:2,out_of_bounds:2,success:91,timeout:5",ok,1199.288,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,4.0,146,1,2,0.86,86,100,-2525.1006274414062,2399.34,80.7,36.892,46.142,1.265,"contact:3,out_of_bounds:1,success:89,timeout:7",ok,1193.967,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,5.0,146,1,2,0.82,82,100,-3925.5964459228517,2454.78,79.7,32.088,46.675,1.463,"contact:5,out_of_bounds:3,success:85,timeout:7",ok,1193.673,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,6.0,146,1,2,0.77,77,100,-3392.2674157714846,2068.65,74.8,29.657,46.863,1.588,"contact:9,out_of_bounds:8,success:80,timeout:3",ok,1216.435,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,7.0,146,1,2,0.73,73,100,-3204.400963745117,1958.22,71.4,29.872,48.452,1.635,"contact:13,out_of_bounds:11,success:76",ok,994.253,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,8.0,146,1,2,0.67,67,100,-4376.06869934082,2216.1,68.1,33.444,52.538,1.598,"contact:18,out_of_bounds:9,success:70,timeout:3",ok,1236.973,tree_spacing_m=6.0 success_rate +0.02 percentage points
+LiDAR-KU + CNN，无 Camera-risk,6,6.0,9.0,146,1,2,0.67,67,100,-5341.745623779297,2520.78,70.2,37.868,56.676,1.546,"contact:17,out_of_bounds:8,success:70,timeout:5",ok,1242.309,tree_spacing_m=6.0 success_rate +0.02 percentage points

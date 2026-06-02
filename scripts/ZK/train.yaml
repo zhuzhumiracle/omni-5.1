@@ -40,7 +40,7 @@ tree:
 init_mode: goodpt
 # 可填 .pt 文件，或填写目录（优先 checkpoint_final.pt，否则选最新修改的 .pt）
 # 相对路径按本脚本所在目录 OmniDrones/scripts/ZK 解析
-goodpt_path: goodpt/5-24-vlim-lcgate-tree_best_return_4728.99.pt
+goodpt_path: goodpt/5-27-vlim-lcgate-tree_best_return_4054.61.pt
 
 viewer:
   resolution: [1080, 780] # 可视化窗口分辨率
