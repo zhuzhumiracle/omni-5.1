@@ -71,6 +71,7 @@ class CanLiDARGateBackbone(torch.nn.Module):
         output_dim=128,
         camera_h_fov_rad=None,
         fov_pitch_range=None,
+        camera_yaw_center_rad=0.0,
         num_rows=1,
         num_cols=3,
         features_per_sector=4,
@@ -103,6 +104,7 @@ class CanLiDARGateBackbone(torch.nn.Module):
             fov_pitch_range = (-math.pi / 2, math.pi / 2)
         self.fov_pitch_min = float(fov_pitch_range[0])
         self.fov_pitch_max = float(fov_pitch_range[1])
+        self.camera_yaw_center_rad = float(camera_yaw_center_rad)
         self._build_sector_2d_masks()
 
         self.ku_encoder = torch.nn.Sequential(
@@ -155,10 +157,14 @@ class CanLiDARGateBackbone(torch.nn.Module):
         row_pitches = (torch.arange(self.ku_h, dtype=torch.float32) + 0.5) / self.ku_h * math.pi - math.pi / 2.0
 
         yaw_grid = col_yaws.unsqueeze(0).expand(self.ku_h, -1)
+        rel_yaw_grid = torch.remainder(
+            yaw_grid - self.camera_yaw_center_rad + math.pi,
+            2.0 * math.pi,
+        ) - math.pi
         pitch_grid = row_pitches.unsqueeze(1).expand(-1, self.ku_w)
 
         fov_mask = (
-            (yaw_grid >= -h_fov / 2.0) & (yaw_grid <= h_fov / 2.0)
+            (rel_yaw_grid >= -h_fov / 2.0) & (rel_yaw_grid <= h_fov / 2.0)
             & (pitch_grid >= p_min) & (pitch_grid <= p_max)
         )
 
@@ -171,7 +177,7 @@ class CanLiDARGateBackbone(torch.nn.Module):
                 y_right = -h_fov / 2.0 + (ci + 1) * h_fov / self.num_cols
                 mask = (
                     fov_mask
-                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (rel_yaw_grid >= y_left) & (rel_yaw_grid <= y_right)
                     & (pitch_grid >= p_left) & (pitch_grid <= p_right)
                 )
                 self._sector_masks.append(torch.nn.Parameter(mask.bool(), requires_grad=False))
@@ -284,6 +290,7 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
     cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
     if float(np.linalg.norm(cam_axis)) <= 1e-9:
         raise RuntimeError("depth_camera_pos and depth_camera_target must not coincide.")
+    camera_yaw_center_rad = math.atan2(float(cam_axis[1]), float(cam_axis[0]))
     cam_pitch_rad = math.atan2(float(cam_axis[2]), cam_xy_norm)
     cam_pitch_min = cam_pitch_rad - camera_v_fov_rad / 2.0
     cam_pitch_max = cam_pitch_rad + camera_v_fov_rad / 2.0
@@ -296,7 +303,8 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
             f"lidar=[{math.degrees(lidar_pitch_min):.2f}, {math.degrees(lidar_pitch_max):.2f}]deg."
         )
     print(
-        "[lc-gate] pitch masks aligned to camera axis | "
+        "[lc-gate] masks aligned to camera axis | "
+        f"yaw={math.degrees(camera_yaw_center_rad):.2f}deg "
         f"pitch={math.degrees(cam_pitch_rad):.2f}deg "
         f"overlap=[{math.degrees(fov_pitch_min):.2f}, {math.degrees(fov_pitch_max):.2f}]deg"
     )
@@ -309,6 +317,7 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
         fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+        camera_yaw_center_rad=camera_yaw_center_rad,
         num_rows=num_rows,
         num_cols=num_cols,
         features_per_sector=features_per_sector,
@@ -321,6 +330,7 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
         fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+        camera_yaw_center_rad=camera_yaw_center_rad,
         num_rows=num_rows,
         num_cols=num_cols,
         features_per_sector=features_per_sector,
@@ -1720,6 +1730,21 @@ def _set_recorded_drone_render_visibility(base_env, env_idx=0, visible=True):
     return len(changed_paths)
 
 
+def _body_forward_axis_from_cfg(base_env):
+    try:
+        raw = base_env.cfg.task.get("body_forward_axis", [0.0, -1.0, 0.0])
+    except Exception:
+        raw = [0.0, -1.0, 0.0]
+    vals = [float(v) for v in raw]
+    if len(vals) != 3:
+        vals = [0.0, -1.0, 0.0]
+    norm = math.sqrt(sum(v * v for v in vals))
+    if norm <= 1e-9:
+        vals = [0.0, -1.0, 0.0]
+        norm = 1.0
+    return [v / norm for v in vals]
+
+
 def _set_third_person_follow_camera(base_env, env_idx=0, eye_offset=None, lookat_offset=None):
     eye_offset = torch.as_tensor(
         eye_offset if eye_offset is not None else [4.0, 0.0, 1.2],
@@ -1758,17 +1783,18 @@ def _set_third_person_follow_camera(base_env, env_idx=0, eye_offset=None, lookat
                 axis_b = torch.tensor(axis, dtype=torch.float32, device=drone_pos.device).reshape(1, 3)
                 return quat_rotate(quat_b, axis_b).reshape(3)
 
-            forward = rotate_body_axis([1.0, 0.0, 0.0])
-            right = rotate_body_axis([0.0, 1.0, 0.0])
             up_axis = rotate_body_axis([0.0, 0.0, 1.0])
+            forward = rotate_body_axis(_body_forward_axis_from_cfg(base_env))
+            right = torch.cross(forward, up_axis, dim=0)
         else:
-            forward = _as_env_vec3(getattr(base_env.drone, "heading", None), env_idx=env_idx)
-            if forward is None:
-                forward = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=drone_pos.device)
-            forward = forward.to(drone_pos.device)
+            forward = torch.tensor(
+                _body_forward_axis_from_cfg(base_env),
+                dtype=torch.float32,
+                device=drone_pos.device,
+            )
             world_up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=drone_pos.device)
-            right = torch.cross(world_up, forward, dim=0)
             up_axis = world_up
+            right = torch.cross(forward, up_axis, dim=0)
 
         if float(torch.linalg.norm(forward).detach().cpu().item()) < 1e-5:
             forward = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=drone_pos.device)
@@ -2017,10 +2043,10 @@ let replay, frames=[], idx=0, playing=true, view='follow', last=performance.now(
 function by(id){{return document.getElementById(id)}}
 function makeTreeGeometry(mesh){{const pos=[]; for(const v of mesh.vertices) pos.push(v[0],v[1],v[2]); const ind=[]; for(const f of mesh.faces) ind.push(f[0],f[1],f[2]); const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3)); g.setIndex(ind); g.computeVertexNormals(); return g}}
 function buildTrees(){{const mat=new THREE.MeshStandardMaterial({{color:0x2f8f57,roughness:.82,side:THREE.DoubleSide}}); const geo=makeTreeGeometry(replay.tree_mesh); const inst=new THREE.InstancedMesh(geo,mat,replay.tree_instances.length); inst.castShadow=true; inst.receiveShadow=true; const o=new THREE.Object3D(); replay.tree_instances.forEach((t,i)=>{{o.position.set(t.position[0],t.position[1],t.position[2]); o.rotation.set(t.roll,t.pitch,t.yaw,'XYZ'); o.scale.setScalar(t.scale); o.updateMatrix(); inst.setMatrixAt(i,o.matrix)}}); scene.add(inst); ui.trees.textContent=String(replay.tree_instances.length)}}
-function buildDrone(){{const g=new THREE.Group(); const bodyMat=new THREE.MeshStandardMaterial({{color:0xf4b84a,metalness:.25,roughness:.5}}); const body=new THREE.Mesh(new THREE.BoxGeometry(.30,.18,.10),bodyMat); const nose=new THREE.Mesh(new THREE.ConeGeometry(.055,.12,16),bodyMat); nose.rotation.y=Math.PI/2; nose.position.x=.20; const armMat=new THREE.MeshStandardMaterial({{color:0xd9e3e5,roughness:.55}}); const rotorMat=new THREE.MeshStandardMaterial({{color:0x171b1d,metalness:.35,roughness:.5}}); g.add(body,nose); const armGeo=new THREE.CylinderGeometry(.016,.016,.34,12); const armA=new THREE.Mesh(armGeo,armMat); armA.rotation.z=-Math.PI/4; const armB=new THREE.Mesh(armGeo,armMat); armB.rotation.z=Math.PI/4; g.add(armA,armB); const a=.17/Math.SQRT2; const rotorPositions=[[a,a,.02],[a,-a,.02],[-a,a,.02],[-a,-a,.02]]; g.rotors=[]; for(const p of rotorPositions){{const r=new THREE.Group(); r.position.set(...p); r.add(new THREE.Mesh(new THREE.TorusGeometry(.072,.007,8,32),rotorMat)); const b1=new THREE.Mesh(new THREE.BoxGeometry(.19,.018,.006),rotorMat); const b2=b1.clone(); b2.rotation.z=Math.PI/2; r.add(b1,b2); g.rotors.push(r); g.add(r)}} g.scale.setScalar(2.4); scene.add(g); return g}}
+function buildDrone(){{const g=new THREE.Group(); const bodyMat=new THREE.MeshStandardMaterial({{color:0xf4b84a,metalness:.25,roughness:.5}}); const body=new THREE.Mesh(new THREE.BoxGeometry(.30,.18,.10),bodyMat); const nose=new THREE.Mesh(new THREE.ConeGeometry(.055,.12,16),bodyMat); nose.rotation.x=Math.PI; nose.position.y=-.20; const armMat=new THREE.MeshStandardMaterial({{color:0xd9e3e5,roughness:.55}}); const rotorMat=new THREE.MeshStandardMaterial({{color:0x171b1d,metalness:.35,roughness:.5}}); g.add(body,nose); const armGeo=new THREE.CylinderGeometry(.016,.016,.34,12); const armA=new THREE.Mesh(armGeo,armMat); armA.rotation.z=-Math.PI/4; const armB=new THREE.Mesh(armGeo,armMat); armB.rotation.z=Math.PI/4; g.add(armA,armB); const a=.17/Math.SQRT2; const rotorPositions=[[a,a,.02],[a,-a,.02],[-a,a,.02],[-a,-a,.02]]; g.rotors=[]; for(const p of rotorPositions){{const r=new THREE.Group(); r.position.set(...p); r.add(new THREE.Mesh(new THREE.TorusGeometry(.072,.007,8,32),rotorMat)); const b1=new THREE.Mesh(new THREE.BoxGeometry(.19,.018,.006),rotorMat); const b2=b1.clone(); b2.rotation.z=Math.PI/2; r.add(b1,b2); g.rotors.push(r); g.add(r)}} g.scale.setScalar(2.4); scene.add(g); return g}}
 function buildTrajectory(){{const pts=frames.map(f=>new THREE.Vector3(...f.pos)); const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({{color:0x55d6d2}})); scene.add(line); const cur=new THREE.Mesh(new THREE.SphereGeometry(.11,12,8),new THREE.MeshBasicMaterial({{color:0x55d6d2}})); scene.add(cur); replay.cursor=cur}}
 function target(){{const p=replay.target||[0,0,2]; const m=new THREE.Mesh(new THREE.SphereGeometry(.45,24,16),new THREE.MeshStandardMaterial({{color:0xff6b5a,emissive:0x260805}})); m.position.set(p[0],p[1],p[2]); scene.add(m)}}
-function applyFrame(i){{idx=Math.max(0,Math.min(frames.length-1,Math.round(i))); const f=frames[idx]; drone.position.set(...f.pos); const q=f.quat_wxyz||[1,0,0,0]; drone.quaternion.set(q[1],q[2],q[3],q[0]).normalize(); for(const [ri,r] of drone.rotors.entries()) r.rotation.z += (ri%2?1:-1)*.7; replay.cursor.position.set(...f.pos); ui.timeline.value=idx; ui.frame.textContent=`${{idx+1}}/${{frames.length}}`; ui.speed.textContent=`${{(f.speed||0).toFixed(2)}} m/s`; ui.euler.textContent=(f.euler_deg||[0,0,0]).map(v=>v.toFixed(1)).join(' '); if(view==='follow'){{const p=new THREE.Vector3(...f.pos); const fw=new THREE.Vector3(1,0,0).applyQuaternion(drone.quaternion).normalize(); const up=new THREE.Vector3(0,0,1).applyQuaternion(drone.quaternion).normalize(); const desired=p.clone().add(fw.clone().multiplyScalar(-6)).add(up.clone().multiplyScalar(2.0)); const target=p.clone().add(fw.clone().multiplyScalar(1.2)).add(up.clone().multiplyScalar(.15)); camera.up.lerp(up,.22).normalize(); camera.position.lerp(desired,.18); controls.target.lerp(target,.25)}}}}
+function applyFrame(i){{idx=Math.max(0,Math.min(frames.length-1,Math.round(i))); const f=frames[idx]; drone.position.set(...f.pos); const q=f.quat_wxyz||[1,0,0,0]; drone.quaternion.set(q[1],q[2],q[3],q[0]).normalize(); for(const [ri,r] of drone.rotors.entries()) r.rotation.z += (ri%2?1:-1)*.7; replay.cursor.position.set(...f.pos); ui.timeline.value=idx; ui.frame.textContent=`${{idx+1}}/${{frames.length}}`; ui.speed.textContent=`${{(f.speed||0).toFixed(2)}} m/s`; ui.euler.textContent=(f.euler_deg||[0,0,0]).map(v=>v.toFixed(1)).join(' '); if(view==='follow'){{const p=new THREE.Vector3(...f.pos); const axis=replay.body_forward_axis||[0,-1,0]; const fw=new THREE.Vector3(axis[0],axis[1],axis[2]).applyQuaternion(drone.quaternion).normalize(); const up=new THREE.Vector3(0,0,1).applyQuaternion(drone.quaternion).normalize(); const desired=p.clone().add(fw.clone().multiplyScalar(-6)).add(up.clone().multiplyScalar(2.0)); const target=p.clone().add(fw.clone().multiplyScalar(1.2)).add(up.clone().multiplyScalar(.15)); camera.up.lerp(up,.22).normalize(); camera.position.lerp(desired,.18); controls.target.lerp(target,.25)}}}}
 function resize(){{renderer.setSize(innerWidth,innerHeight,false); camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix()}} window.addEventListener('resize',resize);
 ui.play.onclick=()=>{{playing=!playing; ui.play.textContent=playing?'Pause':'Play'; if(playing&&idx>=frames.length-1)applyFrame(0)}}; ui.timeline.oninput=()=>{{playing=false; ui.play.textContent='Play'; applyFrame(Number(ui.timeline.value))}};
 by('free').onclick=()=>view='free'; by('follow').onclick=()=>view='follow'; by('top').onclick=()=>{{view='free'; camera.up.set(0,0,1); const p=new THREE.Vector3(...frames[idx].pos); camera.position.set(p.x,p.y,p.z+70); controls.target.copy(p)}}; by('side').onclick=()=>{{view='free'; camera.up.set(0,0,1); const p=new THREE.Vector3(...frames[idx].pos); camera.position.set(p.x+34,p.y-52,p.z+18); controls.target.copy(p)}};
@@ -2600,6 +2626,7 @@ def run_worker(args, hydra_overrides):
                                         "seed": int(args.worker_seed),
                                         "episode": int(ep + 1),
                                         "trial": int(trial_idx),
+                                        "body_forward_axis": _body_forward_axis_from_cfg(base_env),
                                         "target": [
                                             round(float(v), 6)
                                             for v in target_pos[success_env_idx].detach().cpu().reshape(-1)[:3].tolist()

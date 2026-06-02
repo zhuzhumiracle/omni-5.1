@@ -669,6 +669,7 @@ class DualStreamBackbone(torch.nn.Module):
         output_dim=128,
         camera_h_fov_rad=None,
         fov_pitch_range=None,
+        camera_yaw_center_rad=0.0,
         num_rows=3,
         num_cols=3,
         features_per_sector=4,
@@ -703,6 +704,7 @@ class DualStreamBackbone(torch.nn.Module):
             fov_pitch_range = (-math.pi / 2, math.pi / 2)
         self.fov_pitch_min = float(fov_pitch_range[0])
         self.fov_pitch_max = float(fov_pitch_range[1])
+        self.camera_yaw_center_rad = float(camera_yaw_center_rad)
 
         # 预计算 2D 扇区掩码
         self._build_sector_2d_masks()
@@ -765,10 +767,14 @@ class DualStreamBackbone(torch.nn.Module):
         row_pitches = (torch.arange(self.ku_h, dtype=torch.float32) + 0.5) / self.ku_h * math.pi - math.pi / 2.0
 
         yaw_grid = col_yaws.unsqueeze(0).expand(self.ku_h, -1)
+        rel_yaw_grid = torch.remainder(
+            yaw_grid - self.camera_yaw_center_rad + math.pi,
+            2.0 * math.pi,
+        ) - math.pi
         pitch_grid = row_pitches.unsqueeze(1).expand(-1, self.ku_w)
 
         fov_mask = (
-            (yaw_grid >= -h_fov / 2.0) & (yaw_grid <= h_fov / 2.0)
+            (rel_yaw_grid >= -h_fov / 2.0) & (rel_yaw_grid <= h_fov / 2.0)
             & (pitch_grid >= p_min) & (pitch_grid <= p_max)
         )
 
@@ -781,7 +787,7 @@ class DualStreamBackbone(torch.nn.Module):
                 y_right = -h_fov / 2.0 + (ci + 1) * h_fov / self.num_cols
                 mask = (
                     fov_mask
-                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (rel_yaw_grid >= y_left) & (rel_yaw_grid <= y_right)
                     & (pitch_grid >= p_left) & (pitch_grid <= p_right)
                 )
                 self._sector_masks.append(torch.nn.Parameter(mask.bool(), requires_grad=False))
@@ -1302,6 +1308,7 @@ def main(cfg):
             cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
             if float(np.linalg.norm(cam_axis)) <= 1e-9:
                 raise RuntimeError("depth_camera_pos and depth_camera_target must not coincide.")
+            camera_yaw_center_rad = math.atan2(float(cam_axis[1]), float(cam_axis[0]))
             cam_pitch_rad = math.atan2(float(cam_axis[2]), cam_xy_norm)
             cam_pitch_min = cam_pitch_rad - camera_v_fov_rad / 2.0
             cam_pitch_max = cam_pitch_rad + camera_v_fov_rad / 2.0
@@ -1314,8 +1321,9 @@ def main(cfg):
                     f"lidar=[{math.degrees(lidar_pitch_min):.2f}, {math.degrees(lidar_pitch_max):.2f}]deg."
                 )
             logging.info(
-                "LC-gate pitch masks aligned to camera axis: pitch=%.2fdeg, "
+                "LC-gate masks aligned to camera axis: yaw=%.2fdeg pitch=%.2fdeg, "
                 "camera_vfov=[%.2f, %.2f]deg, lidar=[%.2f, %.2f]deg, overlap=[%.2f, %.2f]deg.",
+                math.degrees(camera_yaw_center_rad),
                 math.degrees(cam_pitch_rad),
                 math.degrees(cam_pitch_min),
                 math.degrees(cam_pitch_max),
@@ -1331,6 +1339,7 @@ def main(cfg):
                 ku_value_max=ku_value_max, output_dim=expected_feature_dim,
                 camera_h_fov_rad=camera_h_fov_rad,
                 fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+                camera_yaw_center_rad=camera_yaw_center_rad,
                 num_rows=num_rows, num_cols=num_cols, features_per_sector=features_per_sector,
             ).to(base_env.device)
             critic_backbone = DualStreamBackbone(
@@ -1338,6 +1347,7 @@ def main(cfg):
                 ku_value_max=ku_value_max, output_dim=expected_feature_dim,
                 camera_h_fov_rad=camera_h_fov_rad,
                 fov_pitch_range=(fov_pitch_min, fov_pitch_max),
+                camera_yaw_center_rad=camera_yaw_center_rad,
                 num_rows=num_rows, num_cols=num_cols, features_per_sector=features_per_sector,
             ).to(base_env.device)
 

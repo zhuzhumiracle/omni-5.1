@@ -182,6 +182,11 @@ class forest_lc_gate(IsaacEnv):
         if self.target_yaw_mode == "action" and self.velocity_action_dim < 4:
             raise ValueError("target_yaw_mode=action requires velocity_action_dim >= 4.")
         self.velocity_yaw_speed_threshold = float(cfg.task.get("velocity_yaw_speed_threshold", 0.2))
+        self.body_forward_axis_cfg = [
+            float(v) for v in cfg.task.get("body_forward_axis", [1.0, 0.0, 0.0])
+        ]
+        if len(self.body_forward_axis_cfg) != 3:
+            raise ValueError("body_forward_axis must contain exactly 3 values.")
 
         self.vlim = float(cfg.task.get("vlim", cfg.task.get("v_max", 3.0)))
         self.vlim_randomize = bool(cfg.task.get("vlim_randomize", False))
@@ -343,6 +348,16 @@ class forest_lc_gate(IsaacEnv):
         self.actual_speed_count = torch.zeros((self.num_envs, 1), device=self.device)
         self.steps_since_reset = torch.zeros((self.num_envs, 1, 1), dtype=torch.int32, device=self.device)
         self.flip_counter = torch.zeros((self.num_envs, 1), dtype=torch.int32, device=self.device)
+        self.body_forward_axis = torch.tensor(
+            self.body_forward_axis_cfg,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        forward_norm = self.body_forward_axis.norm().clamp_min(1e-6)
+        self.body_forward_axis = self.body_forward_axis / forward_norm
+        self.body_forward_yaw_offset = float(
+            torch.atan2(self.body_forward_axis[1], self.body_forward_axis[0]).item()
+        )
 
         self.lidar._initialize_impl()
         self.lidar_resolution = (self.num_lidar_points, 1)
@@ -474,6 +489,7 @@ class forest_lc_gate(IsaacEnv):
         # Camera looks along -Z in its local frame; R maps this to body +forward direction.
         # The pitch is the angle between the body forward projection onto XY plane and the actual forward.
         _cam_forward_body = torch.nn.functional.normalize(_forward, dim=0)
+        self._cam_yaw_rad = float(torch.atan2(_cam_forward_body[1], _cam_forward_body[0]).item())
         self._cam_pitch_rad = float(torch.atan2(
             _cam_forward_body[2],
             torch.sqrt(_cam_forward_body[0] * _cam_forward_body[0] + _cam_forward_body[1] * _cam_forward_body[1])
@@ -736,6 +752,22 @@ class forest_lc_gate(IsaacEnv):
         q_xyz = quat[..., 1:]
         t = 2.0 * torch.cross(q_xyz, vec, dim=-1)
         return vec + q_w * t + torch.cross(q_xyz, t, dim=-1)
+
+    def _body_axis_world(self, quat: torch.Tensor, axis: torch.Tensor | None = None):
+        """Rotate a configured body-frame axis into world frame."""
+        if axis is None:
+            axis = self.body_forward_axis
+        axis = axis.to(device=quat.device, dtype=quat.dtype)
+        axis = axis.reshape(*((1,) * (quat.ndim - 1)), 3).expand(*quat.shape[:-1], 3)
+        return quat_rotate(quat, axis)
+
+    def _nose_yaw_from_quat(self, quat: torch.Tensor):
+        nose_world = self._body_axis_world(quat)
+        return torch.atan2(nose_world[..., 1:2], nose_world[..., 0:1])
+
+    def _nose_yaw_to_controller_yaw(self, nose_yaw: torch.Tensor):
+        return nose_yaw - float(self.body_forward_yaw_offset)
+
     def _push_current_lidar_frame_to_history(self):
         """
         把当前 lidar 帧压入历史缓存：
@@ -1245,11 +1277,13 @@ class forest_lc_gate(IsaacEnv):
         # [num_pitch_bins, num_yaw_bins] grids
         yaw_grid = yaw.unsqueeze(0).expand(self.num_pitch_bins, -1)
         pitch_grid = pitch.unsqueeze(1).expand(-1, self.num_yaw_bins)
+        cam_yaw = torch.tensor(float(self._cam_yaw_rad), device=self.device, dtype=torch.float32)
+        rel_yaw_grid = torch.remainder(yaw_grid - cam_yaw + torch.pi, 2.0 * torch.pi) - torch.pi
 
         # Bins within camera FoV ∩ LiDAR pitch range
         front_mask = (
-            (yaw_grid >= -h_fov / 2.0) &
-            (yaw_grid <=  h_fov / 2.0) &
+            (rel_yaw_grid >= -h_fov / 2.0) &
+            (rel_yaw_grid <=  h_fov / 2.0) &
             (pitch_grid >= pitch_min) &
             (pitch_grid <= pitch_max)
         )
@@ -1266,7 +1300,7 @@ class forest_lc_gate(IsaacEnv):
                 y_right = -h_fov / 2.0 + (ci + 1) * h_fov / N_cols
                 mask = (
                     front_mask
-                    & (yaw_grid >= y_left) & (yaw_grid <= y_right)
+                    & (rel_yaw_grid >= y_left) & (rel_yaw_grid <= y_right)
                     & (pitch_grid >= p_left) & (pitch_grid <= p_right)
                 )
                 sector_masks.append(mask)
@@ -1580,21 +1614,22 @@ class forest_lc_gate(IsaacEnv):
             yaw_idx = 4 if self.velocity_action_dim >= 5 else 3
             if action_norm is None or action_norm.shape[-1] <= yaw_idx:
                 raise RuntimeError("target_yaw_mode=action requires an action yaw channel.")
-            return action_norm[..., yaw_idx:yaw_idx + 1] * math.pi
+            nose_yaw = action_norm[..., yaw_idx:yaw_idx + 1] * math.pi
+            return self._nose_yaw_to_controller_yaw(nose_yaw)
 
         goal_vec = self.target_pos - root_state[..., :3]
         goal_yaw = torch.atan2(goal_vec[..., 1:2], goal_vec[..., 0:1])
         if self.target_yaw_mode == "goal":
-            return goal_yaw
+            return self._nose_yaw_to_controller_yaw(goal_yaw)
 
-        heading = self.drone.heading[..., :3]
-        current_yaw = torch.atan2(heading[..., 1:2], heading[..., 0:1])
+        current_yaw = self._nose_yaw_from_quat(root_state[..., 3:7])
         if self.target_yaw_mode == "current":
-            return current_yaw
+            return self._nose_yaw_to_controller_yaw(current_yaw)
 
         vel_yaw = torch.atan2(target_vel_world[..., 1:2], target_vel_world[..., 0:1])
         vel_xy_norm = target_vel_world[..., :2].norm(dim=-1, keepdim=True)
-        return torch.where(vel_xy_norm > self.velocity_yaw_speed_threshold, vel_yaw, goal_yaw)
+        nose_yaw = torch.where(vel_xy_norm > self.velocity_yaw_speed_threshold, vel_yaw, goal_yaw)
+        return self._nose_yaw_to_controller_yaw(nose_yaw)
 
     # --------------------------------------------------------------------- #
     def _pre_sim_step(self, tensordict: TensorDictBase):
@@ -2203,25 +2238,17 @@ class forest_lc_gate(IsaacEnv):
                         axis_b = torch.tensor(axis, dtype=torch.float32, device=self.device).reshape(1, 3)
                         return quat_rotate(drone_quat_b, axis_b).reshape(3)
 
-                    forward = rotate_body_axis([1.0, 0.0, 0.0])
-                    right = rotate_body_axis([0.0, 1.0, 0.0])
                     up_axis = rotate_body_axis([0.0, 0.0, 1.0])
+                    forward = self._body_axis_world(drone_quat_b, self.body_forward_axis).reshape(3)
+                    right = torch.cross(forward, up_axis, dim=0)
                 elif hasattr(self.drone, "heading"):
-                    heading = self.drone.heading
-                    if heading.ndim >= 3:
-                        follow_env_idx = max(0, min(follow_env_idx, heading.shape[0] - 1))
-                        forward = heading[follow_env_idx, 0, :3]
-                    elif heading.ndim == 2:
-                        follow_env_idx = max(0, min(follow_env_idx, heading.shape[0] - 1))
-                        forward = heading[follow_env_idx, :3]
-                    else:
-                        forward = heading[:3]
+                    forward = self.body_forward_axis.to(self.device)
                     up_axis = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
-                    right = torch.cross(up_axis, forward, dim=0)
+                    right = torch.cross(forward, up_axis, dim=0)
                 else:
-                    forward = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-                    right = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                    forward = self.body_forward_axis.to(self.device)
                     up_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+                    right = torch.cross(forward, up_axis, dim=0)
                 if float(torch.linalg.norm(forward).detach().cpu().item()) < 1e-5:
                     forward = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=self.device)
                 else:
@@ -2451,7 +2478,7 @@ class forest_lc_gate(IsaacEnv):
         # Death must dominate partial progress; otherwise the agent can collect
         # milestones and still learn to accept a crash.
         r_death = misbehave.float() * self.death_penalty
-        x_body = self.drone.heading[..., :3]
+        nose_world = self._body_axis_world(self.drone_state[..., 3:7])
         # r_yaw = (x_body * vel_direction).sum(-1)
 
         # 把它改成这样，强迫机头看向目标
@@ -2495,7 +2522,7 @@ class forest_lc_gate(IsaacEnv):
         goal_vec_xy = (self.target_pos - curr_pos)[..., :2]
         goal_dir_xy = goal_vec_xy / goal_vec_xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        heading_xy = self.drone.heading[..., :2]
+        heading_xy = nose_world[..., :2]
         heading_xy = heading_xy / heading_xy.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
         speed_mask = torch.sigmoid((v_xy_norm.squeeze(-1) - 4.0) / 0.1)

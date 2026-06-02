@@ -5,7 +5,7 @@ Camera‑Sector‑LiDAR Alignment Verification Script (v2)
 Verifies spatial alignment between depth camera, 2D sector gates, and LiDAR KU map.
 
 Key fixes vs v1:
-  - Camera target now [2.0, 0.0, 0.95] matching forest_lc_gate.yaml (was [2.0,0.0,0.18])
+  - Camera target now [0.0, -2.0, 0.95] matching forest_lc_gate.yaml body -Y nose axis.
   - KU pitch mapping validated against environment code:
     env uses  pitch_bin = ((pitch + π/2) / π) * num_pitch_bins  → [-90°, 90°] to [0, 39]
   - Added pixel‑to‑ray projection: camera pixel → yaw/pitch → KU row/col
@@ -38,8 +38,8 @@ CFG_DIR = OMNIDRONES_DIR / "cfg"
 
 # ---- Config matching cfg/task/forest_lc_gate.yaml ----
 # Camera tilted upward ~23.4° so its vertical FoV lands within LiDAR [-7°, 52°]
-_DEFAULT_CAM_POS = [0.22, 0.0, 0.18]
-_DEFAULT_CAM_TARGET = [2.0, 0.0, 0.95]
+_DEFAULT_CAM_POS = [0.0, -0.22, 0.18]
+_DEFAULT_CAM_TARGET = [0.0, -2.0, 0.95]
 _DEFAULT_FOCAL_MM = 12.0
 _DEFAULT_H_APERTURE_MM = 20.955
 _DEFAULT_DEPTH_W = 160
@@ -60,6 +60,7 @@ def build_sector_masks(
     fov_pitch_max: float = math.pi / 2,
     num_rows: int = 3,
     num_cols: int = 3,
+    camera_yaw_center_rad: float = -math.pi / 2,
     lidar_pitch_min: float = -math.pi / 2,
     lidar_pitch_max: float = math.pi / 2,
 ) -> tuple[list[np.ndarray], dict]:
@@ -84,10 +85,11 @@ def build_sector_masks(
     row_pitches = (np.arange(ku_h, dtype=np.float64) + 0.5) / ku_h * p_span + lidar_pitch_min
 
     yaw_grid = col_yaws_w[np.newaxis, :].repeat(ku_h, axis=0)    # [H,W]
+    rel_yaw_grid = (yaw_grid - float(camera_yaw_center_rad) + math.pi) % (2.0 * math.pi) - math.pi
     pitch_grid = row_pitches[:, np.newaxis].repeat(ku_w, axis=1)  # [H,W]
 
     fov_mask = (
-        (yaw_grid >= -h_fov / 2.0) & (yaw_grid <= h_fov / 2.0)
+        (rel_yaw_grid >= -h_fov / 2.0) & (rel_yaw_grid <= h_fov / 2.0)
         & (pitch_grid >= p_min) & (pitch_grid <= p_max)
     )
 
@@ -98,7 +100,7 @@ def build_sector_masks(
         for ci in range(num_cols):
             yl = -h_fov / 2.0 + ci * h_fov / num_cols
             yr = -h_fov / 2.0 + (ci + 1) * h_fov / num_cols
-            m = fov_mask & (yaw_grid >= yl) & (yaw_grid <= yr) & (pitch_grid >= pl) & (pitch_grid <= pr)
+            m = fov_mask & (rel_yaw_grid >= yl) & (rel_yaw_grid <= yr) & (pitch_grid >= pl) & (pitch_grid <= pr)
             masks.append(m)
             sectors.append({
                 "row": ri, "col": ci,
@@ -112,6 +114,7 @@ def build_sector_masks(
         "num_rows": num_rows, "num_cols": num_cols,
         "camera_h_fov_rad": h_fov,
         "camera_h_fov_deg": math.degrees(h_fov),
+        "camera_yaw_center_deg": math.degrees(float(camera_yaw_center_rad)),
         "fov_pitch_min_deg": math.degrees(p_min),
         "fov_pitch_max_deg": math.degrees(p_max),
         "fov_total_pixels": int(fov_mask.sum()),
@@ -159,6 +162,7 @@ def project_pixels_to_ku(
     ku_h: int = 40, ku_w: int = 80,
     lidar_pitch_min: float = -math.pi / 2,
     lidar_pitch_max: float = math.pi / 2,
+    camera_yaw_center_rad: float = -math.pi / 2,
     num_test_rows: int = 3, num_test_cols: int = 3,
     depth_w: int = 160, depth_h: int = 96,
     cam_rot_body: np.ndarray | None = None,  # 3×3 row-vector: camera→body
@@ -203,9 +207,10 @@ def project_pixels_to_ku(
             pb = int(np.clip((pitch_body - lidar_pitch_min) / p_span * ku_h, 0, ku_h - 1))
 
             # Which sector (based on body-frame angles)
-            sc = int(np.clip((yaw_body - (-camera_h_fov_rad / 2)) / camera_h_fov_rad * num_test_cols,
+            rel_yaw = (yaw_body - camera_yaw_center_rad + math.pi) % (2.0 * math.pi) - math.pi
+            sc = int(np.clip((rel_yaw - (-camera_h_fov_rad / 2)) / camera_h_fov_rad * num_test_cols,
                              0, num_test_cols - 1)) \
-                if -camera_h_fov_rad / 2 <= yaw_body <= camera_h_fov_rad / 2 else -1
+                if -camera_h_fov_rad / 2 <= rel_yaw <= camera_h_fov_rad / 2 else -1
             sr = int(np.clip((pitch_body - fov_pitch_min) / (fov_pitch_max - fov_pitch_min) * num_test_rows,
                              0, num_test_rows - 1)) \
                 if fov_pitch_min <= pitch_body <= fov_pitch_max else -1
@@ -237,7 +242,7 @@ def render_ascii(masks, meta):
     lines = [
         f"LiDAR KU grid ({ku_h}×{ku_w}) — sector overlay",
         f"Legend: . = outside FOV, 0-{min(len(masks)-1,35)} = sector idx",
-        f"Camera hFoV={meta['camera_h_fov_deg']:.1f}°  "
+        f"Camera yaw={meta['camera_yaw_center_deg']:.1f}° hFoV={meta['camera_h_fov_deg']:.1f}°  "
         f"pitch=[{meta['fov_pitch_min_deg']:.1f}°, {meta['fov_pitch_max_deg']:.1f}°]",
         f"LiDAR pitch=[{meta['lidar_pitch_min_deg']:.1f}°, {meta['lidar_pitch_max_deg']:.1f}°]",
         f"FOV: {meta['fov_total_pixels']}/{ku_h*ku_w} px ({meta['fov_pct_of_sphere']:.1f}%)",
@@ -375,6 +380,7 @@ def run_dry(args):
     cp = np.array(args.camera_pos); ct = np.array(args.camera_target)
     ax = ct - cp; axy = float(np.hypot(ax[0], ax[1]))
     if np.linalg.norm(ax) <= 1e-9: print("ERROR cam_pos==cam_target"); sys.exit(1)
+    cyaw = math.atan2(float(ax[1]), float(ax[0]))
     cpitch = math.atan2(float(ax[2]), axy)
     cp_min = cpitch - vfov/2; cp_max = cpitch + vfov/2
     fp_min = max(cp_min, lp_min); fp_max = min(cp_max, lp_max)
@@ -388,7 +394,7 @@ def run_dry(args):
     print("\n" + "=" * 70)
     print("Camera‑Sector‑LiDAR Alignment (dry-run)")
     print("=" * 70)
-    print(f"  Cam pos={args.camera_pos}  target={args.camera_target}  pitch={math.degrees(cpitch):.2f}°")
+    print(f"  Cam pos={args.camera_pos}  target={args.camera_target}  yaw={math.degrees(cyaw):.2f}° pitch={math.degrees(cpitch):.2f}°")
     print(f"  Cam rotation (row-vector):")
     for i, name in enumerate(["right", "up", "-fwd"]):
         print(f"    {name}: [{cam_rot[i,0]:.4f}, {cam_rot[i,1]:.4f}, {cam_rot[i,2]:.4f}]")
@@ -403,6 +409,7 @@ def run_dry(args):
     masks, meta = build_sector_masks(ku_h=40, ku_w=80, camera_h_fov_rad=hfov,
                                       fov_pitch_min=fp_min, fov_pitch_max=fp_max,
                                       num_rows=nr, num_cols=nc,
+                                      camera_yaw_center_rad=cyaw,
                                       lidar_pitch_min=ku_pmin, lidar_pitch_max=ku_pmax)
 
     print(f"\n  Sectors:")
@@ -418,6 +425,7 @@ def run_dry(args):
     pproj = project_pixels_to_ku(fx=fx, fy=fy, cx=cx, cy=cy, camera_h_fov_rad=hfov,
                                   fov_pitch_min=fp_min, fov_pitch_max=fp_max,
                                   ku_h=40, ku_w=80, lidar_pitch_min=ku_pmin, lidar_pitch_max=ku_pmax,
+                                  camera_yaw_center_rad=cyaw,
                                   num_test_rows=nr, num_test_cols=nc, depth_w=dw, depth_h=dh,
                                   cam_rot_body=cam_rot)
     print(f"\n  Pixel → KU projection:")
@@ -547,13 +555,14 @@ def run_live(cfg_ov):
         cp = np.array(cfg.task.get("depth_camera_pos", _DEFAULT_CAM_POS), dtype=np.float64)
         ct = np.array(cfg.task.get("depth_camera_target", _DEFAULT_CAM_TARGET), dtype=np.float64)
         ax = ct - cp
+        cyaw = math.atan2(float(ax[1]), float(ax[0]))
         cpitch = math.atan2(float(ax[2]), float(np.hypot(ax[0], ax[1])))
         cp_min = cpitch - vfov/2; cp_max = cpitch + vfov/2
         fp_min = max(cp_min, lp_min); fp_max = min(cp_max, lp_max)
 
         print(f"\n  fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
         print(f"  hFoV={math.degrees(hfov):.2f}° vFoV={math.degrees(vfov):.2f}°")
-        print(f"  Cam pitch={math.degrees(cpitch):.2f}° overlap=[{math.degrees(fp_min):.1f}°,{math.degrees(fp_max):.1f}°]")
+        print(f"  Cam yaw={math.degrees(cyaw):.2f}° pitch={math.degrees(cpitch):.2f}° overlap=[{math.degrees(fp_min):.1f}°,{math.degrees(fp_max):.1f}°]")
 
         # Extract camera→body rotation from USD geometry for pixel projection
         cam_rot_live = np.array(cg.get("camera_rot_base", [[1,0,0],[0,1,0],[0,0,1]]),
@@ -564,12 +573,14 @@ def run_live(cfg_ov):
         masks, meta = build_sector_masks(ku_h=40, ku_w=80, camera_h_fov_rad=hfov,
                                           fov_pitch_min=fp_min, fov_pitch_max=fp_max,
                                           num_rows=nr, num_cols=nc,
+                                          camera_yaw_center_rad=cyaw,
                                           lidar_pitch_min=ku_pmin, lidar_pitch_max=ku_pmax)
         print("\n" + render_ascii(masks, meta))
 
         pproj = project_pixels_to_ku(fx=fx, fy=fy, cx=cx, cy=cy, camera_h_fov_rad=hfov,
                                       fov_pitch_min=fp_min, fov_pitch_max=fp_max,
                                       ku_h=40, ku_w=80, lidar_pitch_min=ku_pmin, lidar_pitch_max=ku_pmax,
+                                      camera_yaw_center_rad=cyaw,
                                       num_test_rows=nr, num_test_cols=nc, depth_w=dw, depth_h=dh,
                                       cam_rot_body=cam_rot_live)
         print(f"\n  Pixel → KU:")

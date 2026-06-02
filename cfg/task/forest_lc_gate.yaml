@@ -36,11 +36,14 @@ depth_channels: 1
 depth_resolution: [96, 160]
 depth_data_type: distance_to_camera
 depth_max_range: 10.0
-depth_yaw_center_deg: 0.0
-depth_camera_pos: [0.22, 0.0, 0.18]
+# Hummingbird visual nose/camera front is body -Y. Keep camera, LiDAR-sector
+# fusion, yaw reward, and controller yaw semantics aligned to this axis.
+body_forward_axis: [0.0, -1.0, 0.0]
+depth_yaw_center_deg: -90.0
+depth_camera_pos: [0.0, -0.22, 0.18]
 # Camera tilted upward ~23.4° so its vertical FOV (~±14°) lands within LiDAR pitch range [-7°, 52°].
-# tan(23.4°) ≈ 0.432; forward baseline ≈ 1.78 m → z offset ≈ 0.77 m above camera.
-depth_camera_target: [2.0, 0.0, 0.95]
+# tan(23.4°) ~= 0.432; forward baseline ~= 1.78 m -> z offset ~= 0.77 m above camera.
+depth_camera_target: [0.0, -2.0, 0.95]
 # Explicit pinhole camera intrinsics. USD defaults are narrow for obstacle
 # avoidance, so keep the sensor FOV controlled by config instead.
 depth_camera_focal_length: 12.0
@@ -98,7 +101,7 @@ action_transform: null
 control_mode: velocity
 velocity_action_dim: 5
 velocity_frame: world
-target_yaw_mode: action
+target_yaw_mode: velocity
 velocity_yaw_speed_threshold: 0.2
 
 # 固定俯视相机参数（仅影响可视化）
