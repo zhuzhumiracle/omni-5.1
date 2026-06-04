@@ -78,6 +78,8 @@ class forest_lc_gate(IsaacEnv):
         if self.sync_depth_to_lidar:
             self.depth_update_interval = self.lidar_update_interval
         self.k_hist = int(cfg.task.get("k_hist", 5))
+        self.lidar_free_history_decay = float(cfg.task.get("lidar_free_history_decay", 0.85))
+        self.lidar_free_history_decay = max(0.0, min(1.0, self.lidar_free_history_decay))
 
         depth_res = cfg.task.get("depth_resolution", [96, 160])
         self.depth_c = int(cfg.task.get("depth_channels", 1))
@@ -126,6 +128,15 @@ class forest_lc_gate(IsaacEnv):
         self.camera_risk_add_stale_ratio = bool(cfg.task.get("camera_risk_add_stale_ratio", True))
         self.camera_danger_dist = float(cfg.task.get("camera_danger_dist", 3.0))
         self.camera_risk_min_valid_depth = float(cfg.task.get("camera_risk_min_valid_depth", 0.1))
+        self.camera_risk_percentile = float(cfg.task.get("camera_risk_percentile", 0.10))
+        self.camera_risk_percentile = max(0.0, min(1.0, self.camera_risk_percentile))
+        self.camera_risk_temporal_alpha = float(cfg.task.get("camera_risk_temporal_alpha", 0.35))
+        self.camera_risk_temporal_alpha = max(0.0, min(1.0, self.camera_risk_temporal_alpha))
+        self.camera_risk_depth_trend_scale = float(cfg.task.get("camera_risk_depth_trend_scale", 2.0))
+        self.camera_risk_depth_trend_scale = max(1e-6, self.camera_risk_depth_trend_scale)
+        self.camera_risk_ttc_horizon = float(cfg.task.get("camera_risk_ttc_horizon", 2.0))
+        self.camera_risk_ttc_min_depth = float(cfg.task.get("camera_risk_ttc_min_depth", 0.2))
+        self.camera_risk_ttc_min_depth = max(1e-6, self.camera_risk_ttc_min_depth)
 
         # camera_risk_dim 必须在 super().__init__ 之前计算，_set_specs 在 super 里会用到
         self.camera_risk_dim = (
@@ -523,6 +534,20 @@ class forest_lc_gate(IsaacEnv):
         # camera risk cache: [E, 1, camera_risk_dim]
         self.camera_risk_cache = torch.zeros(
             (self.num_envs, 1, self.camera_risk_dim),
+            device=self.device,
+        )
+        self.camera_risk_pdepth_ema = torch.full(
+            (self.num_envs, self.camera_risk_total_sectors),
+            self.depth_max_range,
+            device=self.device,
+        )
+        self.camera_risk_danger_ema = torch.zeros(
+            (self.num_envs, self.camera_risk_total_sectors),
+            device=self.device,
+        )
+        self.camera_risk_ema_initialized = torch.zeros(
+            (self.num_envs, self.camera_risk_total_sectors),
+            dtype=torch.bool,
             device=self.device,
         )
         # obstacle distance bin cache (k-frame fused, shared with camera-LiDAR risk)
@@ -1292,25 +1317,43 @@ class forest_lc_gate(IsaacEnv):
         N_rows = max(1, self.camera_risk_num_rows)
         N_cols = max(1, self.camera_risk_num_cols)
         sector_masks = []
+        sector_dirs = []
         for ri in range(N_rows):
             p_left = pitch_min + ri * (pitch_max - pitch_min) / N_rows
             p_right = pitch_min + (ri + 1) * (pitch_max - pitch_min) / N_rows
+            p_center = 0.5 * (p_left + p_right)
             for ci in range(N_cols):
                 y_left = -h_fov / 2.0 + ci * h_fov / N_cols
                 y_right = -h_fov / 2.0 + (ci + 1) * h_fov / N_cols
+                y_center = float(self._cam_yaw_rad) + 0.5 * (float(y_left) + float(y_right))
                 mask = (
                     front_mask
                     & (rel_yaw_grid >= y_left) & (rel_yaw_grid <= y_right)
                     & (pitch_grid >= p_left) & (pitch_grid <= p_right)
                 )
                 sector_masks.append(mask)
+                sector_dirs.append(torch.tensor(
+                    [
+                        math.cos(float(p_center)) * math.cos(y_center),
+                        math.cos(float(p_center)) * math.sin(y_center),
+                        math.sin(float(p_center)),
+                    ],
+                    dtype=torch.float32,
+                    device=self.device,
+                ))
 
         sector_masks = [m.reshape(-1).unsqueeze(0).expand(E, -1) for m in sector_masks]
 
         # ---- Step 4: per-front-sector features ----
         risk_features = []
+        pdepth_current = []
+        danger_current = []
 
-        for sector_mask in sector_masks:
+        quat = self.drone_state[..., 3:7]
+        v_world = self.drone.vel_w[..., :3]
+        v_body = quat_rotate_inverse(quat, v_world).squeeze(1)  # [E, 3]
+
+        for sector_idx, sector_mask in enumerate(sector_masks):
             d_lidar_s = lidar_dist_bin.clone()
             d_cam_s = cam_dist_bin.clone()
 
@@ -1320,6 +1363,7 @@ class forest_lc_gate(IsaacEnv):
             cam_valid_s = cam_valid_bin & sector_mask
 
             n_bins = sector_mask.sum(dim=-1).clamp_min(1).float()
+            n_cam_valid = cam_valid_s.sum(dim=-1)
             lidar_has_obs = sector_mask & (d_lidar_s < self.max_obs_dist - 1e-6)
             both_valid = cam_valid_s & lidar_has_obs
             n_both = both_valid.sum(dim=-1).clamp_min(1).float()
@@ -1342,9 +1386,93 @@ class forest_lc_gate(IsaacEnv):
             blind = lidar_has_obs & (~cam_valid_s)
             feat4 = blind.sum(dim=-1).float() / n_bins
 
-            risk_features.append(torch.stack([feat1, feat2, feat3, feat4], dim=-1))
+            # 5/6. Robust camera proximity: percentile depth and mean depth.
+            # Use p-depth instead of min depth so one noisy pixel/bin does not dominate.
+            depth_fill = torch.full_like(d_cam_s, self.depth_max_range)
+            depth_masked = torch.where(cam_valid_s, d_cam_s, depth_fill)
+            depth_sorted = depth_masked.sort(dim=-1).values
+            p_index = (
+                (n_cam_valid.float() - 1.0).clamp_min(0.0) * self.camera_risk_percentile
+            ).long()
+            p_depth = depth_sorted.gather(-1, p_index.unsqueeze(-1)).squeeze(-1)
+            p_depth = torch.where(
+                n_cam_valid > 0,
+                p_depth,
+                torch.full_like(p_depth, self.depth_max_range),
+            )
+            mean_depth = torch.where(
+                n_cam_valid > 0,
+                torch.where(cam_valid_s, d_cam_s, torch.zeros_like(d_cam_s)).sum(dim=-1)
+                / n_cam_valid.float().clamp_min(1.0),
+                torch.full_like(p_depth, self.depth_max_range),
+            )
+            feat5 = (1.0 - p_depth / self.depth_max_range).clamp(0.0, 1.0)
+            feat6 = (1.0 - mean_depth / self.depth_max_range).clamp(0.0, 1.0)
+
+            # 7. TTC-like risk: the same distance is much riskier at high closing speed.
+            sector_dir = sector_dirs[sector_idx]
+            closing_speed = (v_body * sector_dir.view(1, 3)).sum(dim=-1).clamp_min(0.0)
+            feat7 = (
+                closing_speed * self.camera_risk_ttc_horizon
+                / p_depth.clamp_min(self.camera_risk_ttc_min_depth)
+            ).clamp(0.0, 1.0)
+
+            # 8/9. Temporal trend: risk rises when reliable depth shrinks or danger grows.
+            if hasattr(self, "camera_risk_ema_initialized"):
+                init = self.camera_risk_ema_initialized[:, sector_idx]
+                prev_p_depth = self.camera_risk_pdepth_ema[:, sector_idx]
+                prev_danger = self.camera_risk_danger_ema[:, sector_idx]
+                feat8 = torch.where(
+                    init,
+                    ((prev_p_depth - p_depth) / self.camera_risk_depth_trend_scale).clamp(0.0, 1.0),
+                    torch.zeros_like(p_depth),
+                )
+                feat9 = torch.where(
+                    init,
+                    (feat3 - prev_danger).clamp(0.0, 1.0),
+                    torch.zeros_like(feat3),
+                )
+            else:
+                feat8 = torch.zeros_like(p_depth)
+                feat9 = torch.zeros_like(feat3)
+
+            sector_feature = torch.stack(
+                [feat1, feat2, feat3, feat4, feat5, feat6, feat7, feat8, feat9],
+                dim=-1,
+            )
+            if self.camera_risk_features_per_bin < sector_feature.shape[-1]:
+                sector_feature = sector_feature[..., : self.camera_risk_features_per_bin]
+            elif self.camera_risk_features_per_bin > sector_feature.shape[-1]:
+                pad = torch.zeros(
+                    E,
+                    self.camera_risk_features_per_bin - sector_feature.shape[-1],
+                    device=self.device,
+                    dtype=sector_feature.dtype,
+                )
+                sector_feature = torch.cat([sector_feature, pad], dim=-1)
+
+            risk_features.append(sector_feature)
+            pdepth_current.append(p_depth.detach())
+            danger_current.append(feat3.detach())
 
         risk = torch.cat(risk_features, dim=-1)
+
+        if hasattr(self, "camera_risk_ema_initialized") and pdepth_current:
+            pdepth_current = torch.stack(pdepth_current, dim=-1)
+            danger_current = torch.stack(danger_current, dim=-1)
+            alpha = self.camera_risk_temporal_alpha
+            init = self.camera_risk_ema_initialized
+            self.camera_risk_pdepth_ema.copy_(torch.where(
+                init,
+                (1.0 - alpha) * self.camera_risk_pdepth_ema + alpha * pdepth_current,
+                pdepth_current,
+            ))
+            self.camera_risk_danger_ema.copy_(torch.where(
+                init,
+                (1.0 - alpha) * self.camera_risk_danger_ema + alpha * danger_current,
+                danger_current,
+            ))
+            self.camera_risk_ema_initialized.fill_(True)
 
         # ---- Step 5: stale ratio (fraction of depth pixels at max_range) ----
         if self.camera_risk_add_stale_ratio:
@@ -1533,6 +1661,10 @@ class forest_lc_gate(IsaacEnv):
         self.obstacle_dist_bin_cache[env_ids] = self.max_obs_dist
         if self.use_camera_risk_observation:
             self.camera_risk_cache[env_ids] = 0.0
+            if hasattr(self, "camera_risk_pdepth_ema"):
+                self.camera_risk_pdepth_ema[env_ids] = self.depth_max_range
+                self.camera_risk_danger_ema[env_ids] = 0.0
+                self.camera_risk_ema_initialized[env_ids] = False
         self.lidar_dirty = True
         self.depth_dirty = True
 
@@ -2096,22 +2228,40 @@ class forest_lc_gate(IsaacEnv):
             hist_obstacle_dist = self._scatter_points_to_bins(hist_hits_body, reduce="amin")
             obstacle_dist_bin = torch.minimum(obstacle_dist_bin, hist_obstacle_dist)
 
-        # ---------- B. FoV free 边界：仅用当前帧 ----------
-        # 当前帧每条 ray 的终点在 body frame 下 = ray_dirs_local * dist
+        # ---------- B. FoV free 边界：融合最近 k 帧 ----------
+        # 每条 ray 的终点在 body frame 下 = ray_dirs_local * dist
         # - hit ray: dist = 命中距离，表示该方向 free 到障碍处
         # - miss ray: dist = max_obs_dist，表示该方向已确认 free 到最远
         # - 没有 ray 覆盖的 bin: d_unknown = 0 → 编码为 20（完全未知）
-        curr_ray_dist = curr_rel_w.norm(dim=-1)  # [E, P]，复用已有的世界系相对向量
-        curr_ray_dist = torch.nan_to_num(curr_ray_dist, nan=self.max_obs_dist,
-                                          posinf=self.max_obs_dist,
-                                          neginf=self.max_obs_dist)
-        curr_ray_dist = curr_ray_dist.clamp(0.0, self.max_obs_dist)
+        observed_free_dist_bin = torch.zeros(
+            (self.num_envs, self.downsampled_dim),
+            device=self.device,
+        )
 
-        # 直接用本体系 ray 方向 × 距离构造终点，无需从世界系旋转
-        curr_ray_endpoints_body = ray_dirs_local * curr_ray_dist.unsqueeze(-1)  # [E, P, 3]
+        for h in range(self.k_hist):
+            if not self.hist_valid[h].any():
+                continue
 
-        # scatter 到 bin 中取 max，得到每个 bin 方向上已确认 free 的最远距离
-        observed_free_dist_bin = self._scatter_points_to_bins(curr_ray_endpoints_body, reduce="amax")
+            # hist_head points to the next write slot, so the newest valid slot is hist_head - 1.
+            age = (self.hist_head - 1 - h) % self.k_hist
+            free_decay = self.lidar_free_history_decay ** float(age)
+
+            hist_ray_dist = self.hist_ray_end_dist[h].clamp(0.0, self.max_obs_dist) * free_decay
+            hist_endpoints_local = ray_dirs_local * hist_ray_dist.unsqueeze(-1)
+
+            hist_quat = self.hist_sensor_quat_w[h][:, None, :].expand(
+                -1, self.num_lidar_points, -1
+            )
+            hist_endpoints_w = self.hist_sensor_pos_w[h][:, None, :] + quat_rotate(
+                hist_quat.reshape(-1, 4),
+                hist_endpoints_local.reshape(-1, 3),
+            ).reshape(self.num_envs, self.num_lidar_points, 3)
+
+            hist_endpoints_body = self._transform_points_w_to_body(
+                hist_endpoints_w, curr_pos_w, curr_quat_w
+            )
+            hist_free_dist = self._scatter_points_to_bins(hist_endpoints_body, reduce="amax")
+            observed_free_dist_bin = torch.maximum(observed_free_dist_bin, hist_free_dist)
 
         # ---------------- 按论文风格编码 ----------------
         has_obstacle = obstacle_dist_bin < (self.max_obs_dist - 1e-6)

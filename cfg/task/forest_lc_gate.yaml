@@ -27,6 +27,8 @@ lidar_pitch_min_deg: -7.0
 lidar_pitch_max_deg: 52.0
 num_lidar_points: 20000
 lidar_update_interval: 5
+k_hist: 10
+lidar_free_history_decay: 0.85
 
 # 深度相机观测配置。默认不再把完整 depth_ku 作为主模态输入策略，
 # 而是计算低维 camera-LiDAR disagreement risk 作为 LiDAR 的补盲信号。
@@ -77,17 +79,24 @@ depth_preview_window_pos_x: 30
 depth_preview_window_pos_y: 30
 depth_preview_update_interval: 1
 
-# Camera-projected LiDAR disagreement risk: 3 个相机前方 FoV 扇区 (left/center/right) × 4 个特征，
-# 再额外拼接 stale ratio，作为轻量补盲观测。
+# Camera-projected LiDAR disagreement risk:
+# 每个相机前方 FoV 扇区输出 9 个特征：
+# coverage, camera_lidar_diff, camera_closer_ratio, blind_ratio,
+# p10_depth_proximity, mean_depth_proximity, ttc_risk, depth_closing, risk_increasing。
+# 最后再额外拼接 stale ratio，作为轻量补盲观测。
 # camera_risk_num_bins: 9  # front-left / front-center / front-right
-camera_risk_num_rows: 3
-camera_risk_num_cols: 3
-camera_risk_features_per_bin: 4
+camera_risk_num_rows: 5
+camera_risk_num_cols: 5
+camera_risk_features_per_bin: 9
 camera_risk_add_stale_ratio: true
 camera_danger_dist: 0.5
-camera_risk_percentile: 0.05
+camera_risk_percentile: 0.10
 camera_risk_min_valid_depth: 0.1
 camera_risk_min_valid_ratio: 0.01
+camera_risk_temporal_alpha: 0.35
+camera_risk_depth_trend_scale: 2.0
+camera_risk_ttc_horizon: 2.0
+camera_risk_ttc_min_depth: 0.2
 lidar_free_start_dist: 3.0
 lidar_free_end_dist: 5.0
 min_lidar_points_per_sector: 3

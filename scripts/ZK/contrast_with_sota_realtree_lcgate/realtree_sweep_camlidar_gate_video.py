@@ -28,6 +28,17 @@ DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tr
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
 DEFAULT_VLIM_CHECKPOINT = "goodpt/6-4-vlim-lcgate-tree_best_return_2532.35.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
+CAMERA_RISK_FEATURE_NAMES = [
+    "coverage",
+    "diff",
+    "closer",
+    "blind",
+    "p10_close",
+    "mean_close",
+    "ttc",
+    "depth_trend",
+    "risk_trend",
+]
 
 
 def _parse_camera_risk_layout(raw_value):
@@ -1219,6 +1230,7 @@ WEB_HTML = r"""<!doctype html>
     .riskgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 8px 0 10px; }
     .riskcell { border: 1px solid #2b3540; border-radius: 4px; padding: 5px; background: #111820; font-size: 10px; line-height: 1.25; }
     .riskcell b { color: #e8edf2; font-size: 11px; }
+    .riskcell span { color: #9fb1c2; display: inline-block; min-width: 64px; }
     .diag-note { color: #95a3b3; font-size: 11px; margin-top: 6px; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
     th, td { border-bottom: 1px solid #26313c; padding: 5px 3px; text-align: right; }
@@ -1309,9 +1321,13 @@ function renderSensorDebug(sensor){
   drawHeat("kuGate", ku.gate_u8, ku.width, ku.height, "gate");
   const cr = sensor.camera_risk || {};
   const sectors = cr.sectors || [];
+  const featureNames = cr.feature_names || [];
   riskgrid.style.gridTemplateColumns = `repeat(${Math.max(1, Number(cr.cols) || 3)}, 1fr)`;
   riskgrid.innerHTML = sectors.map(s=>{
-    const fs = (s.features || []).map(v=>Number(v).toFixed(2)).join(" ");
+    const fs = (s.features || []).map((v,i)=>{
+      const name = featureNames[i] || `f${i+1}`;
+      return `<span>${name}</span> ${Number(v).toFixed(2)}`;
+    }).join("<br>");
     const gate = s.gate == null ? "-" : Number(s.gate).toFixed(2);
     return `<div class="riskcell"><b>r${s.row} c${s.col}</b><br>gate ${gate}<br>${fs}</div>`;
   }).join("");
@@ -2066,11 +2082,16 @@ def _capture_sensor_debug(base_env, actor_backbone=None, env_idx=0, num_envs=Non
         camera_risk_values = []
         sectors = []
         stale_ratio = None
+        feature_names = []
         if camera_risk is not None:
             camera_risk_values = _round_list(camera_risk.detach().cpu().reshape(-1).tolist(), 4)
             rows = int(getattr(actor_backbone, "num_rows", int(base_env.cfg.task.get("camera_risk_num_rows", 1))))
             cols = int(getattr(actor_backbone, "num_cols", int(base_env.cfg.task.get("camera_risk_num_cols", 3))))
             features_per_sector = int(getattr(actor_backbone, "features_per_sector", int(base_env.cfg.task.get("camera_risk_features_per_bin", 4))))
+            feature_names = [
+                CAMERA_RISK_FEATURE_NAMES[i] if i < len(CAMERA_RISK_FEATURE_NAMES) else f"f{i + 1}"
+                for i in range(max(0, features_per_sector))
+            ]
             total_sectors = rows * cols
             flat = camera_risk.detach().cpu().reshape(-1)
             for si in range(total_sectors):
@@ -2090,12 +2111,17 @@ def _capture_sensor_debug(base_env, actor_backbone=None, env_idx=0, num_envs=Non
             rows = int(getattr(actor_backbone, "num_rows", 1))
             cols = int(getattr(actor_backbone, "num_cols", 3))
             features_per_sector = int(getattr(actor_backbone, "features_per_sector", 4))
+            feature_names = [
+                CAMERA_RISK_FEATURE_NAMES[i] if i < len(CAMERA_RISK_FEATURE_NAMES) else f"f{i + 1}"
+                for i in range(max(0, features_per_sector))
+            ]
 
         return {
             "camera_risk": {
                 "rows": int(rows),
                 "cols": int(cols),
                 "features_per_sector": int(features_per_sector),
+                "feature_names": feature_names,
                 "values": camera_risk_values,
                 "sectors": sectors,
                 "stale_ratio": stale_ratio,
@@ -2218,7 +2244,7 @@ def _write_replay_html(path, replay_json_name):
     .right{{position:fixed;right:16px;bottom:16px;width:min(330px,calc(100vw - 32px));background:rgba(17,22,24,.9);border:1px solid rgba(255,255,255,.16);border-radius:8px;padding:12px;font-size:12px;line-height:1.55}}
     .diag{{position:fixed;right:16px;top:16px;width:min(520px,calc(100vw - 32px));max-height:min(52vh,520px);overflow:auto;background:rgba(17,22,24,.92);border:1px solid rgba(255,255,255,.16);border-radius:8px;padding:12px;font-size:12px;backdrop-filter:blur(10px)}}
     .diag h2{{font-size:13px;margin:0 0 8px;color:#eef3f4}} .diag-note{{color:#a9b4b7;margin-top:7px;line-height:1.35}}
-    .riskgrid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:10px}} .riskcell{{border:1px solid rgba(255,255,255,.14);border-radius:6px;background:rgba(255,255,255,.05);padding:6px;line-height:1.25;font-size:10px}} .riskcell b{{font-size:11px;color:#eef3f4}}
+    .riskgrid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:10px}} .riskcell{{border:1px solid rgba(255,255,255,.14);border-radius:6px;background:rgba(255,255,255,.05);padding:6px;line-height:1.25;font-size:10px}} .riskcell b{{font-size:11px;color:#eef3f4}} .riskcell span{{color:#9fb1c2;display:inline-block;min-width:64px}}
     .heat{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}} .heat label{{display:block;color:#a9b4b7;font-size:11px;margin-bottom:4px}} .heat canvas{{position:static;width:100%;height:92px;image-rendering:pixelated;border:1px solid rgba(255,255,255,.14);border-radius:6px;background:#091017}}
     code{{color:#d9e3e5}} @media(max-width:900px){{.right{{display:none}}.diag{{left:16px;right:16px;width:auto;max-height:42vh}}.grid{{grid-template-columns:repeat(2,1fr)}}.heat{{grid-template-columns:1fr}}}}
   </style>
@@ -2265,7 +2291,7 @@ let replay, frames=[], idx=0, playing=true, view='follow', last=performance.now(
 function by(id){{return document.getElementById(id)}}
 function heatColor(v,mode){{const t=Math.max(0,Math.min(1,v/255)); if(mode==='gate'){{const c=Math.round(30+225*t); return [Math.round(40+80*t),c,Math.round(110+110*t)]}} const r=Math.round(255*Math.max(0,1.4-2.2*t)); const g=Math.round(255*Math.max(0,1.3-Math.abs(t-.35)*2.2)); const b=Math.round(255*Math.min(1,.25+1.2*t)); return [r,g,b]}}
 function drawHeat(id,values,w,h,mode){{const c=by(id); const x=c.getContext('2d'); w=Number(w)||80; h=Number(h)||40; if(c.width!==w)c.width=w; if(c.height!==h)c.height=h; const img=x.createImageData(w,h); const arr=Array.isArray(values)?values:[]; for(let i=0;i<w*h;i++){{const rgb=heatColor(Number(arr[i]||0),mode); img.data[i*4]=rgb[0]; img.data[i*4+1]=rgb[1]; img.data[i*4+2]=rgb[2]; img.data[i*4+3]=255}} x.putImageData(img,0,0)}}
-function renderSensorDebug(sensor){{if(!sensor||!sensor.lidar_ku){{ui.riskgrid.innerHTML=''; ui.diagNote.textContent='waiting for sensor data'; return}} const ku=sensor.lidar_ku; drawHeat('kuRaw',ku.original_u8,ku.width,ku.height,'ku'); drawHeat('kuFused',ku.fused_u8,ku.width,ku.height,'ku'); drawHeat('kuGate',ku.gate_u8,ku.width,ku.height,'gate'); const cr=sensor.camera_risk||{{}}; const sectors=cr.sectors||[]; ui.riskgrid.style.gridTemplateColumns=`repeat(${{Math.max(1,Number(cr.cols)||3)}},1fr)`; ui.riskgrid.innerHTML=sectors.map(s=>{{const fs=(s.features||[]).map(v=>Number(v).toFixed(2)).join(' '); const gate=s.gate==null?'-':Number(s.gate).toFixed(2); return `<div class="riskcell"><b>r${{s.row}} c${{s.col}}</b><br>gate ${{gate}}<br>${{fs}}</div>`}}).join(''); const stale=cr.stale_ratio==null?'-':Number(cr.stale_ratio).toFixed(3); ui.diagNote.textContent=`KU range ${{ku.original_min}}..${{ku.original_max}} → ${{ku.fused_min}}..${{ku.fused_max}}, stale ${{stale}}`}}
+function renderSensorDebug(sensor){{if(!sensor||!sensor.lidar_ku){{ui.riskgrid.innerHTML=''; ui.diagNote.textContent='waiting for sensor data'; return}} const ku=sensor.lidar_ku; drawHeat('kuRaw',ku.original_u8,ku.width,ku.height,'ku'); drawHeat('kuFused',ku.fused_u8,ku.width,ku.height,'ku'); drawHeat('kuGate',ku.gate_u8,ku.width,ku.height,'gate'); const cr=sensor.camera_risk||{{}}; const sectors=cr.sectors||[]; const featureNames=cr.feature_names||[]; ui.riskgrid.style.gridTemplateColumns=`repeat(${{Math.max(1,Number(cr.cols)||3)}},1fr)`; ui.riskgrid.innerHTML=sectors.map(s=>{{const fs=(s.features||[]).map((v,i)=>{{const name=featureNames[i]||`f${{i+1}}`; return `<span>${{name}}</span> ${{Number(v).toFixed(2)}}`}}).join('<br>'); const gate=s.gate==null?'-':Number(s.gate).toFixed(2); return `<div class="riskcell"><b>r${{s.row}} c${{s.col}}</b><br>gate ${{gate}}<br>${{fs}}</div>`}}).join(''); const stale=cr.stale_ratio==null?'-':Number(cr.stale_ratio).toFixed(3); ui.diagNote.textContent=`KU range ${{ku.original_min}}..${{ku.original_max}} → ${{ku.fused_min}}..${{ku.fused_max}}, stale ${{stale}}`}}
 function makeTreeGeometry(mesh){{const pos=[]; for(const v of mesh.vertices) pos.push(v[0],v[1],v[2]); const ind=[]; for(const f of mesh.faces) ind.push(f[0],f[1],f[2]); const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3)); g.setIndex(ind); g.computeVertexNormals(); return g}}
 function buildTrees(){{const mat=new THREE.MeshStandardMaterial({{color:0x2f8f57,roughness:.82,side:THREE.DoubleSide}}); const geo=makeTreeGeometry(replay.tree_mesh); const inst=new THREE.InstancedMesh(geo,mat,replay.tree_instances.length); inst.castShadow=true; inst.receiveShadow=true; const o=new THREE.Object3D(); replay.tree_instances.forEach((t,i)=>{{o.position.set(t.position[0],t.position[1],t.position[2]); o.rotation.set(t.roll,t.pitch,t.yaw,'XYZ'); o.scale.setScalar(t.scale); o.updateMatrix(); inst.setMatrixAt(i,o.matrix)}}); scene.add(inst); ui.trees.textContent=String(replay.tree_instances.length)}}
 function buildDrone(){{const g=new THREE.Group(); const bodyMat=new THREE.MeshStandardMaterial({{color:0xf4b84a,metalness:.25,roughness:.5}}); const body=new THREE.Mesh(new THREE.BoxGeometry(.30,.18,.10),bodyMat); const nose=new THREE.Mesh(new THREE.ConeGeometry(.055,.12,16),bodyMat); nose.rotation.z=-Math.PI/2; nose.position.x=.20; const armMat=new THREE.MeshStandardMaterial({{color:0xd9e3e5,roughness:.55}}); const rotorMat=new THREE.MeshStandardMaterial({{color:0x171b1d,metalness:.35,roughness:.5}}); g.add(body,nose); const armGeo=new THREE.CylinderGeometry(.016,.016,.34,12); const armA=new THREE.Mesh(armGeo,armMat); armA.rotation.z=-Math.PI/4; const armB=new THREE.Mesh(armGeo,armMat); armB.rotation.z=Math.PI/4; g.add(armA,armB); const a=.17/Math.SQRT2; const rotorPositions=[[a,a,.02],[-a,a,.02],[-a,-a,.02],[a,-a,.02]]; g.rotors=[]; for(const p of rotorPositions){{const r=new THREE.Group(); r.position.set(...p); r.add(new THREE.Mesh(new THREE.TorusGeometry(.072,.007,8,32),rotorMat)); const b1=new THREE.Mesh(new THREE.BoxGeometry(.19,.018,.006),rotorMat); const b2=b1.clone(); b2.rotation.z=Math.PI/2; r.add(b1,b2); g.rotors.push(r); g.add(r)}} g.scale.setScalar(2.4); scene.add(g); return g}}
