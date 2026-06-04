@@ -26,7 +26,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/5-29-vlim-lcgate-tree_best_return_3785.25.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/6-4-vlim-lcgate-tree_best_return_2532.35.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
 
 
@@ -226,6 +226,36 @@ class CanLiDARGateBackbone(torch.nn.Module):
         out = self.fusion_mlp(fused)
         return out.reshape(*batch_shape, -1)
 
+    @torch.no_grad()
+    def camera_gate_debug(self, camera_risk):
+        """Return the spatial gate map and per-sector gate values used on LiDAR-KU."""
+        if camera_risk is None:
+            return None, []
+        device = next(self.parameters()).device
+        camera_risk_2d = torch.as_tensor(camera_risk, dtype=torch.float32, device=device).reshape(1, -1)
+        if camera_risk_2d.shape[-1] < self.camera_risk_dim:
+            pad = torch.zeros(1, self.camera_risk_dim - camera_risk_2d.shape[-1], device=device)
+            camera_risk_2d = torch.cat([camera_risk_2d, pad], dim=-1)
+        camera_risk_2d = camera_risk_2d[..., :self.camera_risk_dim]
+        camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+        total_sectors = self.num_rows * self.num_cols
+        sector_feat_dim = total_sectors * self.features_per_sector
+        sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(
+            1, total_sectors, self.features_per_sector
+        )
+
+        spatial_gate = torch.ones(1, 1, self.ku_h, self.ku_w, device=device, dtype=torch.float32)
+        spatial_gate_flat = spatial_gate.reshape(1, 1, self.ku_h * self.ku_w)
+        gate_values = []
+        for i in range(total_sectors):
+            gate_i = self.gate_heads[i](sector_features[:, i, :]).reshape(1)
+            gate_values.append(float(gate_i.detach().cpu().item()))
+            sector_mask = self._sector_masks[i].reshape(-1).to(device=device, dtype=torch.bool)
+            if bool(sector_mask.any()):
+                spatial_gate_flat[:, :, sector_mask] = gate_i.view(1, 1, 1)
+        return spatial_gate_flat.reshape(self.ku_h, self.ku_w).detach(), gate_values
+
 
 def _camera_h_fov_rad_from_cfg(cfg):
     focal = float(cfg.task.get("depth_camera_focal_length", 12.0))
@@ -285,7 +315,7 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
     lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
     lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
     cam_pos_cfg = np.asarray(cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]), dtype=np.float64)
-    cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]), dtype=np.float64)
+    cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.95]), dtype=np.float64)
     cam_axis = cam_target_cfg - cam_pos_cfg
     cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
     if float(np.linalg.norm(cam_axis)) <= 1e-9:
@@ -430,6 +460,12 @@ def _json_safe(value):
 def write_json(path, payload):
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def write_compact_json(path, payload):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(_json_safe(payload), separators=(",", ":")), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -1175,6 +1211,15 @@ WEB_HTML = r"""<!doctype html>
     .label { color: #95a3b3; }
     .value { font-weight: 650; text-align: right; }
     .ok { color: #65d889; } .bad { color: #ff7878; } .run { color: #7cb7ff; }
+    .diag { margin-top: 14px; border-top: 1px solid #26313c; padding-top: 12px; }
+    .diag h2 { font-size: 14px; margin: 0 0 8px; color: #dbe7ef; }
+    .heat { display: grid; grid-template-columns: 1fr; gap: 7px; }
+    .heat canvas { width: 100%; height: 82px; image-rendering: pixelated; border: 1px solid #2b3540; border-radius: 4px; background: #091017; }
+    .heat label { display: block; color: #95a3b3; font-size: 11px; margin: 0 0 3px; }
+    .riskgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 8px 0 10px; }
+    .riskcell { border: 1px solid #2b3540; border-radius: 4px; padding: 5px; background: #111820; font-size: 10px; line-height: 1.25; }
+    .riskcell b { color: #e8edf2; font-size: 11px; }
+    .diag-note { color: #95a3b3; font-size: 11px; margin-top: 6px; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
     th, td { border-bottom: 1px solid #26313c; padding: 5px 3px; text-align: right; }
     th:first-child, td:first-child { text-align: left; }
@@ -1186,6 +1231,16 @@ WEB_HTML = r"""<!doctype html>
   <aside>
     <h1>OmniDrones Real-Tree Sweep</h1>
     <div id="metrics"></div>
+    <div class="diag">
+      <h2>CameraRisk / LiDAR-KU</h2>
+      <div id="riskgrid" class="riskgrid"></div>
+      <div class="heat">
+        <div><label>LiDAR-KU original</label><canvas id="kuRaw" width="80" height="40"></canvas></div>
+        <div><label>LiDAR-KU after camera gate</label><canvas id="kuFused" width="80" height="40"></canvas></div>
+        <div><label>Spatial gate</label><canvas id="kuGate" width="80" height="40"></canvas></div>
+      </div>
+      <div id="diagNote" class="diag-note">waiting for sensor data</div>
+    </div>
     <table><thead><tr><th>spacing</th><th>target</th><th>trees</th><th>success</th><th>actual</th></tr></thead><tbody id="summary"></tbody></table>
   </aside>
 </div>
@@ -1194,6 +1249,8 @@ const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d");
 const metrics = document.getElementById("metrics");
 const summaryEl = document.getElementById("summary");
+const riskgrid = document.getElementById("riskgrid");
+const diagNote = document.getElementById("diagNote");
 function resize(){ canvas.width = canvas.clientWidth * devicePixelRatio; canvas.height = canvas.clientHeight * devicePixelRatio; }
 addEventListener("resize", resize); resize();
 function worldToCanvas(p){
@@ -1214,6 +1271,52 @@ function line(points, color, width){
   ctx.strokeStyle=color; ctx.lineWidth=width*devicePixelRatio; ctx.beginPath();
   points.forEach((p,i)=>{ const q=worldToCanvas(p); if(i===0) ctx.moveTo(q[0],q[1]); else ctx.lineTo(q[0],q[1]); });
   ctx.stroke();
+}
+function heatColor(v, mode){
+  const t = Math.max(0, Math.min(1, v / 255));
+  if(mode === "gate"){
+    const c = Math.round(30 + 225 * t);
+    return [Math.round(40 + 80*t), c, Math.round(110 + 110*t)];
+  }
+  const r = Math.round(255 * Math.max(0, 1.4 - 2.2*t));
+  const g = Math.round(255 * Math.max(0, 1.3 - Math.abs(t - 0.35) * 2.2));
+  const b = Math.round(255 * Math.min(1, 0.25 + 1.2*t));
+  return [r, g, b];
+}
+function drawHeat(id, values, w, h, mode){
+  const c = document.getElementById(id);
+  const x = c.getContext("2d");
+  w = Number(w) || 80; h = Number(h) || 40;
+  if(c.width !== w) c.width = w;
+  if(c.height !== h) c.height = h;
+  const img = x.createImageData(w, h);
+  const arr = Array.isArray(values) ? values : [];
+  for(let i=0; i<w*h; i++){
+    const rgb = heatColor(Number(arr[i] || 0), mode);
+    img.data[i*4] = rgb[0]; img.data[i*4+1] = rgb[1]; img.data[i*4+2] = rgb[2]; img.data[i*4+3] = 255;
+  }
+  x.putImageData(img, 0, 0);
+}
+function renderSensorDebug(sensor){
+  if(!sensor || !sensor.lidar_ku){
+    riskgrid.innerHTML = "";
+    diagNote.textContent = "waiting for sensor data";
+    return;
+  }
+  const ku = sensor.lidar_ku;
+  drawHeat("kuRaw", ku.original_u8, ku.width, ku.height, "ku");
+  drawHeat("kuFused", ku.fused_u8, ku.width, ku.height, "ku");
+  drawHeat("kuGate", ku.gate_u8, ku.width, ku.height, "gate");
+  const cr = sensor.camera_risk || {};
+  const sectors = cr.sectors || [];
+  riskgrid.style.gridTemplateColumns = `repeat(${Math.max(1, Number(cr.cols) || 3)}, 1fr)`;
+  riskgrid.innerHTML = sectors.map(s=>{
+    const fs = (s.features || []).map(v=>Number(v).toFixed(2)).join(" ");
+    const gate = s.gate == null ? "-" : Number(s.gate).toFixed(2);
+    return `<div class="riskcell"><b>r${s.row} c${s.col}</b><br>gate ${gate}<br>${fs}</div>`;
+  }).join("");
+  const stale = cr.stale_ratio == null ? "-" : Number(cr.stale_ratio).toFixed(3);
+  diagNote.textContent = `KU range ${ku.original_min}..${ku.original_max} → ${ku.fused_min}..${ku.fused_max}, stale ${stale}`;
 }
 function render(state){
   drawGrid();
@@ -1249,6 +1352,7 @@ function render(state){
     ["result", state.result || "-"]
   ];
   metrics.innerHTML = rows.map(r=>`<div class="metric"><span class="label">${r[0]}</span><span class="value">${r[1]}</span></div>`).join("");
+  renderSensorDebug(state.sensor_debug);
   const summary = state.summary || [];
   summaryEl.innerHTML = summary.map(s=>{
     const speed = Number.isFinite(s.mean_speed_mps) ? s.mean_speed_mps.toFixed(2) : "-";
@@ -1732,15 +1836,15 @@ def _set_recorded_drone_render_visibility(base_env, env_idx=0, visible=True):
 
 def _body_forward_axis_from_cfg(base_env):
     try:
-        raw = base_env.cfg.task.get("body_forward_axis", [0.0, -1.0, 0.0])
+        raw = base_env.cfg.task.get("body_forward_axis", [1.0, 0.0, 0.0])
     except Exception:
-        raw = [0.0, -1.0, 0.0]
+        raw = [1.0, 0.0, 0.0]
     vals = [float(v) for v in raw]
     if len(vals) != 3:
-        vals = [0.0, -1.0, 0.0]
+        vals = [1.0, 0.0, 0.0]
     norm = math.sqrt(sum(v * v for v in vals))
     if norm <= 1e-9:
-        vals = [0.0, -1.0, 0.0]
+        vals = [1.0, 0.0, 0.0]
         norm = 1.0
     return [v / norm for v in vals]
 
@@ -1914,7 +2018,106 @@ def _as_env_matrix(value, num_envs, width):
         return None
 
 
-def _capture_replay_pose(base_env, env_idx, num_envs, step, sim_time_s):
+def _quantize_u8(values, value_max):
+    tensor = torch.as_tensor(values, dtype=torch.float32)
+    value_max = max(float(value_max), 1e-6)
+    tensor = torch.nan_to_num(tensor, nan=value_max, posinf=value_max, neginf=0.0)
+    tensor = tensor.clamp(0.0, value_max)
+    return torch.round(tensor / value_max * 255.0).to(torch.uint8).detach().cpu().reshape(-1).tolist()
+
+
+def _round_list(values, digits=4):
+    return [round(float(v), int(digits)) for v in values]
+
+
+@torch.no_grad()
+def _capture_sensor_debug(base_env, actor_backbone=None, env_idx=0, num_envs=None):
+    """Capture camera-risk values plus original/gated LiDAR-KU for web diagnostics."""
+    try:
+        if num_envs is None:
+            num_envs = int(getattr(base_env, "num_envs", 1))
+        env_idx = max(0, min(int(env_idx), int(num_envs) - 1))
+
+        lidar_cache = getattr(base_env, "encoded_lidar_cache", None)
+        if lidar_cache is None:
+            return None
+        lidar = lidar_cache.detach().float().reshape(int(num_envs), -1)[env_idx]
+        ku_h = int(getattr(actor_backbone, "ku_h", getattr(base_env, "num_pitch_bins", 40)))
+        ku_w = int(getattr(actor_backbone, "ku_w", getattr(base_env, "num_yaw_bins", 80)))
+        ku_dim = ku_h * ku_w
+        if lidar.numel() < ku_dim:
+            return None
+        lidar = lidar[:ku_dim]
+        ku_value_max = float(getattr(actor_backbone, "ku_value_max", base_env.cfg.task.get("ku_value_max", 20.0)))
+
+        camera_risk_cache = getattr(base_env, "camera_risk_cache", None)
+        camera_risk = None
+        if camera_risk_cache is not None:
+            camera_risk = camera_risk_cache.detach().float().reshape(int(num_envs), -1)[env_idx]
+
+        gate = torch.ones(ku_h, ku_w, dtype=torch.float32, device=lidar.device)
+        sector_gates = []
+        if actor_backbone is not None and camera_risk is not None:
+            gate_debug, sector_gates = actor_backbone.camera_gate_debug(camera_risk)
+            if gate_debug is not None:
+                gate = gate_debug.to(device=lidar.device, dtype=torch.float32)
+        fused = (lidar.reshape(ku_h, ku_w) * gate).reshape(-1)
+
+        camera_risk_values = []
+        sectors = []
+        stale_ratio = None
+        if camera_risk is not None:
+            camera_risk_values = _round_list(camera_risk.detach().cpu().reshape(-1).tolist(), 4)
+            rows = int(getattr(actor_backbone, "num_rows", int(base_env.cfg.task.get("camera_risk_num_rows", 1))))
+            cols = int(getattr(actor_backbone, "num_cols", int(base_env.cfg.task.get("camera_risk_num_cols", 3))))
+            features_per_sector = int(getattr(actor_backbone, "features_per_sector", int(base_env.cfg.task.get("camera_risk_features_per_bin", 4))))
+            total_sectors = rows * cols
+            flat = camera_risk.detach().cpu().reshape(-1)
+            for si in range(total_sectors):
+                start = si * features_per_sector
+                stop = start + features_per_sector
+                features = _round_list(flat[start:stop].tolist(), 4) if stop <= flat.numel() else []
+                sectors.append({
+                    "index": int(si),
+                    "row": int(si // max(1, cols)),
+                    "col": int(si % max(1, cols)),
+                    "features": features,
+                    "gate": round(float(sector_gates[si]), 4) if si < len(sector_gates) else None,
+                })
+            if flat.numel() > total_sectors * features_per_sector:
+                stale_ratio = round(float(flat[total_sectors * features_per_sector].item()), 4)
+        else:
+            rows = int(getattr(actor_backbone, "num_rows", 1))
+            cols = int(getattr(actor_backbone, "num_cols", 3))
+            features_per_sector = int(getattr(actor_backbone, "features_per_sector", 4))
+
+        return {
+            "camera_risk": {
+                "rows": int(rows),
+                "cols": int(cols),
+                "features_per_sector": int(features_per_sector),
+                "values": camera_risk_values,
+                "sectors": sectors,
+                "stale_ratio": stale_ratio,
+            },
+            "lidar_ku": {
+                "width": int(ku_w),
+                "height": int(ku_h),
+                "value_max": float(ku_value_max),
+                "original_u8": _quantize_u8(lidar, ku_value_max),
+                "fused_u8": _quantize_u8(fused, ku_value_max),
+                "gate_u8": _quantize_u8(gate.reshape(-1), 1.0),
+                "original_min": round(float(torch.nan_to_num(lidar).min().item()), 4),
+                "original_max": round(float(torch.nan_to_num(lidar).max().item()), 4),
+                "fused_min": round(float(torch.nan_to_num(fused).min().item()), 4),
+                "fused_max": round(float(torch.nan_to_num(fused).max().item()), 4),
+            },
+        }
+    except Exception:
+        return None
+
+
+def _capture_replay_pose(base_env, env_idx, num_envs, step, sim_time_s, actor_backbone=None, include_sensors=True):
     pos = _as_env_matrix(getattr(base_env.drone, "pos", None), num_envs, 3)
     quat = _as_env_matrix(getattr(base_env.drone, "rot", None), num_envs, 4)
     if pos is None or quat is None:
@@ -1947,7 +2150,7 @@ def _capture_replay_pose(base_env, env_idx, num_envs, step, sim_time_s):
         vel_list = [round(float(v), 6) for v in vel[env_idx].detach().cpu().reshape(-1)[:3].tolist()]
         speed = math.sqrt(sum(float(v) * float(v) for v in vel_list))
 
-    return {
+    sample = {
         "step": int(step),
         "t": round(float(sim_time_s), 6),
         "pos": pos_list,
@@ -1956,6 +2159,11 @@ def _capture_replay_pose(base_env, env_idx, num_envs, step, sim_time_s):
         "vel": vel_list,
         "speed": round(float(speed), 6),
     }
+    if include_sensors:
+        sensor_debug = _capture_sensor_debug(base_env, actor_backbone, env_idx=env_idx, num_envs=num_envs)
+        if sensor_debug is not None:
+            sample["sensor_debug"] = sensor_debug
+    return sample
 
 
 def _write_video_file(path, frames, fps):
@@ -2007,8 +2215,12 @@ def _write_replay_html(path, replay_json_name):
     button,select{{height:32px;border-radius:6px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);color:#eef3f4;padding:0 10px;font:inherit;font-size:13px}}
     input{{width:100%;accent-color:#55d6d2}} .row{{display:flex;gap:8px;flex-wrap:wrap}}
     .note{{font-size:12px;color:#a9b4b7;line-height:1.45;border-top:1px solid rgba(255,255,255,.14);margin-top:10px;padding-top:10px}}
-    .right{{position:fixed;right:16px;top:16px;width:min(330px,calc(100vw - 32px));background:rgba(17,22,24,.9);border:1px solid rgba(255,255,255,.16);border-radius:8px;padding:12px;font-size:12px;line-height:1.55}}
-    code{{color:#d9e3e5}} @media(max-width:780px){{.right{{display:none}}.grid{{grid-template-columns:repeat(2,1fr)}}}}
+    .right{{position:fixed;right:16px;bottom:16px;width:min(330px,calc(100vw - 32px));background:rgba(17,22,24,.9);border:1px solid rgba(255,255,255,.16);border-radius:8px;padding:12px;font-size:12px;line-height:1.55}}
+    .diag{{position:fixed;right:16px;top:16px;width:min(520px,calc(100vw - 32px));max-height:min(52vh,520px);overflow:auto;background:rgba(17,22,24,.92);border:1px solid rgba(255,255,255,.16);border-radius:8px;padding:12px;font-size:12px;backdrop-filter:blur(10px)}}
+    .diag h2{{font-size:13px;margin:0 0 8px;color:#eef3f4}} .diag-note{{color:#a9b4b7;margin-top:7px;line-height:1.35}}
+    .riskgrid{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:10px}} .riskcell{{border:1px solid rgba(255,255,255,.14);border-radius:6px;background:rgba(255,255,255,.05);padding:6px;line-height:1.25;font-size:10px}} .riskcell b{{font-size:11px;color:#eef3f4}}
+    .heat{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}} .heat label{{display:block;color:#a9b4b7;font-size:11px;margin-bottom:4px}} .heat canvas{{position:static;width:100%;height:92px;image-rendering:pixelated;border:1px solid rgba(255,255,255,.14);border-radius:6px;background:#091017}}
+    code{{color:#d9e3e5}} @media(max-width:900px){{.right{{display:none}}.diag{{left:16px;right:16px;width:auto;max-height:42vh}}.grid{{grid-template-columns:repeat(2,1fr)}}.heat{{grid-template-columns:1fr}}}}
   </style>
   <script type="importmap">{{"imports":{{"three":"./static/three.module.js"}}}}</script>
 </head>
@@ -2027,6 +2239,16 @@ def _write_replay_html(path, replay_json_name):
   <div class="note" id="note"></div>
 </section>
 <aside class="right">Mouse: left rotate, wheel zoom, right pan.<br><br>Tree mesh is rendered from the same normalized OBJ geometry and per-tree RNG transforms used by the test script. Drone attitude uses recorded quaternion samples.</aside>
+<section class="diag">
+  <h2>CameraRisk / LiDAR-KU</h2>
+  <div id="riskgrid" class="riskgrid"></div>
+  <div class="heat">
+    <div><label>LiDAR-KU original</label><canvas id="kuRaw" width="80" height="40"></canvas></div>
+    <div><label>LiDAR-KU after camera gate</label><canvas id="kuFused" width="80" height="40"></canvas></div>
+    <div><label>Spatial gate</label><canvas id="kuGate" width="80" height="40"></canvas></div>
+  </div>
+  <div id="diagNote" class="diag-note">waiting for sensor data</div>
+</section>
 <script type="module">
 import * as THREE from 'three';
 import {{ OrbitControls }} from './static/OrbitControls.js';
@@ -2038,15 +2260,18 @@ const controls=new OrbitControls(camera,renderer.domElement); controls.enableDam
 scene.add(new THREE.HemisphereLight(0xd8eef8,0x25301e,1.7)); const sun=new THREE.DirectionalLight(0xffffff,2.1); sun.position.set(-25,-35,60); sun.castShadow=true; scene.add(sun);
 const ground=new THREE.Mesh(new THREE.PlaneGeometry(100,100),new THREE.MeshStandardMaterial({{color:0x1c241f,roughness:.95}})); ground.receiveShadow=true; scene.add(ground);
 const grid=new THREE.GridHelper(100,20,0x596966,0x303936); grid.rotation.x=Math.PI/2; grid.material.transparent=true; grid.material.opacity=.35; scene.add(grid);
-const ui={{status:by('status'),frame:by('frame'),speed:by('speed'),euler:by('euler'),trees:by('trees'),timeline:by('timeline'),play:by('play'),rate:by('rate'),note:by('note')}};
+const ui={{status:by('status'),frame:by('frame'),speed:by('speed'),euler:by('euler'),trees:by('trees'),timeline:by('timeline'),play:by('play'),rate:by('rate'),note:by('note'),riskgrid:by('riskgrid'),diagNote:by('diagNote')}};
 let replay, frames=[], idx=0, playing=true, view='follow', last=performance.now(), drone;
 function by(id){{return document.getElementById(id)}}
+function heatColor(v,mode){{const t=Math.max(0,Math.min(1,v/255)); if(mode==='gate'){{const c=Math.round(30+225*t); return [Math.round(40+80*t),c,Math.round(110+110*t)]}} const r=Math.round(255*Math.max(0,1.4-2.2*t)); const g=Math.round(255*Math.max(0,1.3-Math.abs(t-.35)*2.2)); const b=Math.round(255*Math.min(1,.25+1.2*t)); return [r,g,b]}}
+function drawHeat(id,values,w,h,mode){{const c=by(id); const x=c.getContext('2d'); w=Number(w)||80; h=Number(h)||40; if(c.width!==w)c.width=w; if(c.height!==h)c.height=h; const img=x.createImageData(w,h); const arr=Array.isArray(values)?values:[]; for(let i=0;i<w*h;i++){{const rgb=heatColor(Number(arr[i]||0),mode); img.data[i*4]=rgb[0]; img.data[i*4+1]=rgb[1]; img.data[i*4+2]=rgb[2]; img.data[i*4+3]=255}} x.putImageData(img,0,0)}}
+function renderSensorDebug(sensor){{if(!sensor||!sensor.lidar_ku){{ui.riskgrid.innerHTML=''; ui.diagNote.textContent='waiting for sensor data'; return}} const ku=sensor.lidar_ku; drawHeat('kuRaw',ku.original_u8,ku.width,ku.height,'ku'); drawHeat('kuFused',ku.fused_u8,ku.width,ku.height,'ku'); drawHeat('kuGate',ku.gate_u8,ku.width,ku.height,'gate'); const cr=sensor.camera_risk||{{}}; const sectors=cr.sectors||[]; ui.riskgrid.style.gridTemplateColumns=`repeat(${{Math.max(1,Number(cr.cols)||3)}},1fr)`; ui.riskgrid.innerHTML=sectors.map(s=>{{const fs=(s.features||[]).map(v=>Number(v).toFixed(2)).join(' '); const gate=s.gate==null?'-':Number(s.gate).toFixed(2); return `<div class="riskcell"><b>r${{s.row}} c${{s.col}}</b><br>gate ${{gate}}<br>${{fs}}</div>`}}).join(''); const stale=cr.stale_ratio==null?'-':Number(cr.stale_ratio).toFixed(3); ui.diagNote.textContent=`KU range ${{ku.original_min}}..${{ku.original_max}} → ${{ku.fused_min}}..${{ku.fused_max}}, stale ${{stale}}`}}
 function makeTreeGeometry(mesh){{const pos=[]; for(const v of mesh.vertices) pos.push(v[0],v[1],v[2]); const ind=[]; for(const f of mesh.faces) ind.push(f[0],f[1],f[2]); const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.Float32BufferAttribute(pos,3)); g.setIndex(ind); g.computeVertexNormals(); return g}}
 function buildTrees(){{const mat=new THREE.MeshStandardMaterial({{color:0x2f8f57,roughness:.82,side:THREE.DoubleSide}}); const geo=makeTreeGeometry(replay.tree_mesh); const inst=new THREE.InstancedMesh(geo,mat,replay.tree_instances.length); inst.castShadow=true; inst.receiveShadow=true; const o=new THREE.Object3D(); replay.tree_instances.forEach((t,i)=>{{o.position.set(t.position[0],t.position[1],t.position[2]); o.rotation.set(t.roll,t.pitch,t.yaw,'XYZ'); o.scale.setScalar(t.scale); o.updateMatrix(); inst.setMatrixAt(i,o.matrix)}}); scene.add(inst); ui.trees.textContent=String(replay.tree_instances.length)}}
-function buildDrone(){{const g=new THREE.Group(); const bodyMat=new THREE.MeshStandardMaterial({{color:0xf4b84a,metalness:.25,roughness:.5}}); const body=new THREE.Mesh(new THREE.BoxGeometry(.30,.18,.10),bodyMat); const nose=new THREE.Mesh(new THREE.ConeGeometry(.055,.12,16),bodyMat); nose.rotation.x=Math.PI; nose.position.y=-.20; const armMat=new THREE.MeshStandardMaterial({{color:0xd9e3e5,roughness:.55}}); const rotorMat=new THREE.MeshStandardMaterial({{color:0x171b1d,metalness:.35,roughness:.5}}); g.add(body,nose); const armGeo=new THREE.CylinderGeometry(.016,.016,.34,12); const armA=new THREE.Mesh(armGeo,armMat); armA.rotation.z=-Math.PI/4; const armB=new THREE.Mesh(armGeo,armMat); armB.rotation.z=Math.PI/4; g.add(armA,armB); const a=.17/Math.SQRT2; const rotorPositions=[[a,a,.02],[a,-a,.02],[-a,a,.02],[-a,-a,.02]]; g.rotors=[]; for(const p of rotorPositions){{const r=new THREE.Group(); r.position.set(...p); r.add(new THREE.Mesh(new THREE.TorusGeometry(.072,.007,8,32),rotorMat)); const b1=new THREE.Mesh(new THREE.BoxGeometry(.19,.018,.006),rotorMat); const b2=b1.clone(); b2.rotation.z=Math.PI/2; r.add(b1,b2); g.rotors.push(r); g.add(r)}} g.scale.setScalar(2.4); scene.add(g); return g}}
+function buildDrone(){{const g=new THREE.Group(); const bodyMat=new THREE.MeshStandardMaterial({{color:0xf4b84a,metalness:.25,roughness:.5}}); const body=new THREE.Mesh(new THREE.BoxGeometry(.30,.18,.10),bodyMat); const nose=new THREE.Mesh(new THREE.ConeGeometry(.055,.12,16),bodyMat); nose.rotation.z=-Math.PI/2; nose.position.x=.20; const armMat=new THREE.MeshStandardMaterial({{color:0xd9e3e5,roughness:.55}}); const rotorMat=new THREE.MeshStandardMaterial({{color:0x171b1d,metalness:.35,roughness:.5}}); g.add(body,nose); const armGeo=new THREE.CylinderGeometry(.016,.016,.34,12); const armA=new THREE.Mesh(armGeo,armMat); armA.rotation.z=-Math.PI/4; const armB=new THREE.Mesh(armGeo,armMat); armB.rotation.z=Math.PI/4; g.add(armA,armB); const a=.17/Math.SQRT2; const rotorPositions=[[a,a,.02],[-a,a,.02],[-a,-a,.02],[a,-a,.02]]; g.rotors=[]; for(const p of rotorPositions){{const r=new THREE.Group(); r.position.set(...p); r.add(new THREE.Mesh(new THREE.TorusGeometry(.072,.007,8,32),rotorMat)); const b1=new THREE.Mesh(new THREE.BoxGeometry(.19,.018,.006),rotorMat); const b2=b1.clone(); b2.rotation.z=Math.PI/2; r.add(b1,b2); g.rotors.push(r); g.add(r)}} g.scale.setScalar(2.4); scene.add(g); return g}}
 function buildTrajectory(){{const pts=frames.map(f=>new THREE.Vector3(...f.pos)); const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({{color:0x55d6d2}})); scene.add(line); const cur=new THREE.Mesh(new THREE.SphereGeometry(.11,12,8),new THREE.MeshBasicMaterial({{color:0x55d6d2}})); scene.add(cur); replay.cursor=cur}}
 function target(){{const p=replay.target||[0,0,2]; const m=new THREE.Mesh(new THREE.SphereGeometry(.45,24,16),new THREE.MeshStandardMaterial({{color:0xff6b5a,emissive:0x260805}})); m.position.set(p[0],p[1],p[2]); scene.add(m)}}
-function applyFrame(i){{idx=Math.max(0,Math.min(frames.length-1,Math.round(i))); const f=frames[idx]; drone.position.set(...f.pos); const q=f.quat_wxyz||[1,0,0,0]; drone.quaternion.set(q[1],q[2],q[3],q[0]).normalize(); for(const [ri,r] of drone.rotors.entries()) r.rotation.z += (ri%2?1:-1)*.7; replay.cursor.position.set(...f.pos); ui.timeline.value=idx; ui.frame.textContent=`${{idx+1}}/${{frames.length}}`; ui.speed.textContent=`${{(f.speed||0).toFixed(2)}} m/s`; ui.euler.textContent=(f.euler_deg||[0,0,0]).map(v=>v.toFixed(1)).join(' '); if(view==='follow'){{const p=new THREE.Vector3(...f.pos); const axis=replay.body_forward_axis||[0,-1,0]; const fw=new THREE.Vector3(axis[0],axis[1],axis[2]).applyQuaternion(drone.quaternion).normalize(); const up=new THREE.Vector3(0,0,1).applyQuaternion(drone.quaternion).normalize(); const desired=p.clone().add(fw.clone().multiplyScalar(-6)).add(up.clone().multiplyScalar(2.0)); const target=p.clone().add(fw.clone().multiplyScalar(1.2)).add(up.clone().multiplyScalar(.15)); camera.up.lerp(up,.22).normalize(); camera.position.lerp(desired,.18); controls.target.lerp(target,.25)}}}}
+function applyFrame(i){{idx=Math.max(0,Math.min(frames.length-1,Math.round(i))); const f=frames[idx]; drone.position.set(...f.pos); const q=f.quat_wxyz||[1,0,0,0]; drone.quaternion.set(q[1],q[2],q[3],q[0]).normalize(); for(const [ri,r] of drone.rotors.entries()) r.rotation.z += (ri%2?1:-1)*.7; replay.cursor.position.set(...f.pos); ui.timeline.value=idx; ui.frame.textContent=`${{idx+1}}/${{frames.length}}`; ui.speed.textContent=`${{(f.speed||0).toFixed(2)}} m/s`; ui.euler.textContent=(f.euler_deg||[0,0,0]).map(v=>v.toFixed(1)).join(' '); renderSensorDebug(f.sensor_debug); if(view==='follow'){{const p=new THREE.Vector3(...f.pos); const axis=replay.body_forward_axis||[1,0,0]; const fw=new THREE.Vector3(axis[0],axis[1],axis[2]).applyQuaternion(drone.quaternion).normalize(); const up=new THREE.Vector3(0,0,1).applyQuaternion(drone.quaternion).normalize(); const desired=p.clone().add(fw.clone().multiplyScalar(-6)).add(up.clone().multiplyScalar(2.0)); const target=p.clone().add(fw.clone().multiplyScalar(1.2)).add(up.clone().multiplyScalar(.15)); camera.up.lerp(up,.22).normalize(); camera.position.lerp(desired,.18); controls.target.lerp(target,.25)}}}}
 function resize(){{renderer.setSize(innerWidth,innerHeight,false); camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix()}} window.addEventListener('resize',resize);
 ui.play.onclick=()=>{{playing=!playing; ui.play.textContent=playing?'Pause':'Play'; if(playing&&idx>=frames.length-1)applyFrame(0)}}; ui.timeline.oninput=()=>{{playing=false; ui.play.textContent='Play'; applyFrame(Number(ui.timeline.value))}};
 by('free').onclick=()=>view='free'; by('follow').onclick=()=>view='follow'; by('top').onclick=()=>{{view='free'; camera.up.set(0,0,1); const p=new THREE.Vector3(...frames[idx].pos); camera.position.set(p.x,p.y,p.z+70); controls.target.copy(p)}}; by('side').onclick=()=>{{view='free'; camera.up.set(0,0,1); const p=new THREE.Vector3(...frames[idx].pos); camera.position.set(p.x+34,p.y-52,p.z+18); controls.target.copy(p)}};
@@ -2059,13 +2284,35 @@ fetch('./{replay_json_name}',{{cache:'no-store'}}).then(r=>r.json()).then(data=>
     Path(path).write_text(html, encoding="utf-8")
 
 
+def _make_browser_replay_data(replay_data, max_frames=300):
+    """Keep browser replay JSON small enough to parse without freezing the page."""
+    frames = replay_data.get("frames", []) if isinstance(replay_data, dict) else []
+    if not isinstance(frames, list) or len(frames) <= int(max_frames):
+        return replay_data
+
+    stride = max(1, math.ceil(len(frames) / float(max_frames)))
+    keep = list(range(0, len(frames), stride))
+    if keep[-1] != len(frames) - 1:
+        keep.append(len(frames) - 1)
+
+    slim = dict(replay_data)
+    slim["frames"] = [frames[i] for i in keep]
+    slim["original_frame_count"] = len(frames)
+    slim["replay_frame_stride_from_original"] = stride
+    slim["browser_replay_note"] = (
+        f"Downsampled from {len(frames)} frames to {len(slim['frames'])} "
+        "frames so the replay page can load quickly."
+    )
+    return slim
+
+
 def _write_success_replay_pair(video_dir, stem, replay_data):
     video_dir = Path(video_dir)
     video_dir.mkdir(parents=True, exist_ok=True)
     _ensure_replay_static_assets(video_dir)
     json_path = video_dir / f"{stem}_replay.json"
     html_path = video_dir / f"{stem}_replay.html"
-    write_json(json_path, replay_data)
+    write_compact_json(json_path, _make_browser_replay_data(replay_data))
     _write_replay_html(html_path, json_path.name)
     return str(json_path), str(html_path)
 
@@ -2376,7 +2623,7 @@ def run_worker(args, hydra_overrides):
             env.reward_spec,
             device=base_env.device,
         )
-        _inject_canlidargate_backbone(policy, base_env, env, cfg)
+        actor_backbone, _critic_backbone = _inject_canlidargate_backbone(policy, base_env, env, cfg)
         checkpoint_path = _resolve_checkpoint_path(cfg.get("checkpoint_path"))
         _load_checkpoint_strictish(policy, checkpoint_path, base_env.device)
         policy.eval()
@@ -2512,6 +2759,8 @@ def run_worker(args, hydra_overrides):
                                     num_envs_eval,
                                     step_count,
                                     sim_time_s,
+                                    actor_backbone=actor_backbone,
+                                    include_sensors=True,
                                 )
                                 if pose_sample is not None:
                                     replay_frames_by_env.setdefault(capture_env_idx, []).append(pose_sample)
@@ -2611,6 +2860,8 @@ def run_worker(args, hydra_overrides):
                                             num_envs_eval,
                                             step_count,
                                             float(step_count) * float(getattr(base_env, "dt", 0.02)),
+                                            actor_backbone=actor_backbone,
+                                            include_sensors=True,
                                         )
                                         if pose_sample is not None:
                                             replay_frames_by_env.setdefault(success_env_idx, []).append(pose_sample)
@@ -2652,6 +2903,15 @@ def run_worker(args, hydra_overrides):
                                         },
                                         "tree_mesh": replay_tree_mesh,
                                         "tree_instances": replay_tree_instances,
+                                        "sensor_debug": {
+                                            "enabled": True,
+                                            "ku_width": int(getattr(actor_backbone, "ku_w", 80)),
+                                            "ku_height": int(getattr(actor_backbone, "ku_h", 40)),
+                                            "ku_value_max": float(getattr(actor_backbone, "ku_value_max", 20.0)),
+                                            "camera_risk_rows": int(getattr(actor_backbone, "num_rows", 1)),
+                                            "camera_risk_cols": int(getattr(actor_backbone, "num_cols", 3)),
+                                            "features_per_sector": int(getattr(actor_backbone, "features_per_sector", 4)),
+                                        },
                                         "frames": replay_frames_by_env.get(success_env_idx, []),
                                     }
                                     video_success_saved += 1
@@ -2736,6 +2996,12 @@ def run_worker(args, hydra_overrides):
                                         "trajectory": trajectory,
                                         "obstacles": preview_obstacles,
                                         "lidar_points": _sample_first_env_lidar_points(base_env),
+                                        "sensor_debug": _capture_sensor_debug(
+                                            base_env,
+                                            actor_backbone=actor_backbone,
+                                            env_idx=0,
+                                            num_envs=num_envs_eval,
+                                        ),
                                         "success_rate": latest_success_rate,
                                     },
                                 )

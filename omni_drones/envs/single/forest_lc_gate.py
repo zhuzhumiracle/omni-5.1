@@ -469,7 +469,7 @@ class forest_lc_gate(IsaacEnv):
 
         # ---------- camera extrinsics (position & rotation in body/LiDAR frame) ----------
         _cam_pos_cfg = cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18])
-        _cam_target_cfg = cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18])
+        _cam_target_cfg = cfg.task.get("depth_camera_target", [2.0, 0.0, 0.95])
         self._t_cam2body = torch.tensor(_cam_pos_cfg, dtype=torch.float32, device=self.device)
         _cam_target = torch.tensor(_cam_target_cfg, dtype=torch.float32, device=self.device)
         _forward = _cam_target - self._t_cam2body
@@ -906,7 +906,7 @@ class forest_lc_gate(IsaacEnv):
         self.depth_camera.spawn(
             [f"/World/envs/env_0/{self.drone.name}_0/base_link/{self.depth_prim_name}"],
             translations=[tuple(self.cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]))],
-            targets=[tuple(self.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]))],
+            targets=[tuple(self.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.95]))],
         )
 
         import isaaclab.sim as sim_utils

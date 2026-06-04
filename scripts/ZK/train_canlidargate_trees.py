@@ -574,8 +574,8 @@ def _read_depth_camera_geometry_from_stage(base_env):
         [0.0, 0.0, 1.0],
     ]
 
-    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.12, 0.0, 0.03])
-    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.03])
+    depth_cam_pos_cfg = base_env.cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18])
+    depth_cam_target_cfg = base_env.cfg.task.get("depth_camera_target", [2.0, 0.0, 0.95])
     expected_rot = _expected_row_camera_rotation_from_view(
         np.array(depth_cam_pos_cfg, dtype=np.float64),
         np.array(depth_cam_target_cfg, dtype=np.float64),
@@ -1303,7 +1303,7 @@ def main(cfg):
             lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
             lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
             cam_pos_cfg = np.asarray(cfg.task.get("depth_camera_pos", [0.22, 0.0, 0.18]), dtype=np.float64)
-            cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.18]), dtype=np.float64)
+            cam_target_cfg = np.asarray(cfg.task.get("depth_camera_target", [2.0, 0.0, 0.95]), dtype=np.float64)
             cam_axis = cam_target_cfg - cam_pos_cfg
             cam_xy_norm = float(np.hypot(cam_axis[0], cam_axis[1]))
             if float(np.linalg.norm(cam_axis)) <= 1e-9:

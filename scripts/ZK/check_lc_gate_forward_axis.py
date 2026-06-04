@@ -100,9 +100,9 @@ def main() -> int:
     cfg_path = DEFAULT_CFG
     cfg = _read_flat_yaml(cfg_path)
 
-    body_forward = _normalize(_vec(cfg, "body_forward_axis", [0.0, -1.0, 0.0]))
-    cam_pos = _vec(cfg, "depth_camera_pos", [0.0, -0.22, 0.18])
-    cam_target = _vec(cfg, "depth_camera_target", [0.0, -2.0, 0.95])
+    body_forward = _normalize(_vec(cfg, "body_forward_axis", [1.0, 0.0, 0.0]))
+    cam_pos = _vec(cfg, "depth_camera_pos", [0.22, 0.0, 0.18])
+    cam_target = _vec(cfg, "depth_camera_target", [2.0, 0.0, 0.95])
     cam_axis = _normalize([b - a for a, b in zip(cam_pos, cam_target)])
 
     body_forward_xy = _normalize([body_forward[0], body_forward[1], 0.0])
