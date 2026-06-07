@@ -25,7 +25,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/6-4-vlim-lcgate-tree_best_return_3790.72.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/6-6-vlim-lcgat-tree_best_return_4574.55.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
 
 
@@ -202,20 +202,21 @@ class CanLiDARGateBackbone(torch.nn.Module):
 
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
         total_sectors = self.num_rows * self.num_cols
         sector_feat_dim = total_sectors * self.features_per_sector
         sector_features = camera_risk_2d[:, :sector_feat_dim].reshape(b, total_sectors, self.features_per_sector)
 
         spatial_gate = torch.ones(b, 1, self.ku_h, self.ku_w, device=x_ku_raw.device, dtype=x_ku_raw.dtype)
-        spatial_gate_flat = spatial_gate.reshape(b, 1, self.ku_h * self.ku_w)
         for i in range(total_sectors):
             gate_i = self.gate_heads[i](sector_features[:, i, :])
-            sector_mask = self._sector_masks[i].reshape(-1).to(device=x_ku_raw.device, dtype=torch.bool)
+            sector_mask = self._sector_masks[i]
             if bool(sector_mask.any()):
-                spatial_gate_flat[:, :, sector_mask] = gate_i.view(b, 1, 1)
-        spatial_gate = spatial_gate_flat.reshape(b, 1, self.ku_h, self.ku_w)
+                spatial_gate[:, :, sector_mask] = gate_i.view(b, 1, 1)
 
-        lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
+        x_ku_gated = x_ku_raw * spatial_gate
+
+        lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
 
         state_2d = state.reshape(b, self.state_dim)
@@ -226,14 +227,255 @@ class CanLiDARGateBackbone(torch.nn.Module):
         return out.reshape(*batch_shape, -1)
 
 
-def _camera_h_fov_rad_from_cfg(cfg):
-    focal = float(cfg.task.get("depth_camera_focal_length", 12.0))
-    h_aperture = float(cfg.task.get("depth_camera_horizontal_aperture", 20.955))
-    if focal <= 0.0 or h_aperture <= 0.0:
-        raise ValueError(
-            f"Invalid depth camera intrinsics for FoV: focal={focal}, horizontal_aperture={h_aperture}"
+# ============================================================
+# Camera geometry helpers — aligned with train_canlidargate_trees.py
+# ============================================================
+def _normalize_np(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm <= eps:
+        raise ValueError(f"Cannot normalize near-zero vector: {vec}")
+    return vec / norm
+
+
+def _rotation_error_deg(candidate: np.ndarray, reference: np.ndarray) -> float:
+    relative_rot = candidate.T @ reference
+    trace_val = float(np.trace(relative_rot))
+    cos_angle = max(-1.0, min(1.0, 0.5 * (trace_val - 1.0)))
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _select_camera_rotation_convention(
+    rot_raw: np.ndarray,
+    expected_row_rot: np.ndarray,
+) -> tuple:
+    row_err_deg = _rotation_error_deg(rot_raw, expected_row_rot)
+    col_err_deg = _rotation_error_deg(rot_raw.T, expected_row_rot)
+    if col_err_deg + 1e-9 < row_err_deg:
+        return rot_raw.T.copy(), "column-vector-transposed", row_err_deg, col_err_deg
+    return rot_raw.copy(), "row-vector", row_err_deg, col_err_deg
+
+
+def _read_depth_camera_geometry_from_stage(base_env):
+    """Read depth camera intrinsics & extrinsics from USD stage.
+
+    Aligned with train_canlidargate_trees.py to ensure identical
+    camera_h_fov_rad and pitch range used for 2D sector masks.
+    """
+    import omni.usd  # type: ignore
+    from pxr import Gf, UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("USD stage is not available; cannot read depth camera geometry.")
+
+    depth_prim_path = f"/World/envs/env_0/{base_env.drone.name}_0/base_link/{base_env.depth_prim_name}"
+    base_prim_path = f"/World/envs/env_0/{base_env.drone.name}_0/base_link"
+    prim = stage.GetPrimAtPath(depth_prim_path)
+    base_prim = stage.GetPrimAtPath(base_prim_path)
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"Depth camera prim not found or invalid: {depth_prim_path}")
+    if not base_prim or not base_prim.IsValid():
+        raise RuntimeError(f"Base link prim not found or invalid: {base_prim_path}")
+
+    camera = UsdGeom.Camera(prim)
+    focal_length = camera.GetFocalLengthAttr().Get()
+    horizontal_aperture = camera.GetHorizontalApertureAttr().Get()
+    vertical_aperture = camera.GetVerticalApertureAttr().Get()
+    horizontal_aperture_offset = camera.GetHorizontalApertureOffsetAttr().Get() or 0.0
+    vertical_aperture_offset = camera.GetVerticalApertureOffsetAttr().Get() or 0.0
+    clipping_range = camera.GetClippingRangeAttr().Get()
+    if focal_length is None or horizontal_aperture is None:
+        raise RuntimeError(f"Depth camera {depth_prim_path} is missing focal/aperture attributes.")
+    if vertical_aperture is None:
+        vertical_aperture = float(horizontal_aperture) * float(base_env.depth_h) / float(max(1, base_env.depth_w))
+
+    def _extract_pose_from_matrix(matrix_gf):
+        translation = matrix_gf.ExtractTranslation()
+        quat = matrix_gf.ExtractRotationQuat()
+        rot = np.array(Gf.Matrix3d(quat), dtype=np.float64)
+        pos = np.array([translation[0], translation[1], translation[2]], dtype=np.float64)
+        return pos, rot
+
+    def _orthonormalize_rotation(rot: np.ndarray) -> np.ndarray:
+        u, _, vh = np.linalg.svd(rot)
+        rot_ortho = u @ vh
+        if np.linalg.det(rot_ortho) < 0.0:
+            u[:, -1] *= -1.0
+            rot_ortho = u @ vh
+        return rot_ortho
+
+    cam_in_base_gf = omni.usd.get_local_transform_matrix(prim)
+    if not isinstance(cam_in_base_gf, Gf.Matrix4d):
+        cam_in_base_gf = Gf.Matrix4d(cam_in_base_gf)
+    cam_pos_np, cam_rot_np = _extract_pose_from_matrix(cam_in_base_gf)
+    cam_rot_np = _orthonormalize_rotation(cam_rot_np)
+
+    # Try IsaacSim official relative transform as a sanity check.
+    try:
+        from isaacsim.core.includes.pose import getRelativeTransform  # type: ignore
+
+        official = getRelativeTransform(stage, None, prim.GetPath(), base_prim.GetPath())
+        if not isinstance(official, Gf.Matrix4d):
+            official = Gf.Matrix4d(official)
+        official_pos, official_rot = _extract_pose_from_matrix(official)
+        official_rot = _orthonormalize_rotation(official_rot)
+        pos_err = float(np.linalg.norm(official_pos - cam_pos_np))
+        rot_err = _rotation_error_deg(official_rot, cam_rot_np)
+        if pos_err <= 1e-5 and rot_err <= 1e-3:
+            cam_pos_np = official_pos
+            cam_rot_np = official_rot
+    except Exception:
+        pass
+
+    # Compute intrinsic matrix (row-vector convention).
+    fy = float(focal_length) * float(base_env.depth_h) / float(vertical_aperture)
+    fx = float(focal_length) * float(base_env.depth_w) / float(horizontal_aperture)
+    cx = float(base_env.depth_w) * (0.5 - float(horizontal_aperture_offset) / float(horizontal_aperture))
+    cy = float(base_env.depth_h) * (0.5 - float(vertical_aperture_offset) / float(vertical_aperture))
+    intrinsic_matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    near_clip = 0.1
+    far_clip = 100.0
+    if clipping_range is not None:
+        near_clip = float(clipping_range[0])
+        far_clip = float(clipping_range[1])
+
+    return {
+        "intrinsic_matrix": intrinsic_matrix,
+        "near_clip": near_clip,
+        "far_clip": far_clip,
+        "prim_path": str(depth_prim_path),
+    }
+
+
+def _checkpoint_state_dict(checkpoint_path, device="cpu"):
+    import torch
+
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except (TypeError, RuntimeError):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+    state_dict = ckpt
+    if isinstance(ckpt, dict):
+        for key in ("model_state_dict", "state_dict", "policy_state_dict", "policy"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                state_dict = ckpt[key]
+                break
+        if not all(isinstance(v, torch.Tensor) for v in state_dict.values()):
+            for _k, _v in ckpt.items():
+                if isinstance(_v, dict) and all(
+                    isinstance(vv, torch.Tensor) for vv in _v.values()
+                ):
+                    state_dict = _v
+                    break
+    return state_dict
+
+
+def _probe_checkpoint_gate_spec(checkpoint_path, device="cpu"):
+    """Probe LC-gate checkpoint metadata needed before environment creation."""
+    state_dict = _checkpoint_state_dict(checkpoint_path, device=device)
+
+    gate_by_stream = {}
+    feature_dims = []
+    state_dim = None
+    for k, v in state_dict.items():
+        if not hasattr(v, "shape"):
+            continue
+        if ".state_encoder.0.weight" in k and len(v.shape) == 2 and state_dim is None:
+            state_dim = int(v.shape[1])
+        match = re.search(r"^(?P<prefix>.*)\.gate_heads\.(?P<idx>\d+)\.0\.weight$", k)
+        if match is None or len(v.shape) != 2:
+            continue
+        stream = "actor" if str(k).startswith("actor.") else "critic" if str(k).startswith("critic.") else match.group("prefix")
+        gate_by_stream.setdefault(stream, set()).add(int(match.group("idx")))
+        feature_dims.append(int(v.shape[1]))
+
+    if not feature_dims or not gate_by_stream:
+        print("[probe] no gate_heads found in checkpoint — using config values")
+        return {"features_per_sector": None, "total_sectors": None, "state_dim": state_dim}
+
+    feature_dim = feature_dims[0]
+    if any(dim != feature_dim for dim in feature_dims):
+        unique = sorted(set(feature_dims))
+        raise RuntimeError(f"Checkpoint has inconsistent gate head input dims: {unique}")
+
+    preferred_stream = "actor" if "actor" in gate_by_stream else next(iter(gate_by_stream))
+    gate_indices = gate_by_stream[preferred_stream]
+    total_sectors = max(gate_indices) + 1
+    if len(gate_indices) != total_sectors:
+        print(
+            f"[probe] warning: non-contiguous gate head indices for {preferred_stream}: "
+            f"count={len(gate_indices)}, max_index={max(gate_indices)}"
         )
-    return 2.0 * math.atan(h_aperture / (2.0 * focal))
+        total_sectors = len(gate_indices)
+
+    print(
+        f"[probe] detected checkpoint gate spec: sectors={total_sectors}, "
+        f"features_per_sector={feature_dim}, state_dim={state_dim}"
+    )
+    return {
+        "features_per_sector": int(feature_dim),
+        "total_sectors": int(total_sectors),
+        "state_dim": state_dim,
+    }
+
+
+def _probe_checkpoint_features_per_sector(checkpoint_path, device="cpu"):
+    """Probe a checkpoint to determine features_per_sector from gate_heads weights.
+
+    Returns the detected features_per_sector, or None if the checkpoint
+    doesn't contain gate_heads (e.g. non-gate backbone).
+    """
+    spec = _probe_checkpoint_gate_spec(checkpoint_path, device=device)
+    return spec.get("features_per_sector")
+
+def _layout_from_total_sectors(total_sectors, current_rows, current_cols):
+    total_sectors = int(total_sectors)
+    current_rows = int(current_rows)
+    current_cols = int(current_cols)
+    if total_sectors <= 0:
+        return None
+    if current_rows > 0 and current_cols > 0 and current_rows * current_cols == total_sectors:
+        return current_rows, current_cols
+    side = int(round(math.sqrt(total_sectors)))
+    if side * side == total_sectors:
+        return side, side
+    if current_rows > 0 and total_sectors % current_rows == 0:
+        return current_rows, total_sectors // current_rows
+    if current_cols > 0 and total_sectors % current_cols == 0:
+        return total_sectors // current_cols, current_cols
+    return 1, total_sectors
+
+
+def _apply_checkpoint_gate_spec_to_cfg(cfg, checkpoint_path, device="cpu"):
+    spec = _probe_checkpoint_gate_spec(checkpoint_path, device=device)
+    fps = spec.get("features_per_sector")
+    if fps is not None:
+        config_fps = int(cfg.task.get("camera_risk_features_per_bin", -1))
+        if config_fps != int(fps):
+            print(
+                f"[realtree sweep] overriding camera_risk_features_per_bin before env creation: "
+                f"config={config_fps} -> checkpoint={int(fps)}"
+            )
+            cfg.task.camera_risk_features_per_bin = int(fps)
+
+    total_sectors = spec.get("total_sectors")
+    if total_sectors is not None:
+        current_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+        current_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+        layout = _layout_from_total_sectors(total_sectors, current_rows, current_cols)
+        if layout is not None:
+            rows, cols = layout
+            if rows != current_rows or cols != current_cols:
+                print(
+                    f"[realtree sweep] overriding camera risk layout before env creation: "
+                    f"config={current_rows}x{current_cols} -> checkpoint={rows}x{cols}"
+                )
+                cfg.task.camera_risk_num_rows = int(rows)
+                cfg.task.camera_risk_num_cols = int(cols)
+                cfg.task.camera_risk_num_bins = int(cols) if int(rows) == 1 else int(rows * cols)
+    return spec
 
 
 def _inject_canlidargate_backbone(policy, base_env, env, cfg):
@@ -271,15 +513,17 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
 
     expected_feature_dim = 128
     ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
-    camera_h_fov_rad = _camera_h_fov_rad_from_cfg(cfg)
-    # Compute effective pitch range for 2D masks
-    focal = float(cfg.task.get("depth_camera_focal_length", 12.0))
-    v_aperture = float(cfg.task.get("depth_camera_vertical_aperture", 0.0))
+
+    # ---- camera geometry: aligned with train_canlidargate_trees.py ----
+    # Read actual camera intrinsics from USD stage for correct FoV.
+    camera_geom = _read_depth_camera_geometry_from_stage(base_env)
+    fx = camera_geom["intrinsic_matrix"][0][0]
+    fy = camera_geom["intrinsic_matrix"][1][1]
     depth_h_cfg = int(cfg.task.get("depth_resolution", [96, 160])[0])
-    if v_aperture <= 0:
-        h_aperture = float(cfg.task.get("depth_camera_horizontal_aperture", 20.955))
-        v_aperture = h_aperture * depth_h_cfg / max(1, int(cfg.task.get("depth_resolution", [96, 160])[1]))
-    camera_v_fov_rad = 2.0 * math.atan(v_aperture / (2.0 * focal))
+    depth_w_cfg = int(cfg.task.get("depth_resolution", [96, 160])[1])
+    camera_h_fov_rad = 2.0 * math.atan(depth_w_cfg / (2.0 * fx))
+    camera_v_fov_rad = 2.0 * math.atan(depth_h_cfg / (2.0 * fy))
+
     _lidar_vfov = cfg.task.get("lidar_vfov", [-7., 52.])
     lidar_pitch_min = math.radians(float(_lidar_vfov[0]))
     lidar_pitch_max = math.radians(float(_lidar_vfov[1]))
@@ -1565,6 +1809,12 @@ def run_worker(args, hydra_overrides):
     cfg.enable_viewport = isaacsim_view
     cfg.sim.enable_viewport = isaacsim_view
     cfg.sim.enable_replicator = True
+    checkpoint_path = _resolve_checkpoint_path(cfg.get("checkpoint_path"))
+    _apply_checkpoint_gate_spec_to_cfg(cfg, checkpoint_path, device="cpu")
+    camera_risk_layout_label = (
+        f"{int(cfg.task.get('camera_risk_num_rows', 1))}x"
+        f"{int(cfg.task.get('camera_risk_num_cols', int(cfg.task.get('camera_risk_num_bins', 3))))}"
+    )
 
     live_state_path = Path(args.live_state)
     result_path = Path(args.worker_result)
@@ -1588,7 +1838,7 @@ def run_worker(args, hydra_overrides):
             "trial": int(args.worker_trial),
             "trials": int(args.trials),
             "seed": int(args.worker_seed),
-            "camera_risk_layout": layout_override["label"] if layout_override is not None else "",
+            "camera_risk_layout": layout_override["label"] if layout_override is not None else camera_risk_layout_label,
             "trajectory": trajectory,
             "obstacles": preview_obstacles,
         },
@@ -1643,8 +1893,8 @@ def run_worker(args, hydra_overrides):
             env.reward_spec,
             device=base_env.device,
         )
+
         _inject_canlidargate_backbone(policy, base_env, env, cfg)
-        checkpoint_path = _resolve_checkpoint_path(cfg.get("checkpoint_path"))
         _load_checkpoint_strictish(policy, checkpoint_path, base_env.device)
         policy.eval()
         base_env.enable_render(isaacsim_view)
@@ -2173,8 +2423,8 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--camera-risk-layout",
-        default="3",
-        help="Camera risk layout override. Use '3' for the legacy 3-sector version, or '3x3' for the grid version.",
+        default="",
+        help="Optional camera risk layout override. Leave empty to infer from the checkpoint/task config; use '3' for legacy 3-sector or '3x3' for a grid.",
     )
     parser.add_argument("--speed", type=float, default=3.0, help="Fixed eval vlim / target speed value in m/s")
     parser.add_argument("--speed-min", type=float, default=None, help="Minimum eval vlim for a speed sweep")

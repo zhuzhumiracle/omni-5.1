@@ -26,7 +26,7 @@ REPO_ROOT = OMNIDRONES_DIR.parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results" / "realtree_sweep_camlidar_gate"
 DEFAULT_TREE_PLY = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree.ply"
 DEFAULT_TREE_OBJ = REPO_ROOT / "YOPO" / "Simulator" / "src" / "pointcloud" / "tree_mesh.obj"
-DEFAULT_VLIM_CHECKPOINT = "goodpt/6-4-vlim-lcgate-tree_best_return_2532.35.pt"
+DEFAULT_VLIM_CHECKPOINT = "goodpt/6-6-vlim-lcgat-tree_best_return_4574.55.pt"
 DEFAULT_POLICY_TASK = "forest_lc_gate"
 CAMERA_RISK_FEATURE_NAMES = [
     "coverage",
@@ -276,6 +276,127 @@ def _camera_h_fov_rad_from_cfg(cfg):
             f"Invalid depth camera intrinsics for FoV: focal={focal}, horizontal_aperture={h_aperture}"
         )
     return 2.0 * math.atan(h_aperture / (2.0 * focal))
+
+
+def _checkpoint_state_dict(checkpoint_path, device="cpu"):
+    import torch
+
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except (TypeError, RuntimeError):
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+    state_dict = ckpt
+    if isinstance(ckpt, dict):
+        for key in ("model_state_dict", "state_dict", "policy_state_dict", "policy"):
+            if key in ckpt and isinstance(ckpt[key], dict):
+                state_dict = ckpt[key]
+                break
+        if not all(isinstance(v, torch.Tensor) for v in state_dict.values()):
+            for _k, _v in ckpt.items():
+                if isinstance(_v, dict) and all(
+                    isinstance(vv, torch.Tensor) for vv in _v.values()
+                ):
+                    state_dict = _v
+                    break
+    return state_dict
+
+
+def _probe_checkpoint_gate_spec(checkpoint_path, device="cpu"):
+    """Probe LC-gate checkpoint metadata needed before environment creation."""
+    state_dict = _checkpoint_state_dict(checkpoint_path, device=device)
+
+    gate_by_stream = {}
+    feature_dims = []
+    state_dim = None
+    for k, v in state_dict.items():
+        if not hasattr(v, "shape"):
+            continue
+        if ".state_encoder.0.weight" in k and len(v.shape) == 2 and state_dim is None:
+            state_dim = int(v.shape[1])
+        match = re.search(r"^(?P<prefix>.*)\.gate_heads\.(?P<idx>\d+)\.0\.weight$", k)
+        if match is None or len(v.shape) != 2:
+            continue
+        stream = "actor" if str(k).startswith("actor.") else "critic" if str(k).startswith("critic.") else match.group("prefix")
+        gate_by_stream.setdefault(stream, set()).add(int(match.group("idx")))
+        feature_dims.append(int(v.shape[1]))
+
+    if not feature_dims or not gate_by_stream:
+        print("[probe] no gate_heads found in checkpoint — using config values")
+        return {"features_per_sector": None, "total_sectors": None, "state_dim": state_dim}
+
+    feature_dim = feature_dims[0]
+    if any(dim != feature_dim for dim in feature_dims):
+        unique = sorted(set(feature_dims))
+        raise RuntimeError(f"Checkpoint has inconsistent gate head input dims: {unique}")
+
+    preferred_stream = "actor" if "actor" in gate_by_stream else next(iter(gate_by_stream))
+    gate_indices = gate_by_stream[preferred_stream]
+    total_sectors = max(gate_indices) + 1
+    if len(gate_indices) != total_sectors:
+        print(
+            f"[probe] warning: non-contiguous gate head indices for {preferred_stream}: "
+            f"count={len(gate_indices)}, max_index={max(gate_indices)}"
+        )
+        total_sectors = len(gate_indices)
+
+    print(
+        f"[probe] detected checkpoint gate spec: sectors={total_sectors}, "
+        f"features_per_sector={feature_dim}, state_dim={state_dim}"
+    )
+    return {
+        "features_per_sector": int(feature_dim),
+        "total_sectors": int(total_sectors),
+        "state_dim": state_dim,
+    }
+
+
+def _layout_from_total_sectors(total_sectors, current_rows, current_cols):
+    total_sectors = int(total_sectors)
+    current_rows = int(current_rows)
+    current_cols = int(current_cols)
+    if total_sectors <= 0:
+        return None
+    if current_rows > 0 and current_cols > 0 and current_rows * current_cols == total_sectors:
+        return current_rows, current_cols
+    side = int(round(math.sqrt(total_sectors)))
+    if side * side == total_sectors:
+        return side, side
+    if current_rows > 0 and total_sectors % current_rows == 0:
+        return current_rows, total_sectors // current_rows
+    if current_cols > 0 and total_sectors % current_cols == 0:
+        return total_sectors // current_cols, current_cols
+    return 1, total_sectors
+
+
+def _apply_checkpoint_gate_spec_to_cfg(cfg, checkpoint_path, device="cpu"):
+    spec = _probe_checkpoint_gate_spec(checkpoint_path, device=device)
+    fps = spec.get("features_per_sector")
+    if fps is not None:
+        config_fps = int(cfg.task.get("camera_risk_features_per_bin", -1))
+        if config_fps != int(fps):
+            print(
+                f"[realtree sweep] overriding camera_risk_features_per_bin before env creation: "
+                f"config={config_fps} -> checkpoint={int(fps)}"
+            )
+            cfg.task.camera_risk_features_per_bin = int(fps)
+
+    total_sectors = spec.get("total_sectors")
+    if total_sectors is not None:
+        current_rows = int(cfg.task.get("camera_risk_num_rows", 0))
+        current_cols = int(cfg.task.get("camera_risk_num_cols", 0))
+        layout = _layout_from_total_sectors(total_sectors, current_rows, current_cols)
+        if layout is not None:
+            rows, cols = layout
+            if rows != current_rows or cols != current_cols:
+                print(
+                    f"[realtree sweep] overriding camera risk layout before env creation: "
+                    f"config={current_rows}x{current_cols} -> checkpoint={rows}x{cols}"
+                )
+                cfg.task.camera_risk_num_rows = int(rows)
+                cfg.task.camera_risk_num_cols = int(cols)
+                cfg.task.camera_risk_num_bins = int(cols) if int(rows) == 1 else int(rows * cols)
+    return spec
 
 
 def _inject_canlidargate_backbone(policy, base_env, env, cfg):
@@ -2564,6 +2685,12 @@ def run_worker(args, hydra_overrides):
     cfg.enable_viewport = isaacsim_view
     cfg.sim.enable_viewport = isaacsim_view
     cfg.sim.enable_replicator = True
+    checkpoint_path = _resolve_checkpoint_path(cfg.get("checkpoint_path"))
+    _apply_checkpoint_gate_spec_to_cfg(cfg, checkpoint_path, device="cpu")
+    camera_risk_layout_label = (
+        f"{int(cfg.task.get('camera_risk_num_rows', 1))}x"
+        f"{int(cfg.task.get('camera_risk_num_cols', int(cfg.task.get('camera_risk_num_bins', 3))))}"
+    )
     if export_success_videos:
         cfg.task.follow_camera = True
         cfg.task.hide_drone_meshes_from_depth_camera = bool(args.video_hide_drone)
@@ -2593,7 +2720,7 @@ def run_worker(args, hydra_overrides):
             "trial": int(args.worker_trial),
             "trials": int(args.trials),
             "seed": int(args.worker_seed),
-            "camera_risk_layout": layout_override["label"] if layout_override is not None else "",
+            "camera_risk_layout": layout_override["label"] if layout_override is not None else camera_risk_layout_label,
             "trajectory": trajectory,
             "obstacles": preview_obstacles,
         },
@@ -2650,7 +2777,6 @@ def run_worker(args, hydra_overrides):
             device=base_env.device,
         )
         actor_backbone, _critic_backbone = _inject_canlidargate_backbone(policy, base_env, env, cfg)
-        checkpoint_path = _resolve_checkpoint_path(cfg.get("checkpoint_path"))
         _load_checkpoint_strictish(policy, checkpoint_path, base_env.device)
         policy.eval()
         base_env.enable_render(isaacsim_view)
@@ -3487,8 +3613,8 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--camera-risk-layout",
-        default="3",
-        help="Camera risk layout override. Use '3' for the legacy 3-sector version, or '3x3' for the grid version.",
+        default="",
+        help="Optional camera risk layout override. Leave empty to infer from the checkpoint/task config; use '3' for legacy 3-sector or '3x3' for a grid.",
     )
     parser.add_argument("--speed", type=float, default=3.0, help="Fixed eval vlim / target speed value in m/s")
     parser.add_argument("--speed-min", type=float, default=None, help="Minimum eval vlim for a speed sweep")
