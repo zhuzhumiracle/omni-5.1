@@ -1,0 +1,22 @@
+{
+  "obstacles_per_tile": 5,
+  "tree_spacing_m": 5.0,
+  "target_speed_mps": 5.0,
+  "tree_count": 254,
+  "trial": 1,
+  "seed": 1,
+  "success_rate": 0.6,
+  "success_count": 18,
+  "episode_count": 30,
+  "mean_return": -100.86134236653646,
+  "mean_episode_len": 435.6,
+  "mean_completion_pct": 62.7,
+  "mean_arrival_time_s": 10.772,
+  "mean_path_length_m": 45.815,
+  "mean_speed_mps": 4.254,
+  "death_reason": "contact:11,out_of_bounds:1,success:18",
+  "result": "ok",
+  "success_videos_saved": 1,
+  "success_video_manifest": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/realtree_sweep_camlidar_gate/6-6-vlim-lcgat-tree_best_return_4574.55_02/videos/manifest.json",
+  "duration_s": 1163.456
+}

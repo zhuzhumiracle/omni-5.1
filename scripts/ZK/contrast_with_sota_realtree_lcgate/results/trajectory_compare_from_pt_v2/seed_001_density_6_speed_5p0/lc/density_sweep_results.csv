@@ -1,0 +1,2 @@
+obstacles_per_tile,tree_spacing_m,target_speed_mps,tree_count,trial,seed,success_rate,success_count,episode_count,mean_return,mean_episode_len,mean_completion_pct,mean_arrival_time_s,mean_path_length_m,mean_speed_mps,death_reason,result,duration_s
+6,6.0,5.0,49,1,1,0.5166666666666667,310,600,420.69856018066406,294.38,44.9,10.908,29.065,2.666,"collision:431,out_of_bounds:2,success:143,z_low:24",ok,3146.787

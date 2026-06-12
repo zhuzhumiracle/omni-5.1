@@ -79,6 +79,8 @@ class CanLiDARGateBackbone(torch.nn.Module):
         lidar_dim=3200,
         camera_risk_dim=13,
         ku_value_max=20.0,
+        ku_obstacle_max_dist=10.0,
+        ku_input_channels=1,
         output_dim=128,
         camera_h_fov_rad=None,
         fov_pitch_range=None,
@@ -105,6 +107,14 @@ class CanLiDARGateBackbone(torch.nn.Module):
         if self.ku_value_max <= 0.0:
             raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
         self.ku_unknown_value = self.ku_value_max
+        self.ku_obstacle_max_dist = float(ku_obstacle_max_dist)
+        if self.ku_obstacle_max_dist <= 0.0:
+            raise ValueError(
+                f"ku_obstacle_max_dist must be positive, got {self.ku_obstacle_max_dist}"
+            )
+        self.ku_input_channels = int(ku_input_channels)
+        if self.ku_input_channels not in {1, 3}:
+            raise ValueError(f"ku_input_channels must be 1 or 3, got {self.ku_input_channels}")
 
         self.ku_h = 40
         self.ku_w = 80
@@ -119,7 +129,7 @@ class CanLiDARGateBackbone(torch.nn.Module):
         self._build_sector_2d_masks()
 
         self.ku_encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
+            torch.nn.Conv2d(self.ku_input_channels, 16, kernel_size=3, padding=1, bias=False),
             torch.nn.GroupNorm(4, 16),
             torch.nn.LeakyReLU(0.1, inplace=True),
             torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
@@ -193,6 +203,24 @@ class CanLiDARGateBackbone(torch.nn.Module):
                 )
                 self._sector_masks.append(torch.nn.Parameter(mask.bool(), requires_grad=False))
 
+    def _ku_to_three_channels(self, x_ku_raw):
+        max_dist = max(self.ku_obstacle_max_dist, 1e-6)
+        eps = 1e-6
+        unknown = x_ku_raw >= (self.ku_unknown_value - eps)
+        has_obstacle = x_ku_raw < (max_dist - eps)
+        obstacle_close = torch.where(
+            has_obstacle,
+            1.0 - (x_ku_raw / max_dist),
+            torch.zeros_like(x_ku_raw),
+        ).clamp(0.0, 1.0)
+        free_dist = (self.ku_unknown_value - x_ku_raw).clamp(0.0, max_dist)
+        confirmed_free = torch.where(
+            (~has_obstacle) & (~unknown),
+            free_dist / max_dist,
+            torch.zeros_like(x_ku_raw),
+        ).clamp(0.0, 1.0)
+        return torch.cat([obstacle_close, confirmed_free, unknown.to(dtype=x_ku_raw.dtype)], dim=1)
+
     def forward(self, obs):
         state = obs[..., :self.state_dim]
         x_ku_flat = obs[..., self.state_dim:self.state_dim + self.lidar_dim]
@@ -227,7 +255,10 @@ class CanLiDARGateBackbone(torch.nn.Module):
                 spatial_gate_flat[:, :, sector_mask] = gate_i.view(b, 1, 1)
         spatial_gate = spatial_gate_flat.reshape(b, 1, self.ku_h, self.ku_w)
 
-        lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
+        if self.ku_input_channels == 3:
+            lidar_feat = self.ku_encoder(self._ku_to_three_channels(x_ku_raw) * spatial_gate)
+        else:
+            lidar_feat = self.ku_encoder((x_ku_raw * spatial_gate) / self.ku_value_max)
         lidar_z = self.ku_global_head(lidar_feat)
 
         state_2d = state.reshape(b, self.state_dim)
@@ -309,11 +340,14 @@ def _probe_checkpoint_gate_spec(checkpoint_path, device="cpu"):
     gate_by_stream = {}
     feature_dims = []
     state_dim = None
+    ku_input_channels = None
     for k, v in state_dict.items():
         if not hasattr(v, "shape"):
             continue
         if ".state_encoder.0.weight" in k and len(v.shape) == 2 and state_dim is None:
             state_dim = int(v.shape[1])
+        if k.endswith("ku_encoder.0.weight") and len(v.shape) == 4 and ku_input_channels is None:
+            ku_input_channels = int(v.shape[1])
         match = re.search(r"^(?P<prefix>.*)\.gate_heads\.(?P<idx>\d+)\.0\.weight$", k)
         if match is None or len(v.shape) != 2:
             continue
@@ -323,7 +357,12 @@ def _probe_checkpoint_gate_spec(checkpoint_path, device="cpu"):
 
     if not feature_dims or not gate_by_stream:
         print("[probe] no gate_heads found in checkpoint — using config values")
-        return {"features_per_sector": None, "total_sectors": None, "state_dim": state_dim}
+        return {
+            "features_per_sector": None,
+            "total_sectors": None,
+            "state_dim": state_dim,
+            "ku_input_channels": ku_input_channels,
+        }
 
     feature_dim = feature_dims[0]
     if any(dim != feature_dim for dim in feature_dims):
@@ -342,12 +381,14 @@ def _probe_checkpoint_gate_spec(checkpoint_path, device="cpu"):
 
     print(
         f"[probe] detected checkpoint gate spec: sectors={total_sectors}, "
-        f"features_per_sector={feature_dim}, state_dim={state_dim}"
+        f"features_per_sector={feature_dim}, state_dim={state_dim}, "
+        f"ku_input_channels={ku_input_channels}"
     )
     return {
         "features_per_sector": int(feature_dim),
         "total_sectors": int(total_sectors),
         "state_dim": state_dim,
+        "ku_input_channels": ku_input_channels,
     }
 
 
@@ -371,6 +412,9 @@ def _layout_from_total_sectors(total_sectors, current_rows, current_cols):
 
 def _apply_checkpoint_gate_spec_to_cfg(cfg, checkpoint_path, device="cpu"):
     spec = _probe_checkpoint_gate_spec(checkpoint_path, device=device)
+    ku_input_channels = spec.get("ku_input_channels")
+    if ku_input_channels is not None:
+        cfg.task.ku_input_channels = int(ku_input_channels)
     fps = spec.get("features_per_sector")
     if fps is not None:
         config_fps = int(cfg.task.get("camera_risk_features_per_bin", -1))
@@ -434,6 +478,8 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
 
     expected_feature_dim = 128
     ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
+    ku_obstacle_max_dist = float(cfg.task.get("max_obs_dist", cfg.task.get("lidar_range", 10.0)))
+    ku_input_channels = int(cfg.task.get("ku_input_channels", 1))
     camera_h_fov_rad = _camera_h_fov_rad_from_cfg(cfg)
     # Compute effective pitch range for 2D masks
     focal = float(cfg.task.get("depth_camera_focal_length", 12.0))
@@ -476,6 +522,8 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
         lidar_dim=lidar_dim,
         camera_risk_dim=camera_risk_dim,
         ku_value_max=ku_value_max,
+        ku_obstacle_max_dist=ku_obstacle_max_dist,
+        ku_input_channels=ku_input_channels,
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
         fov_pitch_range=(fov_pitch_min, fov_pitch_max),
@@ -489,6 +537,8 @@ def _inject_canlidargate_backbone(policy, base_env, env, cfg):
         lidar_dim=lidar_dim,
         camera_risk_dim=camera_risk_dim,
         ku_value_max=ku_value_max,
+        ku_obstacle_max_dist=ku_obstacle_max_dist,
+        ku_input_channels=ku_input_channels,
         output_dim=expected_feature_dim,
         camera_h_fov_rad=camera_h_fov_rad,
         fov_pitch_range=(fov_pitch_min, fov_pitch_max),

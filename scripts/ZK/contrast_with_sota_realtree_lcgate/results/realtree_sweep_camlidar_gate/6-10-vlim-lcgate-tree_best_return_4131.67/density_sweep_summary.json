@@ -1,0 +1,515 @@
+[
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 83,
+    "episode_count": 100,
+    "success_rate": 0.83,
+    "mean_return": -66954.46672790527,
+    "mean_episode_len": 2795.17,
+    "avg_completion_pct": 81.6,
+    "mean_arrival_time_s": 51.235,
+    "mean_path_length_m": 43.444,
+    "mean_speed_mps": 0.848
+  },
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 87,
+    "episode_count": 100,
+    "success_rate": 0.87,
+    "mean_return": -63610.293569030764,
+    "mean_episode_len": 2676.18,
+    "avg_completion_pct": 77.8,
+    "mean_arrival_time_s": 51.19,
+    "mean_path_length_m": 43.375,
+    "mean_speed_mps": 0.846
+  },
+  {
+    "target_speed_mps": 1.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 87,
+    "episode_count": 100,
+    "success_rate": 0.87,
+    "mean_return": -13812.341831054688,
+    "mean_episode_len": 2430.14,
+    "avg_completion_pct": 77.7,
+    "mean_arrival_time_s": 50.888,
+    "mean_path_length_m": 42.851,
+    "mean_speed_mps": 0.841
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 85,
+    "episode_count": 100,
+    "success_rate": 0.85,
+    "mean_return": -40597.1782925415,
+    "mean_episode_len": 1461.17,
+    "avg_completion_pct": 82.0,
+    "mean_arrival_time_s": 26.249,
+    "mean_path_length_m": 46.139,
+    "mean_speed_mps": 1.738
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 92,
+    "episode_count": 100,
+    "success_rate": 0.92,
+    "mean_return": -20046.746952514648,
+    "mean_episode_len": 1299.39,
+    "avg_completion_pct": 80.1,
+    "mean_arrival_time_s": 25.347,
+    "mean_path_length_m": 44.297,
+    "mean_speed_mps": 1.732
+  },
+  {
+    "target_speed_mps": 2.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 85,
+    "episode_count": 100,
+    "success_rate": 0.85,
+    "mean_return": 2474.4554895019533,
+    "mean_episode_len": 1186.86,
+    "avg_completion_pct": 78.5,
+    "mean_arrival_time_s": 25.484,
+    "mean_path_length_m": 44.159,
+    "mean_speed_mps": 1.723
+  },
+  {
+    "target_speed_mps": 3.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 83,
+    "episode_count": 100,
+    "success_rate": 0.83,
+    "mean_return": -65297.291417541506,
+    "mean_episode_len": 1130.21,
+    "avg_completion_pct": 79.7,
+    "mean_arrival_time_s": 17.571,
+    "mean_path_length_m": 45.339,
+    "mean_speed_mps": 2.571
+  },
+  {
+    "target_speed_mps": 3.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 81,
+    "episode_count": 100,
+    "success_rate": 0.81,
+    "mean_return": -21638.259735412597,
+    "mean_episode_len": 865.09,
+    "avg_completion_pct": 74.3,
+    "mean_arrival_time_s": 16.985,
+    "mean_path_length_m": 43.57,
+    "mean_speed_mps": 2.577
+  },
+  {
+    "target_speed_mps": 3.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 87,
+    "episode_count": 100,
+    "success_rate": 0.87,
+    "mean_return": -21120.8129876709,
+    "mean_episode_len": 904.38,
+    "avg_completion_pct": 79.9,
+    "mean_arrival_time_s": 17.051,
+    "mean_path_length_m": 43.91,
+    "mean_speed_mps": 2.574
+  },
+  {
+    "target_speed_mps": 4.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 80,
+    "episode_count": 100,
+    "success_rate": 0.8,
+    "mean_return": -43728.612811279294,
+    "mean_episode_len": 835.63,
+    "avg_completion_pct": 78.8,
+    "mean_arrival_time_s": 13.36,
+    "mean_path_length_m": 44.49,
+    "mean_speed_mps": 3.328
+  },
+  {
+    "target_speed_mps": 4.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 87,
+    "episode_count": 100,
+    "success_rate": 0.87,
+    "mean_return": -67126.37582946777,
+    "mean_episode_len": 919.22,
+    "avg_completion_pct": 78.0,
+    "mean_arrival_time_s": 13.434,
+    "mean_path_length_m": 45.182,
+    "mean_speed_mps": 3.354
+  },
+  {
+    "target_speed_mps": 4.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 89,
+    "episode_count": 100,
+    "success_rate": 0.89,
+    "mean_return": -22748.895272216796,
+    "mean_episode_len": 767.55,
+    "avg_completion_pct": 81.6,
+    "mean_arrival_time_s": 13.88,
+    "mean_path_length_m": 46.7,
+    "mean_speed_mps": 3.351
+  },
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 74,
+    "episode_count": 100,
+    "success_rate": 0.74,
+    "mean_return": -43779.16049468994,
+    "mean_episode_len": 722.64,
+    "avg_completion_pct": 75.4,
+    "mean_arrival_time_s": 11.505,
+    "mean_path_length_m": 46.705,
+    "mean_speed_mps": 4.043
+  },
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 82,
+    "episode_count": 100,
+    "success_rate": 0.82,
+    "mean_return": -114653.2646585083,
+    "mean_episode_len": 1001.53,
+    "avg_completion_pct": 76.1,
+    "mean_arrival_time_s": 11.154,
+    "mean_path_length_m": 45.847,
+    "mean_speed_mps": 4.09
+  },
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 86,
+    "episode_count": 100,
+    "success_rate": 0.86,
+    "mean_return": -22060.59928833008,
+    "mean_episode_len": 613.9,
+    "avg_completion_pct": 78.0,
+    "mean_arrival_time_s": 10.959,
+    "mean_path_length_m": 44.461,
+    "mean_speed_mps": 4.055
+  },
+  {
+    "target_speed_mps": 6.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 69,
+    "episode_count": 100,
+    "success_rate": 0.69,
+    "mean_return": -47344.10928649902,
+    "mean_episode_len": 655.27,
+    "avg_completion_pct": 71.7,
+    "mean_arrival_time_s": 9.613,
+    "mean_path_length_m": 45.07,
+    "mean_speed_mps": 4.697
+  },
+  {
+    "target_speed_mps": 6.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 82,
+    "episode_count": 100,
+    "success_rate": 0.82,
+    "mean_return": -50517.68580810547,
+    "mean_episode_len": 648.26,
+    "avg_completion_pct": 75.4,
+    "mean_arrival_time_s": 9.631,
+    "mean_path_length_m": 45.608,
+    "mean_speed_mps": 4.734
+  },
+  {
+    "target_speed_mps": 6.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 82,
+    "episode_count": 100,
+    "success_rate": 0.82,
+    "mean_return": -89810.09331573486,
+    "mean_episode_len": 832.16,
+    "avg_completion_pct": 78.3,
+    "mean_arrival_time_s": 9.53,
+    "mean_path_length_m": 45.166,
+    "mean_speed_mps": 4.739
+  },
+  {
+    "target_speed_mps": 7.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 59,
+    "episode_count": 100,
+    "success_rate": 0.59,
+    "mean_return": -44851.55271850586,
+    "mean_episode_len": 582.81,
+    "avg_completion_pct": 68.7,
+    "mean_arrival_time_s": 8.673,
+    "mean_path_length_m": 45.635,
+    "mean_speed_mps": 5.267
+  },
+  {
+    "target_speed_mps": 7.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 80,
+    "episode_count": 100,
+    "success_rate": 0.8,
+    "mean_return": -114639.85488952637,
+    "mean_episode_len": 889.77,
+    "avg_completion_pct": 75.0,
+    "mean_arrival_time_s": 8.855,
+    "mean_path_length_m": 47.952,
+    "mean_speed_mps": 5.397
+  },
+  {
+    "target_speed_mps": 7.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 80,
+    "episode_count": 100,
+    "success_rate": 0.8,
+    "mean_return": -68875.27378173829,
+    "mean_episode_len": 698.99,
+    "avg_completion_pct": 76.8,
+    "mean_arrival_time_s": 8.669,
+    "mean_path_length_m": 46.516,
+    "mean_speed_mps": 5.365
+  },
+  {
+    "target_speed_mps": 8.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 46,
+    "episode_count": 100,
+    "success_rate": 0.46,
+    "mean_return": -117633.9034689331,
+    "mean_episode_len": 861.87,
+    "avg_completion_pct": 59.8,
+    "mean_arrival_time_s": 8.455,
+    "mean_path_length_m": 49.624,
+    "mean_speed_mps": 5.87
+  },
+  {
+    "target_speed_mps": 8.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 74,
+    "episode_count": 100,
+    "success_rate": 0.74,
+    "mean_return": -66600.9053378296,
+    "mean_episode_len": 665.26,
+    "avg_completion_pct": 73.3,
+    "mean_arrival_time_s": 7.827,
+    "mean_path_length_m": 46.673,
+    "mean_speed_mps": 5.968
+  },
+  {
+    "target_speed_mps": 8.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 75,
+    "episode_count": 100,
+    "success_rate": 0.75,
+    "mean_return": -203541.97510955812,
+    "mean_episode_len": 585.38,
+    "avg_completion_pct": 76.3,
+    "mean_arrival_time_s": 7.792,
+    "mean_path_length_m": 46.363,
+    "mean_speed_mps": 5.962
+  },
+  {
+    "target_speed_mps": 9.0,
+    "obstacles_per_tile": 4,
+    "tree_spacing_m": 4.0,
+    "tree_count": 341,
+    "trials": 1,
+    "seeds": [
+      0
+    ],
+    "success_count": 38,
+    "episode_count": 100,
+    "success_rate": 0.38,
+    "mean_return": -140635.87981842042,
+    "mean_episode_len": 872.63,
+    "avg_completion_pct": 50.7,
+    "mean_arrival_time_s": 7.499,
+    "mean_path_length_m": 49.685,
+    "mean_speed_mps": 6.651
+  },
+  {
+    "target_speed_mps": 9.0,
+    "obstacles_per_tile": 5,
+    "tree_spacing_m": 5.0,
+    "tree_count": 216,
+    "trials": 1,
+    "seeds": [
+      1
+    ],
+    "success_count": 70,
+    "episode_count": 100,
+    "success_rate": 0.7,
+    "mean_return": -200952.5795022583,
+    "mean_episode_len": 532.96,
+    "avg_completion_pct": 69.6,
+    "mean_arrival_time_s": 7.552,
+    "mean_path_length_m": 49.569,
+    "mean_speed_mps": 6.563
+  },
+  {
+    "target_speed_mps": 9.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 146,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 71,
+    "episode_count": 100,
+    "success_rate": 0.71,
+    "mean_return": -251047.29609313965,
+    "mean_episode_len": 721.99,
+    "avg_completion_pct": 70.3,
+    "mean_arrival_time_s": 7.38,
+    "mean_path_length_m": 48.593,
+    "mean_speed_mps": 6.585
+  }
+]

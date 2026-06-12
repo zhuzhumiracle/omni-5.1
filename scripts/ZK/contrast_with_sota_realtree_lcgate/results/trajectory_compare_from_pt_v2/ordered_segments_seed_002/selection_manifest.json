@@ -1,0 +1,50 @@
+{
+  "seed": 2,
+  "density": 6,
+  "speed": 5.0,
+  "selection_rule": "continuous trajectory segments with completion order LC-gate > LC > Single-LiDAR",
+  "methods": {
+    "lcgate": {
+      "label": "LC-gate",
+      "path": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/lcgate_selected_segment.json",
+      "source_live_state": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lcgate/live_state.json",
+      "segment": [
+        318,
+        372
+      ],
+      "path_length_m": 46.028,
+      "start_distance_m": 48.0,
+      "final_error_m": 3.031,
+      "completion_pct": 93.685,
+      "points": 54
+    },
+    "lc": {
+      "label": "LiDAE-KU/LC",
+      "path": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/lc_selected_segment.json",
+      "source_live_state": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lc/live_state.json",
+      "segment": [
+        363,
+        422
+      ],
+      "path_length_m": 45.748,
+      "start_distance_m": 48.0,
+      "final_error_m": 4.445,
+      "completion_pct": 90.739,
+      "points": 59
+    },
+    "lidar": {
+      "label": "Single-LiDAR",
+      "path": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/lidar_selected_segment.json",
+      "source_live_state": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lidar/live_state.json",
+      "segment": [
+        132,
+        193
+      ],
+      "path_length_m": 47.67,
+      "start_distance_m": 48.0,
+      "final_error_m": 6.999,
+      "completion_pct": 85.42,
+      "points": 61
+    }
+  }
+}

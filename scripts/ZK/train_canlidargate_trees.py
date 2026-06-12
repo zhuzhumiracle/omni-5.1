@@ -666,6 +666,7 @@ class DualStreamBackbone(torch.nn.Module):
         lidar_dim=3200,
         camera_risk_dim=13,
         ku_value_max=20.0,
+        ku_obstacle_max_dist=10.0,
         output_dim=128,
         camera_h_fov_rad=None,
         fov_pitch_range=None,
@@ -692,6 +693,11 @@ class DualStreamBackbone(torch.nn.Module):
         if self.ku_value_max <= 0.0:
             raise ValueError(f"ku_value_max must be positive, got {self.ku_value_max}")
         self.ku_unknown_value = self.ku_value_max
+        self.ku_obstacle_max_dist = float(ku_obstacle_max_dist)
+        if self.ku_obstacle_max_dist <= 0.0:
+            raise ValueError(
+                f"ku_obstacle_max_dist must be positive, got {self.ku_obstacle_max_dist}"
+            )
 
         self.ku_h = 40
         self.ku_w = 80
@@ -711,7 +717,7 @@ class DualStreamBackbone(torch.nn.Module):
 
         # ================= 1. LiDAR-KU 编码分支 =================
         self.ku_encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1, bias=False),
+            torch.nn.Conv2d(3, 16, kernel_size=3, padding=1, bias=False),
             torch.nn.GroupNorm(4, 16),
             torch.nn.LeakyReLU(0.1, inplace=True),
             torch.nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
@@ -799,6 +805,27 @@ class DualStreamBackbone(torch.nn.Module):
             "fusion": self.fusion_mlp[0].weight,
         }
 
+    def _ku_to_three_channels(self, x_ku_raw):
+        """Decode legacy scalar KU into obstacle, confirmed-free, and unknown channels."""
+        max_dist = max(self.ku_obstacle_max_dist, 1e-6)
+        eps = 1e-6
+        unknown = x_ku_raw >= (self.ku_unknown_value - eps)
+        has_obstacle = x_ku_raw < (max_dist - eps)
+
+        obstacle_close = torch.where(
+            has_obstacle,
+            1.0 - (x_ku_raw / max_dist),
+            torch.zeros_like(x_ku_raw),
+        ).clamp(0.0, 1.0)
+        free_dist = (self.ku_unknown_value - x_ku_raw).clamp(0.0, max_dist)
+        confirmed_free = torch.where(
+            (~has_obstacle) & (~unknown),
+            free_dist / max_dist,
+            torch.zeros_like(x_ku_raw),
+        ).clamp(0.0, 1.0)
+        unknown_mask = unknown.to(dtype=x_ku_raw.dtype)
+        return torch.cat([obstacle_close, confirmed_free, unknown_mask], dim=1)
+
     def forward(self, obs):
         state = obs[..., :self.state_dim]
         x_ku_flat = obs[..., self.state_dim:self.state_dim + self.lidar_dim]
@@ -817,6 +844,7 @@ class DualStreamBackbone(torch.nn.Module):
             nan=self.ku_unknown_value,
         )
         x_ku_raw = torch.clamp(x_ku_raw, 0.0, self.ku_unknown_value)
+        x_ku_channels = self._ku_to_three_channels(x_ku_raw)
 
         camera_risk_2d = camera_risk.reshape(b, self.camera_risk_dim)
         camera_risk_2d = torch.nan_to_num(camera_risk_2d, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
@@ -832,9 +860,9 @@ class DualStreamBackbone(torch.nn.Module):
             if bool(sector_mask.any()):
                 spatial_gate[:, :, sector_mask] = gate_i.view(b, 1, 1)
 
-        x_ku_gated = x_ku_raw * spatial_gate
+        x_ku_gated = x_ku_channels * spatial_gate
 
-        lidar_feat = self.ku_encoder(x_ku_gated / self.ku_value_max)
+        lidar_feat = self.ku_encoder(x_ku_gated)
         lidar_z = self.ku_global_head(lidar_feat)
 
         state_2d = state.reshape(b, self.state_dim)
@@ -1257,6 +1285,7 @@ def main(cfg):
             obs_dim = env.observation_spec[("agents", "observation")].shape[-1]
             lidar_dim = 3200
             ku_value_max = float(cfg.task.get("ku_value_max", 20.0))
+            ku_obstacle_max_dist = float(cfg.task.get("max_obs_dist", cfg.task.get("lidar_range", 10.0)))
             # 2D grid layout: rows=pitch, cols=yaw.  Backward compat: old camera_risk_num_bins -> 1 row × N cols.
             _num_rows = int(cfg.task.get("camera_risk_num_rows", 0))
             _num_cols = int(cfg.task.get("camera_risk_num_cols", 0))
@@ -1336,7 +1365,8 @@ def main(cfg):
 
             actor_backbone = DualStreamBackbone(
                 state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
-                ku_value_max=ku_value_max, output_dim=expected_feature_dim,
+                ku_value_max=ku_value_max, ku_obstacle_max_dist=ku_obstacle_max_dist,
+                output_dim=expected_feature_dim,
                 camera_h_fov_rad=camera_h_fov_rad,
                 fov_pitch_range=(fov_pitch_min, fov_pitch_max),
                 camera_yaw_center_rad=camera_yaw_center_rad,
@@ -1344,7 +1374,8 @@ def main(cfg):
             ).to(base_env.device)
             critic_backbone = DualStreamBackbone(
                 state_dim=state_dim, lidar_dim=lidar_dim, camera_risk_dim=camera_risk_dim,
-                ku_value_max=ku_value_max, output_dim=expected_feature_dim,
+                ku_value_max=ku_value_max, ku_obstacle_max_dist=ku_obstacle_max_dist,
+                output_dim=expected_feature_dim,
                 camera_h_fov_rad=camera_h_fov_rad,
                 fov_pitch_range=(fov_pitch_min, fov_pitch_max),
                 camera_yaw_center_rad=camera_yaw_center_rad,

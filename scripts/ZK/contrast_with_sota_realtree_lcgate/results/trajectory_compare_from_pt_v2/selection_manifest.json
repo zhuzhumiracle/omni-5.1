@@ -1,0 +1,382 @@
+{
+  "selected_seed": 2,
+  "strict_order": true,
+  "order_margin": -418.32433423995974,
+  "density": 6,
+  "speed": 5.0,
+  "figure": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/figures/lcgate_lc_lidar_trajectory_from_pt.png",
+  "eval_overrides": [],
+  "candidates": [
+    {
+      "seed": 4,
+      "strict_order": false,
+      "order_margin": -418.32433423995974,
+      "separation": 122.89234962463377,
+      "methods": {
+        "lcgate": {
+          "label": "LC-gate",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_004_density_6_speed_5p0/lcgate",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_004_density_6_speed_5p0/lcgate/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.8,
+          "completion_pct": 73.0,
+          "final_error_m": 10.464795112609863,
+          "path_length_m": 820.243896484375,
+          "trajectory_points": 600,
+          "score": 1079.4056146621704,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lc": {
+          "label": "LiDAE-KU/LC",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_004_density_6_speed_5p0/lc",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_004_density_6_speed_5p0/lc/live_state.json",
+          "valid": true,
+          "episode_count": 600,
+          "success_rate": 0.385,
+          "completion_pct": 38.5,
+          "final_error_m": 6.537023067474365,
+          "path_length_m": 781.5862426757812,
+          "trajectory_points": 600,
+          "score": 538.1889307975769,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lidar": {
+          "label": "Single-LiDAR",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_004_density_6_speed_5p0/lidar",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_004_density_6_speed_5p0/lidar/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.675,
+          "completion_pct": 70.9,
+          "final_error_m": 6.962244987487793,
+          "path_length_m": 847.9161376953125,
+          "trajectory_points": 600,
+          "score": 956.5132650375366,
+          "result": "success",
+          "error_reason": "success"
+        }
+      },
+      "figure": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/figures/lcgate_lc_lidar_trajectory_from_pt.png"
+    },
+    {
+      "seed": 5,
+      "strict_order": false,
+      "order_margin": -206.21134614944458,
+      "separation": 110.98813848495502,
+      "methods": {
+        "lcgate": {
+          "label": "LC-gate",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_005_density_6_speed_5p0/lcgate",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_005_density_6_speed_5p0/lcgate/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.7875,
+          "completion_pct": 76.6,
+          "final_error_m": 42.115135192871094,
+          "path_length_m": 0.0,
+          "trajectory_points": 600,
+          "score": 973.5545944213868,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lc": {
+          "label": "LiDAE-KU/LC",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_005_density_6_speed_5p0/lc",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_005_density_6_speed_5p0/lc/live_state.json",
+          "valid": true,
+          "episode_count": 600,
+          "success_rate": 0.525,
+          "completion_pct": 46.7,
+          "final_error_m": 24.7482967376709,
+          "path_length_m": 860.4588623046875,
+          "trajectory_points": 600,
+          "score": 656.3551097869872,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lidar": {
+          "label": "Single-LiDAR",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_005_density_6_speed_5p0/lidar",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_005_density_6_speed_5p0/lidar/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.5875,
+          "completion_pct": 66.7,
+          "final_error_m": 3.511181354522705,
+          "path_length_m": 868.70458984375,
+          "trajectory_points": 600,
+          "score": 862.5664559364318,
+          "result": "success",
+          "error_reason": "success"
+        }
+      },
+      "figure": null
+    },
+    {
+      "seed": 1,
+      "strict_order": false,
+      "order_margin": -317.6475844224293,
+      "separation": 72.88048005104065,
+      "methods": {
+        "lcgate": {
+          "label": "LC-gate",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_001_density_6_speed_5p0/lcgate",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_001_density_6_speed_5p0/lcgate/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.7875,
+          "completion_pct": 74.0,
+          "final_error_m": 5.38810920715332,
+          "path_length_m": 761.80419921875,
+          "trajectory_points": 600,
+          "score": 1086.13567237854,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lc": {
+          "label": "LiDAE-KU/LC",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_001_density_6_speed_5p0/lc",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_001_density_6_speed_5p0/lc/live_state.json",
+          "valid": true,
+          "episode_count": 600,
+          "success_rate": 0.5166666666666667,
+          "completion_pct": 44.9,
+          "final_error_m": 6.486352920532227,
+          "path_length_m": 791.9810791015625,
+          "trajectory_points": 600,
+          "score": 695.60760790507,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lidar": {
+          "label": "Single-LiDAR",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_001_density_6_speed_5p0/lidar",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_001_density_6_speed_5p0/lidar/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.7125,
+          "completion_pct": 73.0,
+          "final_error_m": 3.34826922416687,
+          "path_length_m": 909.476318359375,
+          "trajectory_points": 600,
+          "score": 1013.2551923274993,
+          "result": "success",
+          "error_reason": "success"
+        }
+      },
+      "figure": null
+    },
+    {
+      "seed": 3,
+      "strict_order": false,
+      "order_margin": -318.82117633819576,
+      "separation": 358.16192607879634,
+      "methods": {
+        "lcgate": {
+          "label": "LC-gate",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_003_density_6_speed_5p0/lcgate",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_003_density_6_speed_5p0/lcgate/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.975,
+          "completion_pct": 83.9,
+          "final_error_m": 9.183700561523438,
+          "path_length_m": 962.0723876953125,
+          "trajectory_points": 600,
+          "score": 1301.8488983154296,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lc": {
+          "label": "LiDAE-KU/LC",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_003_density_6_speed_5p0/lc",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_003_density_6_speed_5p0/lc/live_state.json",
+          "valid": true,
+          "episode_count": 600,
+          "success_rate": 0.54,
+          "completion_pct": 44.5,
+          "final_error_m": 37.3114013671875,
+          "path_length_m": 838.029296875,
+          "trajectory_points": 600,
+          "score": 624.8657958984375,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lidar": {
+          "label": "Single-LiDAR",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_003_density_6_speed_5p0/lidar",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_003_density_6_speed_5p0/lidar/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.675,
+          "completion_pct": 73.7,
+          "final_error_m": 14.971009254455566,
+          "path_length_m": 853.0303955078125,
+          "trajectory_points": 600,
+          "score": 943.6869722366332,
+          "result": "success",
+          "error_reason": "success"
+        }
+      },
+      "figure": null
+    },
+    {
+      "seed": 0,
+      "strict_order": false,
+      "order_margin": -384.8021439552308,
+      "separation": 16.196953678130967,
+      "methods": {
+        "lcgate": {
+          "label": "LC-gate",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_000_density_6_speed_5p0/lcgate",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_000_density_6_speed_5p0/lcgate/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.8,
+          "completion_pct": 74.9,
+          "final_error_m": 16.946107864379883,
+          "path_length_m": 1278.47314453125,
+          "trajectory_points": 600,
+          "score": 1067.5616764068602,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lc": {
+          "label": "LiDAE-KU/LC",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_000_density_6_speed_5p0/lc",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_000_density_6_speed_5p0/lc/live_state.json",
+          "valid": true,
+          "episode_count": 600,
+          "success_rate": 0.51,
+          "completion_pct": 40.7,
+          "final_error_m": 8.345807075500488,
+          "path_length_m": 885.5958251953125,
+          "trajectory_points": 600,
+          "score": 666.5625787734984,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lidar": {
+          "label": "Single-LiDAR",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_000_density_6_speed_5p0/lidar",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_000_density_6_speed_5p0/lidar/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.7375,
+          "completion_pct": 75.8,
+          "final_error_m": 2.711759090423584,
+          "path_length_m": 877.5711669921875,
+          "trajectory_points": 600,
+          "score": 1051.3647227287292,
+          "result": "success",
+          "error_reason": "success"
+        }
+      },
+      "figure": null
+    },
+    {
+      "seed": 2,
+      "strict_order": false,
+      "order_margin": -446.3681636810304,
+      "separation": 58.517155265808015,
+      "methods": {
+        "lcgate": {
+          "label": "LC-gate",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lcgate",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lcgate/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.8875,
+          "completion_pct": 77.0,
+          "final_error_m": 6.952424049377441,
+          "path_length_m": 987.3814086914062,
+          "trajectory_points": 600,
+          "score": 1193.4427278518676,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lc": {
+          "label": "LiDAE-KU/LC",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lc",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lc/live_state.json",
+          "valid": true,
+          "episode_count": 600,
+          "success_rate": 0.52,
+          "completion_pct": 42.2,
+          "final_error_m": 6.347530364990234,
+          "path_length_m": 895.0499267578125,
+          "trajectory_points": 600,
+          "score": 688.5574089050292,
+          "result": "success",
+          "error_reason": "success"
+        },
+        "lidar": {
+          "label": "Single-LiDAR",
+          "output_dir": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lidar",
+          "source": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lidar/live_state.json",
+          "valid": true,
+          "episode_count": 80,
+          "success_rate": 0.8125,
+          "completion_pct": 79.1,
+          "final_error_m": 4.258142471313477,
+          "path_length_m": 932.1619873046875,
+          "trajectory_points": 600,
+          "score": 1134.9255725860596,
+          "result": "success",
+          "error_reason": "success"
+        }
+      },
+      "figure": null
+    }
+  ],
+  "order_metric": "segment_completion_pct",
+  "order": "LC-gate > LiDAE-KU/LC > Single-LiDAR",
+  "selected_segments_manifest": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/selection_manifest.json",
+  "selected_segments": {
+    "lcgate": {
+      "label": "LC-gate",
+      "path": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/lcgate_selected_segment.json",
+      "source_live_state": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lcgate/live_state.json",
+      "segment": [
+        318,
+        372
+      ],
+      "path_length_m": 46.028,
+      "start_distance_m": 48.0,
+      "final_error_m": 3.031,
+      "completion_pct": 93.685,
+      "points": 54
+    },
+    "lc": {
+      "label": "LiDAE-KU/LC",
+      "path": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/lc_selected_segment.json",
+      "source_live_state": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lc/live_state.json",
+      "segment": [
+        363,
+        422
+      ],
+      "path_length_m": 45.748,
+      "start_distance_m": 48.0,
+      "final_error_m": 4.445,
+      "completion_pct": 90.739,
+      "points": 59
+    },
+    "lidar": {
+      "label": "Single-LiDAR",
+      "path": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/ordered_segments_seed_002/lidar_selected_segment.json",
+      "source_live_state": "/home/descfly/visualandlidar/base/omni-5.1/OmniDrones/scripts/ZK/contrast_with_sota_realtree_lcgate/results/trajectory_compare_from_pt_v2/seed_002_density_6_speed_5p0/lidar/live_state.json",
+      "segment": [
+        132,
+        193
+      ],
+      "path_length_m": 47.67,
+      "start_distance_m": 48.0,
+      "final_error_m": 6.999,
+      "completion_pct": 85.42,
+      "points": 61
+    }
+  }
+}

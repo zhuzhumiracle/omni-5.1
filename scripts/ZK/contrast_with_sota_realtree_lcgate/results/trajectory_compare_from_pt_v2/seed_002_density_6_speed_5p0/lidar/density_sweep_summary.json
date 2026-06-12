@@ -1,0 +1,21 @@
+[
+  {
+    "target_speed_mps": 5.0,
+    "obstacles_per_tile": 6,
+    "tree_spacing_m": 6.0,
+    "tree_count": 48,
+    "trials": 1,
+    "seeds": [
+      2
+    ],
+    "success_count": 65,
+    "episode_count": 80,
+    "success_rate": 0.8125,
+    "mean_return": 670.920132446289,
+    "mean_episode_len": 539.8625,
+    "avg_completion_pct": 79.1,
+    "mean_arrival_time_s": 10.697,
+    "mean_path_length_m": 43.297,
+    "mean_speed_mps": 4.074
+  }
+]
